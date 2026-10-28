@@ -120,7 +120,7 @@ def _is_legitimate_and_relevant_check(
 
 def _extract_executed_passed_test_nodes(check: VerificationCheck) -> List[str]:
     """
-    Extracts test node IDs and test functions that were demonstrably EXECUTED and PASSED by a runner.
+    Extracts test node IDs, file targets, and test functions that were demonstrably EXECUTED and PASSED by a runner.
     Only valid if check exited with exit_code == 0 and check.success is True.
     Rejects targets appearing merely in command arguments, summary strings, or failure traces.
     """
@@ -131,18 +131,41 @@ def _extract_executed_passed_test_nodes(check: VerificationCheck) -> List[str]:
     passed_nodes = []
 
     # 1. Pytest verbose: "tests/test_auth.py::test_login PASSED" or "test_login PASSED"
-    for m in re.finditer(r"(?:^|\s)(?:[\w./\\]+::)?(test_[a-zA-Z0-9_]+)\s+(?:PASSED|passed)\b", output, re.MULTILINE):
-        passed_nodes.append(m.group(1).lower())
+    for m in re.finditer(r"(?:^|\s)((?:[\w./\\]+::)?(test_[a-zA-Z0-9_]+))\s+(?:PASSED|passed)\b", output, re.MULTILINE):
+        full_node = m.group(1).lower()
+        test_fn = m.group(2).lower()
+        passed_nodes.append(full_node)
+        passed_nodes.append(test_fn)
+        if "::" in full_node:
+            file_part = full_node.split("::")[0]
+            passed_nodes.append(file_part)
+            passed_nodes.append(os.path.basename(file_part))
+            passed_nodes.append(os.path.splitext(os.path.basename(file_part))[0])
 
     # 2. Pytest prefixed: "PASSED tests/test_auth.py::test_login"
-    for m in re.finditer(r"\bPASSED\s+(?:[\w./\\]+::)?(test_[a-zA-Z0-9_]+)\b", output):
-        passed_nodes.append(m.group(1).lower())
+    for m in re.finditer(r"\bPASSED\s+((?:[\w./\\]+::)?(test_[a-zA-Z0-9_]+))\b", output):
+        full_node = m.group(1).lower()
+        test_fn = m.group(2).lower()
+        passed_nodes.append(full_node)
+        passed_nodes.append(test_fn)
+        if "::" in full_node:
+            file_part = full_node.split("::")[0]
+            passed_nodes.append(file_part)
+            passed_nodes.append(os.path.basename(file_part))
+            passed_nodes.append(os.path.splitext(os.path.basename(file_part))[0])
 
     # 3. Unittest: "test_login (tests.test_auth.AuthTests) ... ok" or "test_login ... ok"
-    for m in re.finditer(r"(?:^|\s)(test_[a-zA-Z0-9_]+)\s*(?:\([^)]*\))?\s*\.\.\.\s*ok\b", output, re.IGNORECASE | re.MULTILINE):
-        passed_nodes.append(m.group(1).lower())
+    for m in re.finditer(r"(?:^|\s)(test_[a-zA-Z0-9_]+)\s*(?:\(([\w.]+)\))?\s*\.\.\.\s*ok\b", output, re.IGNORECASE | re.MULTILINE):
+        test_fn = m.group(1).lower()
+        passed_nodes.append(test_fn)
+        if m.group(2):
+            mod_part = m.group(2).lower()
+            passed_nodes.append(mod_part)
+            for part in mod_part.split("."):
+                passed_nodes.append(part)
+                passed_nodes.append(f"{part}.py")
 
-    # 4. Jest / Vitest: "✓ test_login" or "PASS ... test_login"
+    # 4. Jest / Vitest: "✓ test_login" or "PASS ... > test_login"
     for m in re.finditer(r"(?:✓|PASS)\s+(?:[\w./\\]+>\s*)?(test_[a-zA-Z0-9_]+)", output):
         passed_nodes.append(m.group(1).lower())
 
@@ -222,35 +245,31 @@ class VerificationEngine:
 
                 if target_test:
                     target_test_clean = target_test.strip().lower()
+                    target_test_stem = os.path.splitext(os.path.basename(target_test_clean))[0]
                     target_test_name = target_test_clean.split("::")[-1].replace(".py", "")
 
                     for check in relevant_passed_checks:
                         passed_nodes = _extract_executed_passed_test_nodes(check)
-                        cmd_lower = (check.command or "").lower()
 
-                        # Case A: Executed test node matched directly in runner output
-                        node_matched = target_test_name in passed_nodes or any(
-                            target_test_name in p or p in target_test_name for p in passed_nodes
-                        )
-
-                        # Case B: Explicit test file targeted directly in command line and passed
-                        file_matched = (
-                            (target_test_clean.endswith(".py") or "test_" in target_test_clean)
-                            and target_test_name in cmd_lower
-                            and (
-                                check.exit_code == 0
-                                and (
-                                    "passed" in (check.output or "").lower()
-                                    or "verified" in (check.output or "").lower()
-                                    or "ok" in (check.output or "").lower()
-                                    or len(passed_nodes) > 0
-                                )
+                        # Must match an actually executed and passed test node parsed from runner telemetry
+                        node_matched = (
+                            target_test_clean in passed_nodes
+                            or target_test_name in passed_nodes
+                            or target_test_stem in passed_nodes
+                            or any(
+                                p == target_test_clean
+                                or p == target_test_name
+                                or p == target_test_stem
+                                or p.endswith(f"::{target_test_name}")
+                                or p.endswith(f"/{target_test_clean}")
+                                or p.endswith(f"\\{target_test_clean}")
+                                for p in passed_nodes
                             )
                         )
 
-                        if node_matched or file_matched:
+                        if node_matched:
                             matching_check = check
-                            matched_proof = f"Executed test target '{target_test}' passed with exit code 0"
+                            matched_proof = f"Executed test node '{target_test}' passed with exit code 0"
                             matched_artifact = check.evidence_artifact or (check.command or check.check_name)
                             verification_tier = "VERIFIED_TARGETED_TEST"
                             break

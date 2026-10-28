@@ -785,8 +785,8 @@ def test_verifier_criteria_mapping_and_evidence():
         command="pytest tests/test_api_auth.py",
         success=True,
         exit_code=0,
-        output="1 passed - API endpoint returned 401 on missing token as expected",
-        evidence_summary="API endpoint returned 401 on missing token as expected",
+        output="tests/test_api_auth.py::test_api_auth PASSED\n1 passed in 0.05s",
+        evidence_summary="tests/test_api_auth.py::test_api_auth PASSED",
         criterion_bindings={"API endpoint must return 401 on missing token": "test_api_auth.py"},
     )
     ve.record_check(check1)
@@ -821,8 +821,8 @@ def test_verifier_criteria_mapping_and_evidence():
         command="pytest tests/test_migration.py",
         success=True,
         exit_code=0,
-        output="Database migration must fail closed on write error verified",
-        evidence_summary="Database migration must fail closed on write error",
+        output="tests/test_migration.py::test_migration_fail_closed PASSED\n1 passed in 0.05s",
+        evidence_summary="tests/test_migration.py::test_migration_fail_closed PASSED",
         criterion_bindings={"Database migration must fail closed on write error": "test_migration.py"},
     )
     ve.record_check(check2)
@@ -1482,6 +1482,8 @@ async def test_container_hardening_non_root_image_validation_and_timeout_cleanup
             if args[0] == "/usr/bin/docker" and len(args) > 1 and args[1] == "rm":
                 cleanup_calls.append(args)
                 mock_clean = AsyncMock()
+                mock_clean.returncode = 0
+                mock_clean.communicate = AsyncMock(return_value=(b"", b""))
                 mock_clean.wait = AsyncMock(return_value=0)
                 return mock_clean
             return mock_proc
@@ -1505,6 +1507,30 @@ async def test_container_hardening_non_root_image_validation_and_timeout_cleanup
             assert cleanup_calls[0][1] == "rm"
             assert cleanup_calls[0][2] == "-f"
             assert cleanup_calls[0][3] == timeout_res.artifacts.get("container_name")
+
+        # 5. Failed cleanup branch: verifies container_cleaned_up=False when docker rm fails
+        async def fake_failed_cleanup(*args, **kwargs):
+            if args[0] == "/usr/bin/docker" and len(args) > 1 and args[1] == "rm":
+                mock_clean = AsyncMock()
+                mock_clean.returncode = 1
+                mock_clean.communicate = AsyncMock(return_value=(b"", b"Error: No such container"))
+                return mock_clean
+            return mock_proc
+
+        with patch("shutil.which", return_value="/usr/bin/docker"), \
+             patch("asyncio.create_subprocess_exec", side_effect=fake_failed_cleanup), \
+             patch("agent.tools.terminal._kill_process_tree"):
+            fail_clean_res = await tool.execute(
+                call_id="c_fail_clean_test",
+                workspace_path=temp_dir,
+                command="sleep 100",
+                timeout_seconds=1,
+                sandbox_mode="container",
+            )
+            assert fail_clean_res.success is False
+            assert fail_clean_res.artifacts.get("container_cleaned_up") is False
+            assert "cleanup_warning" in fail_clean_res.artifacts
+            assert "Cleanup Warning" in fail_clean_res.error
 
 
 def test_credential_vault_concurrent_creation_race_and_validation():
@@ -1679,6 +1705,127 @@ def test_verifier_rejects_fabricated_output_and_unbacked_assertion_records():
     assert rep3.acceptance_criteria_satisfied is True
     assert rep3.criteria_evidence[0].demonstrated is True
     assert rep3.criteria_evidence[0].verification_tier == "VERIFIED_ASSERTION"
+
+
+def test_verifier_rejects_exit_zero_generic_word_without_test_execution():
+    """Validates Regression Test 1:
+    A command targets tests/test_auth.py, exits 0, prints 'tests/test_auth.py verified',
+    but never actually runs an executed test node; it MUST remain UNVERIFIED."""
+    ve = VerificationEngine()
+    criteria = ["Secure user authentication"]
+
+    fabricated_check = VerificationCheck(
+        check_name="Fabricated Target Test",
+        check_type="test",
+        command="python -c \"print('tests/test_auth.py verified')\"",
+        success=True,
+        exit_code=0,
+        output="tests/test_auth.py verified\nok - all checks passed",
+        evidence_summary="Printed verified message",
+        criterion_bindings={"Secure user authentication": "tests/test_auth.py"},
+    )
+    ve.record_check(fabricated_check)
+
+    report = ve.evaluate_completion(
+        task_id="t_reg_1",
+        goal="Implement secure user authentication",
+        actions_taken=["Ran fabricated command"],
+        modified_files=["agent/api/server.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+
+    # Must remain strictly UNVERIFIED because no test runner node was parsed/executed
+    assert report.status == TaskStatus.PARTIALLY_COMPLETED
+    assert report.acceptance_criteria_satisfied is False
+    assert len(report.criteria_evidence) == 1
+    assert report.criteria_evidence[0].demonstrated is False
+    assert report.criteria_evidence[0].verification_tier == "UNVERIFIED"
+
+
+def is_docker_daemon_available() -> bool:
+    """Checks whether the Docker CLI and daemon are operational."""
+    import shutil
+    import subprocess
+    if not shutil.which("docker"):
+        return False
+    try:
+        res = subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_real_docker_container_security_boundaries():
+    """Live Docker Integration Test (exercised in CI and Docker-enabled hosts):
+    1. Filesystem boundary: writing outside /workspace (to rootfs /) is blocked by --read-only.
+    2. Network boundary: outbound network connections fail by --network none.
+    3. User boundary: container runs as non-root user (id -u != 0).
+    4. Timeout cleanup: timed-out container is forcefully removed and not left in docker ps -a."""
+    if not is_docker_daemon_available():
+        pytest.skip("Docker daemon is not running on this host.")
+
+    from agent.tools.terminal import RunCommandTool
+    import subprocess
+
+    tool = RunCommandTool()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        # 1. Read-only rootfs prevents writes outside /workspace
+        esc_res = await tool.execute(
+            call_id="c_real_fs",
+            workspace_path=temp_dir,
+            command="touch /escape.txt",
+            sandbox_mode="container",
+        )
+        assert esc_res.success is False
+        assert "Read-only file system" in esc_res.output or "Read-only file system" in str(esc_res.error)
+
+        # 2. Network none blocks raw socket connections
+        net_res = await tool.execute(
+            call_id="c_real_net",
+            workspace_path=temp_dir,
+            command='python3 -c "import socket; s = socket.socket(); s.settimeout(1); s.connect((\'1.1.1.1\', 80))"',
+            sandbox_mode="container",
+            allow_network=False,
+        )
+        assert net_res.success is False
+
+        # 3. Non-root user verified (id -u != 0)
+        id_res = await tool.execute(
+            call_id="c_real_user",
+            workspace_path=temp_dir,
+            command="id -u",
+            sandbox_mode="container",
+        )
+        assert id_res.success is True
+        uid = int(id_res.output.strip().splitlines()[-1])
+        assert uid != 0
+
+        # 4. Timeout and container cleanup from daemon
+        timeout_res = await tool.execute(
+            call_id="c_real_timeout",
+            workspace_path=temp_dir,
+            command="sleep 30",
+            timeout_seconds=2,
+            sandbox_mode="container",
+        )
+        assert timeout_res.success is False
+        assert "timed out after" in timeout_res.error
+        assert timeout_res.artifacts.get("container_cleaned_up") is True
+        c_name = timeout_res.artifacts.get("container_name")
+        assert c_name is not None
+
+        # Verify container was removed from Docker daemon (not running or orphaned)
+        ps_check = subprocess.run(
+            ["docker", "ps", "-a", "--filter", f"name={c_name}", "--format", "{{.Names}}"],
+            capture_output=True,
+            text=True,
+        )
+        assert c_name not in ps_check.stdout.strip().splitlines()
+
+
 
 
 

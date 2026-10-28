@@ -30,6 +30,11 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
+    - name: Pre-pull Docker Sandbox Image
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        docker pull python:3.12-slim
+
     - name: Run Test Suite
       run: |
         pytest tests/ -v

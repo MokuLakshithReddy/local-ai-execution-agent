@@ -552,27 +552,44 @@ class RunCommandTool(BaseTool):
                     if process.pid:
                         _kill_process_tree(process.pid)
                     # Forcefully stop and remove running container in Docker daemon
+                    container_cleaned_up = False
+                    cleanup_warning = None
                     try:
                         cleanup_proc = await asyncio.create_subprocess_exec(
                             docker_bin, "rm", "-f", container_name,
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.DEVNULL,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
                         )
-                        await asyncio.wait_for(cleanup_proc.wait(), timeout=5.0)
-                    except Exception:
-                        pass
+                        _, cleanup_err = await asyncio.wait_for(cleanup_proc.communicate(), timeout=5.0)
+                        if cleanup_proc.returncode == 0:
+                            container_cleaned_up = True
+                        else:
+                            err_msg = cleanup_err.decode("utf-8", errors="replace").strip()
+                            cleanup_warning = f"Container cleanup failed with exit code {cleanup_proc.returncode}: {err_msg}"
+                    except asyncio.TimeoutError:
+                        cleanup_warning = f"Container cleanup command timed out after 5.0 seconds for container '{container_name}'."
+                    except Exception as clean_err:
+                        cleanup_warning = f"Container cleanup error for '{container_name}': {str(clean_err)}"
+
+                    artifacts = {
+                        "sandbox_mode": "container",
+                        "isolated": True,
+                        "container_name": container_name,
+                        "container_cleaned_up": container_cleaned_up,
+                    }
+                    if cleanup_warning:
+                        artifacts["cleanup_warning"] = cleanup_warning
+
                     return ActionResult(
                         call_id=call_id,
                         tool_name=self.name,
                         success=False,
                         output="",
-                        error=f"Container execution timed out after {timeout} seconds.",
-                        artifacts={
-                            "sandbox_mode": "container",
-                            "isolated": True,
-                            "container_name": container_name,
-                            "container_cleaned_up": True,
-                        },
+                        error=(
+                            f"Container execution timed out after {timeout} seconds."
+                            + (f" Cleanup Warning: {cleanup_warning}" if cleanup_warning else "")
+                        ),
+                        artifacts=artifacts,
                         execution_time_ms=(time.time() - t0) * 1000,
                     )
 
