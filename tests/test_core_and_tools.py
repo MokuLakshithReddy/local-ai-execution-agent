@@ -459,10 +459,14 @@ def test_real_process_tree_termination():
 
     # Terminate the entire tree
     _kill_process_tree(proc.pid)
+    try:
+        proc.wait(timeout=1.0)
+    except Exception:
+        pass
     time.sleep(0.5)
 
-    assert not psutil.pid_exists(proc.pid)
-    assert not psutil.pid_exists(child_pid)
+    assert not psutil.pid_exists(proc.pid) or proc.poll() is not None
+    assert not psutil.pid_exists(child_pid) or (psutil.pid_exists(child_pid) and psutil.Process(child_pid).status() == psutil.STATUS_ZOMBIE)
 
 
 def test_verifier_relevance_and_anti_overstating():
@@ -872,12 +876,17 @@ def test_api_host_ipv6_and_token_permission_failure():
 
     # 3. Fail-safe token file permission failure
     with tempfile.NamedTemporaryFile() as tf:
-        with patch("subprocess.run") as mock_sub:
-            mock_sub.return_value.returncode = 1
-            mock_sub.return_value.stderr = "Access denied / icacls error"
+        if sys.platform == "win32":
+            with patch("subprocess.run") as mock_sub:
+                mock_sub.return_value.returncode = 1
+                mock_sub.return_value.stderr = "Access denied / icacls error"
 
-            with pytest.raises(RuntimeError, match="Security Failure.*icacls failed"):
-                _lock_down_token_file(tf.name)
+                with pytest.raises(RuntimeError, match="Security Failure.*icacls failed"):
+                    _lock_down_token_file(tf.name)
+        else:
+            with patch("os.chmod", side_effect=PermissionError("chmod denied")):
+                with pytest.raises(RuntimeError, match="Security Failure.*Failed to set 0600"):
+                    _lock_down_token_file(tf.name)
 
 
 @pytest.mark.asyncio
@@ -1296,9 +1305,8 @@ def test_posix_key_directory_permissions_and_symlink_rejection():
         symlink_dir = os.path.join(temp_dir, "symlink_dir")
 
         with patch("os.path.islink", side_effect=lambda p: p == symlink_dir):
-            v_sym = CredentialVault(key_dir=symlink_dir)
             with pytest.raises(CredentialEncryptionError, match="Symlink"):
-                v_sym._get_or_create_posix_key()
+                CredentialVault(key_dir=symlink_dir, is_windows=False)
 
         # 2. Insecure directory mode rejection on POSIX
         with patch("sys.platform", "linux"), \
@@ -1308,8 +1316,11 @@ def test_posix_key_directory_permissions_and_symlink_rejection():
             stat_obj.st_mode = 0o040777
             mock_stat.return_value = stat_obj
 
-            v_mode = CredentialVault(key_dir=vault_dir)
             with pytest.raises(CredentialEncryptionError, match="Insecure permissions on key directory"):
+                v_mode = CredentialVault.__new__(CredentialVault)
+                v_mode._is_windows = False
+                v_mode._key_dir = vault_dir
+                v_mode._key_file = os.path.join(vault_dir, "vault.key")
                 v_mode._get_or_create_posix_key()
 
 
