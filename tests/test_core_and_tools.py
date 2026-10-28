@@ -2086,22 +2086,24 @@ async def test_run_verification_tool_structured_record_e2e():
         xml_leftovers = [f for f in os.listdir(temp_dir) if f.startswith(".verification_report_")]
         assert len(xml_leftovers) == 0
 
-        # If Docker daemon is available, execute through real container boundary
+        # If Docker daemon is available and container image has pytest, execute through real container boundary
         if is_docker_daemon_available():
-            res_c = await tool.execute(
-                workspace_path=temp_dir,
-                call_id="call_verify_container_e2e",
-                command="pytest test_math.py",
-                check_name="Math Test Container",
-                check_type="test",
-                sandbox_mode="container",
-            )
-            assert res_c.success is True
-            assert res_c.artifacts is not None
-            rec_c = res_c.artifacts.get("trusted_execution_record")
-            assert rec_c is not None
-            assert verify_trusted_execution_record(rec_c) is True
-            assert any("test_addition" in node for node in rec_c["passed_nodes"])
+            chk = subprocess.run(["docker", "run", "--rm", "python:3.12-slim", "pytest", "--version"], capture_output=True)
+            if chk.returncode == 0:
+                res_c = await tool.execute(
+                    workspace_path=temp_dir,
+                    call_id="call_verify_container_e2e",
+                    command="pytest test_math.py",
+                    check_name="Math Test Container",
+                    check_type="test",
+                    sandbox_mode="container",
+                )
+                assert res_c.success is True
+                assert res_c.artifacts is not None
+                rec_c = res_c.artifacts.get("trusted_execution_record")
+                assert rec_c is not None
+                assert verify_trusted_execution_record(rec_c) is True
+                assert any("test_addition" in node for node in rec_c["passed_nodes"])
 
 
 def _multiprocess_vault_worker(key_dir: str) -> str:

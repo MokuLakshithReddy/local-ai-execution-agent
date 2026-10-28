@@ -110,3 +110,4 @@ def verify_trusted_execution_record(record: Any) -> bool:
     )
 
     return hmac.compare_digest(record.signature, expected_sig)
+

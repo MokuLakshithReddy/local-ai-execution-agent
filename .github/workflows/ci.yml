@@ -30,10 +30,13 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Pre-pull Docker Sandbox Image
+    - name: Pre-pull and Prepare Docker Sandbox Image
       if: matrix.os == 'ubuntu-latest'
       run: |
         docker pull python:3.12-slim
+        docker run --name prep_box python:3.12-slim pip install --no-cache-dir pytest
+        docker commit prep_box python:3.12-slim
+        docker rm -f prep_box
 
     - name: Run Unit & Adversarial Test Suite
       run: |
