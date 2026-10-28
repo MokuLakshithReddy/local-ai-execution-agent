@@ -95,9 +95,13 @@ class CriterionEvidence(BaseModel):
     criterion: str
     requirement: str
     demonstrated: bool
-    evidence_type: str  # test_execution, file_modification, build_verification, linter_clean
-    evidence_summary: str
+    evidence_type: str = "test_execution"  # assertion_verified, test_execution, build_verification, linter_clean, unverified
+    evidence_summary: str = ""
     linked_check: Optional[str] = None
+    exit_status: Optional[int] = None
+    test_node_or_assertion: Optional[str] = None
+    verification_tier: str = "UNVERIFIED"  # VERIFIED_ASSERTION, VERIFIED_TARGETED_TEST, HEURISTIC_ONLY, UNVERIFIED
+
 
 
 class TaskReport(BaseModel):

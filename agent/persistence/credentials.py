@@ -28,30 +28,71 @@ class CredentialEncryptionError(RuntimeError):
 
 
 class CredentialVault:
-    def __init__(self):
+    def __init__(self, key_dir: Optional[str] = None):
         self._is_windows = IS_WINDOWS
         if not self._is_windows:
             from cryptography.fernet import Fernet
-            self._key_dir = os.path.expanduser("~/.config/ai_execution_agent")
-            os.makedirs(self._key_dir, exist_ok=True)
+            self._key_dir = key_dir or os.path.expanduser("~/.config/ai_execution_agent")
             self._key_file = os.path.join(self._key_dir, "vault.key")
             self._fernet = Fernet(self._get_or_create_posix_key())
 
     def _get_or_create_posix_key(self) -> bytes:
         from cryptography.fernet import Fernet
+        # 1. If key file already exists, read and verify restrictive permissions
         if os.path.exists(self._key_file):
             try:
+                if hasattr(os, "stat") and sys.platform != "win32":
+                    st = os.stat(self._key_file)
+                    if (st.st_mode & 0o077) != 0:
+                        raise CredentialEncryptionError(
+                            f"Insecure permissions on vault key '{self._key_file}' (mode: {oct(st.st_mode)}). Expected 0600."
+                        )
                 with open(self._key_file, "rb") as f:
-                    return f.read().strip()
-            except Exception:
-                pass
+                    content = f.read().strip()
+                if not content or len(content) < 32:
+                    raise CredentialEncryptionError(f"Corrupted or empty vault key file '{self._key_file}'.")
+                return content
+            except Exception as e:
+                if isinstance(e, CredentialEncryptionError):
+                    raise
+                raise CredentialEncryptionError(f"Failed to read existing vault key '{self._key_file}': {str(e)}") from e
+
+        # 2. Key does not exist: generate and securely persist
         key = Fernet.generate_key()
         try:
+            if not os.path.exists(self._key_dir):
+                os.makedirs(self._key_dir, mode=0o700, exist_ok=True)
+            elif hasattr(os, "chmod") and sys.platform != "win32":
+                try:
+                    os.chmod(self._key_dir, 0o700)
+                except Exception:
+                    pass
+
             with open(self._key_file, "wb") as f:
                 f.write(key)
-            os.chmod(self._key_file, 0o600)
-        except Exception:
-            pass
+
+            if hasattr(os, "chmod") and sys.platform != "win32":
+                try:
+                    os.chmod(self._key_file, 0o600)
+                except Exception:
+                    pass
+                st = os.stat(self._key_file)
+                if (st.st_mode & 0o077) != 0:
+                    raise CredentialEncryptionError(
+                        f"Failed to verify 0600 permissions on newly created vault key '{self._key_file}'."
+                    )
+        except Exception as e:
+            if os.path.exists(self._key_file):
+                try:
+                    os.remove(self._key_file)
+                except Exception:
+                    pass
+            if isinstance(e, CredentialEncryptionError):
+                raise
+            raise CredentialEncryptionError(
+                f"POSIX vault key persistence failed. Startup aborted to prevent credential loss: {str(e)}"
+            ) from e
+
         return key
 
     def encrypt(self, plain_text: str) -> str:

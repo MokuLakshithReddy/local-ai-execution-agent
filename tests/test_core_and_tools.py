@@ -898,4 +898,224 @@ async def test_database_write_error_propagation():
             assert "Database write failure in save_setting" in str(exc_info.value)
 
 
+def test_posix_vault_key_failure_handling():
+    """Validates 3A: POSIX vault key creation fails closed on unwritable dir or permission error.
+    Also validates key recovery on restart."""
+    from unittest.mock import patch
+    from agent.persistence.credentials import CredentialVault, CredentialEncryptionError
+
+    # 1. Unwritable directory / permission failure -> raises CredentialEncryptionError
+    with tempfile.TemporaryDirectory() as temp_dir:
+        key_dir = os.path.join(temp_dir, "keys")
+        v = CredentialVault.__new__(CredentialVault)
+        v._is_windows = False
+        v._key_dir = key_dir
+        v._key_file = os.path.join(key_dir, "vault.key")
+
+        # Simulate open() raising PermissionError (unwritable directory)
+        with patch("builtins.open", side_effect=PermissionError("Permission denied: unwritable key dir")):
+            with pytest.raises(CredentialEncryptionError, match="POSIX vault key persistence failed"):
+                v._get_or_create_posix_key()
+
+        # Simulate insecure permissions on existing key
+        os.makedirs(key_dir, exist_ok=True)
+        with open(v._key_file, "wb") as f:
+            f.write(b"a" * 32)
+        
+        class MockStat:
+            st_mode = 0o100644
+
+        with patch("sys.platform", "linux"), patch("os.stat", return_value=MockStat()):
+            with pytest.raises(CredentialEncryptionError, match="Insecure permissions on vault key"):
+                v._get_or_create_posix_key()
+
+        # 2. Restart recovery: Valid key persists and allows decrypting after restart
+        v1 = CredentialVault.__new__(CredentialVault)
+        v1._is_windows = False
+        v1._key_dir = os.path.join(temp_dir, "valid_keys")
+        v1._key_file = os.path.join(v1._key_dir, "vault.key")
+        from cryptography.fernet import Fernet
+        v1._fernet = Fernet(v1._get_or_create_posix_key())
+
+        ciphertext = v1.encrypt("my-secret-key-123")
+        assert ciphertext.startswith("fernet:")
+
+        # Re-initialize vault from the same persisted key file (simulates restart)
+        v2 = CredentialVault.__new__(CredentialVault)
+        v2._is_windows = False
+        v2._key_dir = v1._key_dir
+        v2._key_file = v1._key_file
+        v2._fernet = Fernet(v2._get_or_create_posix_key())
+
+        decrypted = v2.decrypt(ciphertext)
+        assert decrypted == "my-secret-key-123"
+
+
+def test_verifier_strict_structured_evidence_mapping():
+    """Validates 3B: Verifier refuses to overstate completion.
+    A general passing test (exit code 0) without a targeted test node or assertion
+    is rejected as UNVERIFIED, preventing false-positive completion."""
+    ve = VerificationEngine()
+
+    criteria = [
+        "Database migration must fail closed on write error",
+        "API endpoint must return 401 on missing token",
+    ]
+
+    # Check that passed with exit code 0, but is completely generic (no test node or assertion matching criteria)
+    generic_check = VerificationCheck(
+        check_name="Generic Test Suite",
+        check_type="test",
+        command="pytest tests/test_core.py",
+        success=True,
+        exit_code=0,
+        output="5 passed in 0.25s\nRan all general unit tests successfully.",
+        evidence_summary="5 passed in 0.25s",
+    )
+    ve.record_check(generic_check)
+
+    report = ve.evaluate_completion(
+        task_id="t_strict_1",
+        goal="Harden migration failure and secure API auth",
+        actions_taken=["Edited code"],
+        modified_files=["agent/persistence/db.py", "agent/api/server.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+
+    # General passing check MUST NOT satisfy specific criteria
+    assert report.status == TaskStatus.PARTIALLY_COMPLETED
+    assert report.acceptance_criteria_satisfied is False
+    assert len(report.criteria_evidence) == 2
+    assert all(ce.demonstrated is False for ce in report.criteria_evidence)
+    assert all(ce.verification_tier == "UNVERIFIED" for ce in report.criteria_evidence)
+
+    # Now provide check with targeted test node for API auth
+    targeted_check = VerificationCheck(
+        check_name="API Auth Test",
+        check_type="test",
+        command="pytest tests/test_api.py -k test_token_auth_missing_token_401",
+        success=True,
+        exit_code=0,
+        output="tests/test_api.py::test_token_auth_missing_token_401 PASSED\n1 passed in 0.10s",
+        evidence_summary="test_token_auth_missing_token_401 PASSED",
+    )
+    ve.record_check(targeted_check)
+
+    report2 = ve.evaluate_completion(
+        task_id="t_strict_2",
+        goal="Harden migration failure and secure API auth",
+        actions_taken=["Edited code", "Ran targeted test"],
+        modified_files=["agent/persistence/db.py", "agent/api/server.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+    # API auth is demonstrated via VERIFIED_TARGETED_TEST, while migration is still UNVERIFIED
+    ce_auth = next(ce for ce in report2.criteria_evidence if "401" in ce.criterion)
+    ce_mig = next(ce for ce in report2.criteria_evidence if "migration" in ce.criterion)
+    assert ce_auth.demonstrated is True
+    assert ce_auth.verification_tier == "VERIFIED_TARGETED_TEST"
+    assert ce_mig.demonstrated is False
+    assert ce_mig.verification_tier == "UNVERIFIED"
+    assert report2.status == TaskStatus.PARTIALLY_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_credential_migration_multi_key_corrupted_and_recovery():
+    """Validates 3C: Credential migration across multiple provider keys,
+    corrupted legacy values, and recovery after a failed migration."""
+    import json
+    import base64
+    from unittest.mock import patch
+    from agent.persistence.db import Database, CredentialMigrationError
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        db_file = os.path.join(temp_dir, "mig_multi.db")
+        db = Database(db_path=db_file)
+        await db.init()
+
+        openai_key = "sk-openai-valid-11111"
+        anthropic_key = "sk-ant-valid-22222"
+        b64_openai = "b64:" + base64.b64encode(openai_key.encode()).decode("ascii")
+        b64_anthropic = "b64:" + base64.b64encode(anthropic_key.encode()).decode("ascii")
+        corrupt_gemini = "b64:@@@invalid-corrupted-padding@@@"
+
+        # Seed multi-key settings in SQLite
+        multi_settings = {
+            "openai_api_key": b64_openai,
+            "anthropic_api_key": b64_anthropic,
+            "gemini_api_key": corrupt_gemini,
+        }
+        async with aiosqlite.connect(db_file) as raw_db:
+            await raw_db.execute(
+                "INSERT INTO settings (key, value_json) VALUES (?, ?)",
+                ("app_settings", json.dumps(multi_settings))
+            )
+            await raw_db.commit()
+
+        # 1. Failure-path: Transient disk write error during multi-key migration
+        with patch.object(db, "save_setting", side_effect=Exception("Disk full / read-only")):
+            with pytest.raises(CredentialMigrationError):
+                await db.get_setting("app_settings")
+
+        # 2. Recovery-path: Database becomes writable; re-running get_setting cleanly migrates all keys
+        recovered = await db.get_setting("app_settings")
+        assert recovered is not None
+        assert recovered["openai_api_key"] == openai_key
+        assert recovered["anthropic_api_key"] == anthropic_key
+        # Corrupted key cannot be recovered and is safely None
+        assert recovered["gemini_api_key"] is None
+
+        # Inspect SQLite to assert legacy b64 was eliminated and replaced with dpapi/fernet
+        async with aiosqlite.connect(db_file) as raw_db:
+            cursor = await raw_db.execute("SELECT value_json FROM settings WHERE key = 'app_settings'")
+            row = await cursor.fetchone()
+            saved_json = json.loads(row[0])
+            assert "b64:" not in saved_json.get("openai_api_key", "")
+            assert any(p in saved_json.get("openai_api_key", "") for p in ("dpapi:", "fernet:"))
+            assert "b64:" not in saved_json.get("anthropic_api_key", "")
+            assert any(p in saved_json.get("anthropic_api_key", "") for p in ("dpapi:", "fernet:"))
+
+
+def test_terminal_os_sandbox_job_limits_and_container_config():
+    """Validates 2: OS kernel Job Object sandboxing and Container Sandbox isolation configuration.
+    - Windows Job Object enforces active process limit and auto-termination on close.
+    - build_container_command enforces read-only rootfs, --network none, and workspace mount."""
+    import psutil
+    from agent.tools.terminal import WindowsJobSandbox, build_container_command
+
+    # 1. Container command configuration validation
+    cmd = build_container_command(
+        command="pytest tests/",
+        workspace_path="C:\\test\\ws",
+        allow_network=False,
+        memory_limit="256m",
+        pids_limit=16,
+    )
+    assert "--network=none" in cmd
+    assert "--read-only" in cmd
+    assert "--cap-drop=ALL" in cmd
+    assert "--memory=256m" in cmd
+    assert "--pids-limit=16" in cmd
+    assert any("-v" == arg for arg in cmd)
+
+    # 2. Windows Job Object kernel limits
+    if sys.platform == "win32":
+        job = WindowsJobSandbox(max_active_processes=2, max_memory_bytes=256 * 1024 * 1024)
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+        try:
+            assigned = job.assign_process(proc.pid)
+            assert assigned is True
+            assert psutil.pid_exists(proc.pid)
+
+            # Close job object -> Windows kernel kills assigned process tree immediately
+            job.close()
+            time.sleep(0.5)
+            assert not psutil.pid_exists(proc.pid)
+        finally:
+            if psutil.pid_exists(proc.pid):
+                proc.kill()
+
+
+
 

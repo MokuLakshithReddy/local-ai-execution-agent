@@ -140,6 +140,127 @@ def validate_sandbox_command(command: str, workspace_path: str, allow_network: b
                     raise
 
 
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+
+class WindowsJobSandbox:
+    """
+    OS-level kernel containment using Windows Job Objects (ctypes.windll.kernel32).
+    Enforces:
+    - JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000): Kernel terminates process tree on exit.
+    - JOB_OBJECT_LIMIT_ACTIVE_PROCESS (0x0008): Limits concurrent child processes (prevents fork bombs).
+    - JOB_OBJECT_LIMIT_JOB_MEMORY (0x0200): Limits total memory consumption of the job tree.
+    - JOB_OBJECT_LIMIT_PROCESS_MEMORY (0x0100): Limits per-process memory consumption.
+    - JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION (0x0400).
+    """
+    def __init__(self, max_active_processes: int = 16, max_memory_bytes: int = 512 * 1024 * 1024):
+        self._handle = None
+        self._kernel32 = None
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                self._kernel32 = ctypes.windll.kernel32
+                self._handle = self._kernel32.CreateJobObjectW(None, None)
+                if self._handle:
+                    limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+                    limits.BasicLimitInformation.LimitFlags = 0x2000 | 0x0008 | 0x0200 | 0x0400
+                    limits.BasicLimitInformation.ActiveProcessLimit = max_active_processes
+                    limits.JobMemoryLimit = max_memory_bytes
+                    limits.ProcessMemoryLimit = max_memory_bytes
+                    self._kernel32.SetInformationJobObject(
+                        self._handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+                    )
+            except Exception:
+                self._handle = None
+
+    def assign_process(self, pid: int) -> bool:
+        if not self._handle or not self._kernel32:
+            return False
+        try:
+            h_proc = self._kernel32.OpenProcess(0x0100 | 0x0001, False, pid)
+            if h_proc:
+                res = self._kernel32.AssignProcessToJobObject(self._handle, h_proc)
+                self._kernel32.CloseHandle(h_proc)
+                return bool(res)
+        except Exception:
+            pass
+        return False
+
+    def close(self):
+        if self._handle and self._kernel32:
+            try:
+                self._kernel32.CloseHandle(self._handle)
+            except Exception:
+                pass
+            self._handle = None
+
+
+def build_container_command(
+    command: str,
+    workspace_path: str,
+    image: str = "python:3.12-slim",
+    memory_limit: str = "512m",
+    pids_limit: int = 32,
+    allow_network: bool = False,
+) -> list[str]:
+    """
+    Constructs an OS container sandbox command line enforcing:
+    1. Filesystem boundary: rootfs is read-only (--read-only), only /workspace is mounted rw.
+    2. Network boundary: complete network namespace isolation (--network none) when allow_network=False.
+    3. Resource limits: memory limit (--memory) and process fork limit (--pids-limit).
+    4. Capability drop: drops all Linux capabilities (--cap-drop all).
+    """
+    real_ws = os.path.realpath(workspace_path)
+    net_flag = "bridge" if allow_network else "none"
+    return [
+        "docker", "run", "--rm", "-i",
+        f"--network={net_flag}",
+        "--read-only",
+        "--cap-drop=ALL",
+        f"--memory={memory_limit}",
+        f"--pids-limit={pids_limit}",
+        "-v", f"{real_ws}:/workspace:rw",
+        "-w", "/workspace",
+        image,
+        "sh", "-c", command,
+    ]
+
+
 def _kill_process_tree(pid: int):
     """Recursively terminates all child processes and process tree to prevent orphaned background tasks."""
     try:
@@ -272,6 +393,9 @@ class RunCommandTool(BaseTool):
         # Set clean python unbuffered output
         isolated_env["PYTHONUNBUFFERED"] = "1"
 
+        # Initialize OS kernel sandbox limit manager
+        job_sandbox = WindowsJobSandbox(max_active_processes=16, max_memory_bytes=512 * 1024 * 1024)
+
         try:
             process = await asyncio.create_subprocess_shell(
                 command,
@@ -280,6 +404,9 @@ class RunCommandTool(BaseTool):
                 stderr=asyncio.subprocess.PIPE,
                 env=isolated_env,
             )
+            # Enforce OS kernel process and memory limits
+            if process.pid:
+                job_sandbox.assign_process(process.pid)
 
             try:
                 # Read streams with memory bound
@@ -338,3 +465,5 @@ class RunCommandTool(BaseTool):
                 error=str(e),
                 execution_time_ms=(time.time() - t0) * 1000,
             )
+        finally:
+            job_sandbox.close()

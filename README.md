@@ -9,7 +9,7 @@
 [![React + Vite](https://img.shields.io/badge/React-19%20%7C%20Vite-646CFF.svg)](https://vitejs.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-Local--First-003B57.svg)](https://sqlite.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Verification: Passed](https://img.shields.io/badge/Verification-25%20Passed-10b981.svg)](#-live-verification-evidence-log)
+[![Verification: Passed](https://img.shields.io/badge/Verification-29%20Passed-10b981.svg)](#-live-verification-evidence-log)
 
 </div>
 
@@ -70,7 +70,7 @@ The verification engine (`agent/verification/verifier.py`) enforces an unambiguo
 
 ## 🧪 Live Verification Evidence Log
 
-The test suite in [`tests/test_core_and_tools.py`](tests/test_core_and_tools.py) tests security invariants, tool bounds, and verifiable outcomes across all 25 automated integration tests.
+The test suite in [`tests/test_core_and_tools.py`](tests/test_core_and_tools.py) tests security invariants, tool bounds, and verifiable outcomes across all 29 automated integration tests.
 
 ### Verified Test Telemetry:
 ```
@@ -79,67 +79,91 @@ platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.7.0
 rootdir: C:\Users\nsrfl\OneDrive\Desktop\MAKE LLM TO CODE
 configfile: pytest.ini
 plugins: anyio-4.15.1, asyncio-1.4.1
-collected 25 items
+collected 29 items
 
-tests/test_core_and_tools.py::test_resolve_safe_path_security PASSED     [  4%]
-tests/test_core_and_tools.py::test_symlink_containment_security PASSED   [  8%]
-tests/test_core_and_tools.py::test_credential_vault_encryption PASSED    [ 12%]
-tests/test_core_and_tools.py::test_database_credential_encryption_and_sanitization PASSED [ 16%]
-tests/test_core_and_tools.py::test_security_sanitizer_redaction PASSED   [ 20%]
-tests/test_core_and_tools.py::test_security_sanitizer_injection_defense PASSED [ 24%]
-tests/test_core_and_tools.py::test_permission_manager_levels PASSED      [ 28%]
-tests/test_core_and_tools.py::test_terminal_environment_allowlist PASSED [ 32%]
-tests/test_core_and_tools.py::test_filesystem_tools_lifecycle PASSED     [ 36%]
-tests/test_core_and_tools.py::test_criteria_driven_verification PASSED   [ 40%]
-tests/test_core_and_tools.py::test_api_security_authorization PASSED     [ 44%]
-tests/test_core_and_tools.py::test_adversarial_bootstrap_attacks PASSED  [ 48%]
-tests/test_core_and_tools.py::test_token_file_acl_protection PASSED      [ 52%]
-tests/test_core_and_tools.py::test_credential_vault_corruption_and_migration PASSED [ 56%]
-tests/test_core_and_tools.py::test_dpapi_failure_fails_closed PASSED     [ 60%]
-tests/test_core_and_tools.py::test_real_process_tree_termination PASSED  [ 64%]
-tests/test_core_and_tools.py::test_verifier_relevance_and_anti_overstating PASSED [ 68%]
-tests/test_core_and_tools.py::test_approval_race_conditions PASSED       [ 72%]
-tests/test_core_and_tools.py::test_task_interruption_and_server_restart PASSED [ 76%]
-tests/test_core_and_tools.py::test_end_to_end_edit_test_fix_lifecycle PASSED [ 80%]
-tests/test_core_and_tools.py::test_legacy_migration_failure_fails_closed PASSED [ 84%]
-tests/test_core_and_tools.py::test_terminal_sandbox_boundaries PASSED    [ 88%]
-tests/test_core_and_tools.py::test_verifier_criteria_mapping_and_evidence PASSED [ 92%]
-tests/test_core_and_tools.py::test_api_host_ipv6_and_token_permission_failure PASSED [ 96%]
-tests/test_core_and_tools.py::test_database_write_error_propagation PASSED [100%]
+tests/test_core_and_tools.py::test_resolve_safe_path_security PASSED     [  3%]
+tests/test_core_and_tools.py::test_symlink_containment_security PASSED   [  6%]
+tests/test_core_and_tools.py::test_credential_vault_encryption PASSED    [ 10%]
+tests/test_core_and_tools.py::test_database_credential_encryption_and_sanitization PASSED [ 13%]
+tests/test_core_and_tools.py::test_security_sanitizer_redaction PASSED   [ 17%]
+tests/test_core_and_tools.py::test_security_sanitizer_injection_defense PASSED [ 20%]
+tests/test_core_and_tools.py::test_permission_manager_levels PASSED      [ 24%]
+tests/test_core_and_tools.py::test_terminal_environment_allowlist PASSED [ 27%]
+tests/test_core_and_tools.py::test_filesystem_tools_lifecycle PASSED     [ 31%]
+tests/test_core_and_tools.py::test_criteria_driven_verification PASSED   [ 34%]
+tests/test_core_and_tools.py::test_api_security_authorization PASSED     [ 37%]
+tests/test_core_and_tools.py::test_adversarial_bootstrap_attacks PASSED  [ 41%]
+tests/test_core_and_tools.py::test_token_file_acl_protection PASSED      [ 44%]
+tests/test_core_and_tools.py::test_credential_vault_corruption_and_migration PASSED [ 48%]
+tests/test_core_and_tools.py::test_dpapi_failure_fails_closed PASSED     [ 51%]
+tests/test_core_and_tools.py::test_real_process_tree_termination PASSED  [ 55%]
+tests/test_core_and_tools.py::test_verifier_relevance_and_anti_overstating PASSED [ 58%]
+tests/test_core_and_tools.py::test_approval_race_conditions PASSED       [ 62%]
+tests/test_core_and_tools.py::test_task_interruption_and_server_restart PASSED [ 65%]
+tests/test_core_and_tools.py::test_end_to_end_edit_test_fix_lifecycle PASSED [ 68%]
+tests/test_core_and_tools.py::test_legacy_migration_failure_fails_closed PASSED [ 72%]
+tests/test_core_and_tools.py::test_terminal_sandbox_boundaries PASSED    [ 75%]
+tests/test_core_and_tools.py::test_verifier_criteria_mapping_and_evidence PASSED [ 79%]
+tests/test_core_and_tools.py::test_api_host_ipv6_and_token_permission_failure PASSED [ 82%]
+tests/test_core_and_tools.py::test_database_write_error_propagation PASSED [ 86%]
+tests/test_core_and_tools.py::test_posix_vault_key_failure_handling PASSED [ 89%]
+tests/test_core_and_tools.py::test_verifier_strict_structured_evidence_mapping PASSED [ 93%]
+tests/test_core_and_tools.py::test_credential_migration_multi_key_corrupted_and_recovery PASSED [ 96%]
+tests/test_core_and_tools.py::test_terminal_os_sandbox_job_limits_and_container_config PASSED [100%]
 
-======================= 25 passed, 3 warnings in 2.47s ========================
+======================= 29 passed, 3 warnings in 3.61s ========================
 ```
 
 ---
 
 ## 🛡️ Hardened Defenses & Security Invariants
 
-In response to advanced adversarial scenarios and security reviews, the following protections are enforced:
+In response to rigorous security assessments and adversarial analysis, the agent enforces a multi-tiered defense architecture:
 
-### 1. Legacy Credential Migration Guarantee (Finding A)
-- **Verifiable Migration**: In `agent/persistence/db.py`, `get_setting()` securely re-encrypts legacy `b64:` and `enc:` credentials with OS-native DPAPI and persists them into SQLite immediately.
-- **Fail-Closed on Persistence Failure**: If re-encryption or persistence fails, migration does not return unmigrated secrets; it purges sensitive values from memory and raises `CredentialMigrationError`.
-- **Test Proof**: Validated via `test_legacy_migration_failure_fails_closed()` where SQLite write failure during migration raises `CredentialMigrationError` without returning plaintext credentials.
+### 1. Terminal Containment Architecture (Evidence-Based Separation)
+The terminal execution subsystem (`agent/tools/terminal.py`) explicitly separates **syntactic pre-flight policies** from **OS kernel boundaries** and **containerized isolation**:
 
-### 2. Enforceable OS-Level Terminal Sandbox (Finding B)
-- **Filesystem Boundary Enforcement**: `agent/tools/terminal.py` checks all candidate path arguments against the workspace root. Any path resolving outside the workspace (e.g. `C:\Windows\win.ini`, `/etc/passwd`) raises `SandboxViolationError`.
-- **Directory Traversal Blocking**: Escape patterns (`cd ..`, `pushd`) are forbidden in the sandboxed shell.
-- **Outbound Network Sandboxing**: Outbound network utilities (`curl`, `wget`, `nc`, `ssh`, etc.) are blocked by default unless `allow_network=True`. In addition, blackhole proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY = 127.0.0.1:0`) prevent socket connections.
-- **Process Tree Termination**: Runaway commands trigger `_kill_process_tree()` via `psutil` and `taskkill /F /T /PID` to prevent orphaned child processes.
+- **Tier 1 — Pre-Execution Policy Guard**:
+  - `validate_sandbox_command()` parses tokens, quotes, and traversal patterns prior to execution.
+  - Rejects obvious dangerous shell commands (`cd ..`, `pushd`, unquoted traversals) and hazardous command names (`curl`, `wget`, `nc`, `ssh`) when network is disabled.
+  - *Accurate Boundary*: A text policy filter catches syntax mistakes but does not prevent internal interpreter execution (e.g. `python -c "import socket; ..."`). Kernel or container sandboxing is required for hard containment.
 
-### 3. Acceptance Criteria & Concrete Evidence Mapping (Finding C)
-- **Explicit Criteria Mapping**: In `agent/verification/verifier.py`, tasks can define explicit `acceptance_criteria: List[str]` in addition to auto-inferred goal requirements.
-- **CriterionEvidence Tracking**: Each criterion maps to a structured `CriterionEvidence` object recording `demonstrated` (bool), `evidence_type`, and `linked_check`.
-- **Distinguishing "Command Passed" from "Requirement Demonstrated"**: An arbitrary passing command (`exit_code = 0`) is not sufficient unless concrete verification evidence demonstrates that the specific requirement was satisfied. Any undemonstrated criterion leaves the task in `PARTIALLY_COMPLETED`.
+- **Tier 2 — OS Kernel Resource & Process Sandboxing**:
+  - **Windows Job Objects (`WindowsJobSandbox`)**: Every host subprocess is bound to a native Windows Job Object configured via `ctypes.windll.kernel32`:
+    - `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000)`: Guarantees that if the agent exits, times out, or closes the job handle, the OS kernel terminates the entire child process tree immediately.
+    - `JOB_OBJECT_LIMIT_ACTIVE_PROCESS (0x0008)`: Enforces hard limits on active processes (default: 16) to prevent fork-bombs and runaway child trees.
+    - `JOB_OBJECT_LIMIT_JOB_MEMORY (0x0200)`: Restricts total job memory (default: 512 MB).
+  - **Environment Scrubbing**: Only essential variables (`PATH`, `SYSTEMROOT`, `COMSPEC`) in `SAFE_ENV_ALLOWLIST` are exposed; cloud and host credentials are scrubbed.
+  - **Proxy Blackholing**: Sets `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY = 127.0.0.1:0` to blackhole outbound requests.
 
-### 4. Local API & Token Failure Handling (Finding D)
-- **Fail-Safe Token Permissions**: On startup, `_lock_down_token_file()` sets strict ACLs via `icacls` (Windows) or `chmod 0600` (POSIX). If permission configuration fails, it raises `RuntimeError`, failing safely rather than operating unprotected.
-- **RFC-Compliant IPv4 & IPv6 Host Parsing**: `_extract_hostname()` accurately parses standard IPv4, bare IPv6 (`::1`), bracketed IPv6 (`[::1]:8000`), and ports using `urllib.parse.urlsplit` and `ipaddress`.
-- **DNS Rebinding & Hostile Origins**: Foreign hosts (`evil.attacker.com`) and cross-site browser fetches (`Sec-Fetch-Site: cross-site`) are rejected with `400 Bad Request` and `403 Forbidden`.
+- **Tier 3 — Containerized Execution Isolation (`build_container_command`)**:
+  - When container sandboxing is enabled, commands run inside an isolated OCI container:
+    - **Kernel Network Namespace Isolation**: `--network none` strips network access completely at the kernel level (raw sockets, python scripts, and compiled binaries cannot transmit traffic).
+    - **Read-Only Root Filesystem**: `--read-only` prevents mutations to system directories.
+    - **Filesystem Boundary**: Only the target workspace directory is mounted read-write (`-v {workspace}:/workspace:rw`).
+    - **Resource Caps**: `--memory 512m`, `--pids-limit 32`, and `--cap-drop=ALL`.
 
-### 5. Persistence Error Propagation (Finding E)
-- **Preserving Write Failures**: `Database.save_setting()` no longer catches database errors silently. Any SQLite disk write or operational error raises `DatabaseWriteError`.
-- **Zero Masked Success**: Callers and API endpoints accurately receive failure status (`HTTP 500`) when settings fail to persist to disk.
+### 2. Strict Structured Evidence Verification (Anti-Overstating)
+- **Beyond Generic Exit Status**: In `agent/verification/verifier.py`, an exit status of 0 is no longer sufficient by itself to claim that specific criteria were demonstrated.
+- **Structured Assertion Linking**: Every acceptance criterion is evaluated into a `CriterionEvidence` record with explicit `verification_tier`:
+  - `VERIFIED_TARGETED_TEST`: An explicit test node (e.g. `test_token_auth_missing_token_401 PASSED`) specifically targeted and demonstrated the criterion.
+  - `VERIFIED_ASSERTION`: A structured output assertion proved the requirement with multiple semantic matches.
+  - `UNVERIFIED`: If checks passed generally without an assertion or targeted test case for that requirement, the criterion is flagged as `UNVERIFIED` and the task remains `PARTIALLY_COMPLETED`.
+
+### 3. POSIX Vault Key Hardening & Fail-Closed Startup
+- **Fail-Closed on Write or Permission Failure**: In `agent/persistence/credentials.py`, `_get_or_create_posix_key()` fails startup by raising `CredentialEncryptionError` if the key directory is unwritable or restrictive permissions (`0600`) cannot be verified.
+- **Corrupted / Insecure Key Detection**: If an existing vault key file is group/world readable (`st_mode & 0o077 != 0`), initialization is aborted.
+- **Restart Recovery**: Valid keys persist reliably and allow seamless credential decryption across server restarts.
+
+### 4. Comprehensive Credential Migration Failure Paths & Recovery
+- **Multi-Key Migration**: Safely migrates multiple provider keys (`openai`, `anthropic`, `gemini`) stored together in a single settings object.
+- **Corrupted Legacy Value Handling**: Corrupted legacy base64 strings are nullified safely rather than returning garbled ciphertext.
+- **Failure-Path & Recovery**: If an intermediate SQLite disk write fails during migration, `CredentialMigrationError` is raised and unmigrated secrets are wiped from memory. Once the disk error resolves, subsequent requests cleanly complete migration and persist OS-native encrypted credentials.
+
+### 5. Local API, IPv6, & Token Failure Defenses
+- **Fail-Safe Token Permissions**: `_lock_down_token_file()` raises `RuntimeError` if ACLs cannot be locked down via `icacls` or `chmod 0600`.
+- **RFC-Compliant IPv4 & IPv6 Parsing**: `_extract_hostname()` accurately parses IPv4, bare IPv6 (`::1`), bracketed IPv6 (`[::1]:8000`), and rejects hostile domains (`evil.attacker.com`).
+- **Persistence Error Propagation**: `Database.save_setting()` propagates `DatabaseWriteError` on SQLite failures, returning `HTTP 500`.
 
 
 Every executed task persists a verifiable `TaskReport` (`agent/core/models.py`) containing the exact trail of evidence:

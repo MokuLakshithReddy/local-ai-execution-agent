@@ -111,6 +111,19 @@ def _is_legitimate_and_relevant_check(
     return False
 
 
+def _extract_test_nodes_and_assertions(check: VerificationCheck) -> List[str]:
+    """Extracts executed test function names, node IDs, and explicit assertion targets from check output."""
+    nodes = []
+    text = f"{check.command or ''}\n{check.output}\n{check.evidence_summary}".lower()
+    for m in re.finditer(r"(?:tests?[\\/]\S+::)?(test_[a-zA-Z0-9_]+)", text):
+        nodes.append(m.group(1))
+    for m in re.finditer(r"-k\s+[\"']?([^\"'\s]+)[\"']?", check.command or ""):
+        nodes.append(m.group(1).lower())
+    for m in re.finditer(r"test_[a-zA-Z0-9_]+(?:\.py)?", check.command or ""):
+        nodes.append(m.group(0).lower().replace(".py", ""))
+    return list(set(nodes))
+
+
 class VerificationEngine:
     def __init__(self):
         self.recorded_checks: List[VerificationCheck] = []
@@ -164,14 +177,37 @@ class VerificationEngine:
             for criterion in acceptance_criteria:
                 c_lower = criterion.lower()
                 c_words = set(re.findall(r"[a-zA-Z0-9_-]{3,}", c_lower))
-                c_words = {w for w in c_words if w not in {"the", "and", "for", "with", "this", "that", "from", "should", "must", "verify", "check"}}
+                c_words = {w for w in c_words if w not in {"the", "and", "for", "with", "this", "that", "from", "should", "must", "verify", "check", "test"}}
 
-                # Find relevant check whose command, output, or name explicitly exercises this criterion
                 matching_check = None
+                matched_proof = None
+                verification_tier = "UNVERIFIED"
+
                 for check in relevant_passed_checks:
-                    check_text = f"{(check.command or '')} {check.check_name} {check.output}".lower()
-                    if any(w in check_text for w in c_words):
-                        matching_check = check
+                    test_nodes = _extract_test_nodes_and_assertions(check)
+                    check_text = f"{(check.command or '')}\n{check.check_name}\n{check.output}\n{check.evidence_summary}".lower()
+
+                    # 1. Check for targeted test node (highest fidelity tier: VERIFIED_TARGETED_TEST)
+                    for node in test_nodes:
+                        node_terms = set(re.findall(r"[a-z0-9]+", node))
+                        if len(c_words.intersection(node_terms)) >= 2:
+                            matching_check = check
+                            matched_proof = f"Targeted test node '{node}' passed"
+                            verification_tier = "VERIFIED_TARGETED_TEST"
+                            break
+                    if matching_check:
+                        break
+
+                    # 2. Check for explicit structured assertion in output/summary (tier: VERIFIED_ASSERTION)
+                    for line in check_text.splitlines():
+                        line_words = set(re.findall(r"[a-z0-9_-]+", line))
+                        common = c_words.intersection(line_words)
+                        if len(common) >= 2 and any(p in line for p in ("passed", "assert", "verified", "succeeded", "ok", "200", "401", "403", "404", "error", "closed")):
+                            matching_check = check
+                            matched_proof = f"Assertion verified: {line.strip()[:120]}"
+                            verification_tier = "VERIFIED_ASSERTION"
+                            break
+                    if matching_check:
                         break
 
                 if matching_check:
@@ -180,25 +216,33 @@ class VerificationEngine:
                             criterion=criterion,
                             requirement=f"Evidence verified via {matching_check.check_name}",
                             demonstrated=True,
-                            evidence_type="test_execution",
+                            evidence_type="assertion_verified" if verification_tier == "VERIFIED_ASSERTION" else "test_execution",
                             evidence_summary=matching_check.evidence_summary,
                             linked_check=matching_check.command or matching_check.check_name,
+                            exit_status=matching_check.exit_code,
+                            test_node_or_assertion=matched_proof,
+                            verification_tier=verification_tier,
                         )
                     )
                 else:
+                    best_general = relevant_passed_checks[0] if relevant_passed_checks else None
                     criteria_evidence.append(
                         CriterionEvidence(
                             criterion=criterion,
                             requirement="Concrete test execution demonstrating requirement",
                             demonstrated=False,
-                            evidence_type="missing_evidence",
-                            evidence_summary="No executed check demonstrated coverage of this specific criterion.",
-                            linked_check=None,
+                            evidence_type="unverified",
+                            evidence_summary=f"Check '{best_general.check_name}' exited 0, but no targeted test node or assertion proved this criterion." if best_general else "No passing check executed for this criterion.",
+                            linked_check=best_general.command if best_general else None,
+                            exit_status=best_general.exit_code if best_general else None,
+                            test_node_or_assertion=None,
+                            verification_tier="UNVERIFIED",
                         )
                     )
                     skipped_or_failed.append(
                         f"Unmet Acceptance Criterion: '{criterion}' was not demonstrated by concrete verification evidence."
                     )
+
 
         # 2. Derive required criteria from goal keywords
         required_criteria = []
