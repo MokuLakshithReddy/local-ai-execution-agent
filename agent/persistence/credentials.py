@@ -63,24 +63,9 @@ class CredentialVault:
                     f"Insecure permissions on key directory '{self._key_dir}' (mode: {oct(dir_st.st_mode)}). Expected 0700."
                 )
 
-        # 3. If key file already exists, verify permissions and load
+        # 3. If key file already exists, verify permissions and load via shared routine
         if os.path.exists(self._key_file):
-            try:
-                if sys.platform != "win32":
-                    st = os.stat(self._key_file)
-                    if (st.st_mode & 0o077) != 0:
-                        raise CredentialEncryptionError(
-                            f"Insecure permissions on vault key '{self._key_file}' (mode: {oct(st.st_mode)}). Expected 0600."
-                        )
-                with open(self._key_file, "rb") as f:
-                    content = f.read().strip()
-                if not content or len(content) < 32:
-                    raise CredentialEncryptionError(f"Corrupted or empty vault key file '{self._key_file}'.")
-                return content
-            except Exception as e:
-                if isinstance(e, CredentialEncryptionError):
-                    raise
-                raise CredentialEncryptionError(f"Failed to read existing vault key '{self._key_file}': {str(e)}") from e
+            return self._validate_and_read_posix_key(self._key_file)
 
         # 4. Key does not exist: generate and atomically create with exclusive lock (O_EXCL)
         key = Fernet.generate_key()
@@ -90,20 +75,17 @@ class CredentialVault:
             try:
                 fd = os.open(self._key_file, flags, 0o600)
             except FileExistsError:
-                # Concurrent creator finished first: read and verify their key
-                with open(self._key_file, "rb") as f:
-                    return f.read().strip()
+                # Concurrent creator finished first: validate and read their key through shared routine
+                return self._validate_and_read_posix_key(self._key_file)
 
             with os.fdopen(fd, "wb") as f:
                 f.write(key)
 
             if sys.platform != "win32":
                 os.chmod(self._key_file, 0o600)
-                st = os.stat(self._key_file)
-                if (st.st_mode & 0o077) != 0:
-                    raise CredentialEncryptionError(
-                        f"Failed to verify 0600 permissions on newly created vault key '{self._key_file}'."
-                    )
+
+            # Re-verify newly written key through shared validation routine
+            return self._validate_and_read_posix_key(self._key_file)
         except Exception as e:
             if os.path.exists(self._key_file) and not isinstance(e, FileExistsError):
                 try:
@@ -116,7 +98,38 @@ class CredentialVault:
                 f"POSIX vault key persistence failed. Startup aborted to prevent credential loss: {str(e)}"
             ) from e
 
-        return key
+    def _validate_and_read_posix_key(self, key_path: str) -> bytes:
+        """
+        Shared validation routine for POSIX vault key.
+        Guarantees that:
+        1. Key path is not a symlink.
+        2. Key directory is not a symlink and has secure permissions.
+        3. File mode has strict 0600 permissions on POSIX.
+        4. File content is a valid, uncorrupted key of at least 32 bytes.
+        """
+        if os.path.islink(key_path):
+            raise CredentialEncryptionError(f"Symlink attack detected at key file '{key_path}'.")
+
+        if not os.path.exists(key_path):
+            raise CredentialEncryptionError(f"Vault key file does not exist: '{key_path}'.")
+
+        if sys.platform != "win32":
+            st = os.stat(key_path)
+            if (st.st_mode & 0o077) != 0:
+                raise CredentialEncryptionError(
+                    f"Insecure permissions on vault key '{key_path}' (mode: {oct(st.st_mode)}). Expected 0600."
+                )
+
+        try:
+            with open(key_path, "rb") as f:
+                content = f.read().strip()
+        except Exception as e:
+            raise CredentialEncryptionError(f"Failed to read vault key '{key_path}': {str(e)}") from e
+
+        if not content or len(content) < 32:
+            raise CredentialEncryptionError(f"Corrupted or empty vault key file '{key_path}'.")
+
+        return content
 
     def encrypt(self, plain_text: str) -> str:
         """

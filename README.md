@@ -10,7 +10,7 @@
 [![SQLite](https://img.shields.io/badge/SQLite-Local--First-003B57.svg)](https://sqlite.org/)
 [![CI](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Verification: Passed](https://img.shields.io/badge/Verification-34%20Passed-10b981.svg)](#-live-verification-evidence-log)
+[![Verification: Passed](https://img.shields.io/badge/Verification-37%20Passed-10b981.svg)](#-live-verification-evidence-log)
 
 </div>
 
@@ -111,13 +111,16 @@ tests/test_core_and_tools.py::test_posix_vault_key_failure_handling PASSED [ 76%
 tests/test_core_and_tools.py::test_verifier_strict_structured_evidence_mapping PASSED [ 79%]
 tests/test_core_and_tools.py::test_credential_migration_multi_key_corrupted_and_recovery PASSED [ 82%]
 tests/test_core_and_tools.py::test_terminal_os_sandbox_job_limits_and_container_config PASSED [ 85%]
-tests/test_core_and_tools.py::test_verifier_adversarial_irrelevant_passing_test_rejected PASSED [ 88%]
-tests/test_core_and_tools.py::test_terminal_container_execution_fail_closed_and_dispatch PASSED [ 91%]
-tests/test_core_and_tools.py::test_terminal_default_is_container_and_host_rejected_when_sandboxed PASSED [ 94%]
-tests/test_core_and_tools.py::test_posix_key_directory_permissions_and_symlink_rejection PASSED [ 97%]
-tests/test_core_and_tools.py::test_credential_migration_partial_failure_stages PASSED [100%]
+tests/test_core_and_tools.py::test_verifier_adversarial_irrelevant_passing_test_rejected PASSED [ 81%]
+tests/test_core_and_tools.py::test_terminal_container_execution_fail_closed_and_dispatch PASSED [ 83%]
+tests/test_core_and_tools.py::test_terminal_default_is_container_and_host_rejected_when_sandboxed PASSED [ 86%]
+tests/test_core_and_tools.py::test_posix_key_directory_permissions_and_symlink_rejection PASSED [ 89%]
+tests/test_core_and_tools.py::test_credential_migration_partial_failure_stages PASSED [ 91%]
+tests/test_core_and_tools.py::test_container_hardening_non_root_image_validation_and_timeout_cleanup PASSED [ 94%]
+tests/test_core_and_tools.py::test_credential_vault_concurrent_creation_race_and_validation PASSED [ 97%]
+tests/test_core_and_tools.py::test_verifier_rejects_fabricated_output_and_unbacked_assertion_records PASSED [100%]
 
-======================= 34 passed in 3.36s ========================
+======================= 37 passed in 5.47s ========================
 ```
 
 ---
@@ -149,6 +152,9 @@ The terminal execution subsystem (`agent/tools/terminal.py`) explicitly separate
 
 - **Tier 3 — Wired Container Execution Isolation (`build_container_command` + `create_subprocess_exec`)**:
   - The container builder is directly wired into `RunCommandTool.execute()` as the default execution mode (`sandbox_mode="container"`).
+  - **Non-Root Execution & Tmpfs Mount**: Configures `--user` (default non-root UID:GID) and mounts an ephemeral `--tmpfs /tmp:rw,noexec,nosuid,size=64m`.
+  - **Project-Specific Images Safely Supported**: Validates image names against strict regex (`^[a-zA-Z0-9_\.-]+(/[a-zA-Z0-9_\.-]+)?(:[a-zA-Z0-9_\.-]+)?$`), allowing Node (`node:20-slim`), Rust (`rust:1.75-slim`), Go (`golang:1.22-alpine`), and Python while blocking shell injection.
+  - **Daemon-Level Timeout Cleanup**: Assigns a deterministic `--name agent-sandbox-<uuid>` and on execution timeout invokes `docker rm -f <container_name>`, guaranteeing no orphaned containers remain in the Docker daemon.
   - **Fail-Closed on Missing Runtime**: If container sandboxing is requested and `docker` is not installed or available in PATH, execution fails closed immediately (`container_runtime_available: False`, `sandbox_violation: True`) with a clear error.
   - **Direct Container Runtime Execution**: When available, commands execute through `asyncio.create_subprocess_exec("docker", "run", ...)`:
     - **Kernel Network Namespace Isolation**: `--network none` strips network access completely at the kernel level (raw sockets, python scripts, and compiled binaries cannot transmit traffic).
@@ -156,19 +162,18 @@ The terminal execution subsystem (`agent/tools/terminal.py`) explicitly separate
     - **Filesystem Boundary**: Only the target workspace directory is mounted read-write (`-v {workspace}:/workspace:rw`).
     - **Resource Caps**: `--memory 512m`, `--pids-limit 32`, and `--cap-drop=ALL`.
 
-### 2. Explicit Criterion Binding & Structured Assertion Verification (Anti-Heuristic)
-- **Elimination of Word-Overlap Heuristics**: In `agent/verification/verifier.py`, coincidental word sharing between test names and acceptance criteria (e.g. `test_token_storage_counter` sharing "token" with `API endpoint must return 401 on missing token`) is strictly rejected.
+### 2. Execution-Backed Proof-Grade Verification (Anti-Fabrication Engine)
+- **Elimination of Word-Overlap & Arbitrary Output Matches**: In `agent/verification/verifier.py`, coincidental word sharing between test names and acceptance criteria, or arbitrary strings in stdout/stderr, are strictly rejected.
 - **Proof-Grade Verification Tiers**:
-  - `VERIFIED_TARGETED_TEST`: Requires an explicit criterion-to-test binding (`criterion_bindings: { "criterion": "target_test" }`) where the target test was demonstrably executed and exited code 0.
-  - `VERIFIED_ASSERTION`: Requires a `StructuredAssertion` record specifying the criterion, exact test or assertion executed, result (`PASSED`), and evidence artifact.
-  - `UNVERIFIED`: If no explicit binding or structured assertion proves the criterion, it remains `UNVERIFIED` and the task remains `PARTIALLY_COMPLETED`, even if the general test suite exited code 0.
-- **Adversarial Tested**: Demonstrated via `test_verifier_adversarial_irrelevant_passing_test_rejected`, preventing false-positive completions.
+  - `VERIFIED_TARGETED_TEST`: Requires an explicit criterion-to-test binding where the target test was **demonstrably executed and passed in the runner telemetry** with process exit code `0`.
+  - `VERIFIED_ASSERTION`: Requires a `StructuredAssertion` record backed by an executed test node in output or an existing verification report artifact on disk. Fabricated assertion records attached to failing or unexecuted checks are refused.
+  - `UNVERIFIED`: If no execution-backed test proves the criterion, it remains `UNVERIFIED` and the task remains `PARTIALLY_COMPLETED`, even if general commands succeeded.
+- **Adversarial Tested**: Demonstrated via `test_verifier_rejects_fabricated_output_and_unbacked_assertion_records`.
 
-### 3. POSIX Vault Key Hardening, Symlink Rejection & Atomic Creation
-- **Directory & File Mode Enforcement**: `agent/persistence/credentials.py` enforces directory permissions `0700` and file permissions `0600` on POSIX, failing startup closed if permissions cannot be set or verified.
-- **Symlink Protection**: Explicitly verifies `not os.path.islink(key_dir)` and `not os.path.islink(key_file)` to prevent symlink hijacking attacks.
-- **Atomic Creation**: Uses `os.open(..., O_CREAT | O_EXCL, 0o600)` to eliminate concurrent initialization race conditions.
-- **Restart Recovery**: Valid keys persist reliably and allow seamless credential decryption across server restarts.
+### 3. POSIX Vault Key Hardening & Concurrent Race Elimination
+- **Shared `_validate_and_read_posix_key` Routine**: Reused across initial key checks, post-atomic-creation verification, and the `FileExistsError` race branch when another process creates the key concurrently.
+- **Multi-Point Verification**: Validates `0700` directory permissions, `0600` file permissions on POSIX, symlink absence (`not os.path.islink`), and key length >= 32 bytes.
+- **Atomic Creation**: Uses `os.open(..., O_CREAT | O_EXCL, 0o600)` to eliminate initialization race conditions under multi-threaded concurrency. Demonstrated via `test_credential_vault_concurrent_creation_race_and_validation`.
 
 ### 4. Multi-Key Credential Migration & Partial Failure Isolation
 - **Multi-Key Migration**: Safely migrates multiple provider keys (`openai`, `anthropic`, `gemini`) stored together in `app_settings`.

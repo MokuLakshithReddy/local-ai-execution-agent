@@ -118,17 +118,35 @@ def _is_legitimate_and_relevant_check(
     return False
 
 
-def _extract_test_nodes_and_assertions(check: VerificationCheck) -> List[str]:
-    """Extracts executed test function names, node IDs, and explicit assertion targets from check output."""
-    nodes = []
-    text = f"{check.command or ''}\n{check.output}\n{check.evidence_summary}".lower()
-    for m in re.finditer(r"(?:tests?[\\/]\S+::)?(test_[a-zA-Z0-9_]+)", text):
-        nodes.append(m.group(1))
-    for m in re.finditer(r"-k\s+[\"']?([^\"'\s]+)[\"']?", check.command or ""):
-        nodes.append(m.group(1).lower())
-    for m in re.finditer(r"test_[a-zA-Z0-9_]+(?:\.py)?", check.command or ""):
-        nodes.append(m.group(0).lower().replace(".py", ""))
-    return list(set(nodes))
+def _extract_executed_passed_test_nodes(check: VerificationCheck) -> List[str]:
+    """
+    Extracts test node IDs and test functions that were demonstrably EXECUTED and PASSED by a runner.
+    Only valid if check exited with exit_code == 0 and check.success is True.
+    Rejects targets appearing merely in command arguments, summary strings, or failure traces.
+    """
+    if check.exit_code != 0 or not check.success:
+        return []
+
+    output = check.output or ""
+    passed_nodes = []
+
+    # 1. Pytest verbose: "tests/test_auth.py::test_login PASSED" or "test_login PASSED"
+    for m in re.finditer(r"(?:^|\s)(?:[\w./\\]+::)?(test_[a-zA-Z0-9_]+)\s+(?:PASSED|passed)\b", output, re.MULTILINE):
+        passed_nodes.append(m.group(1).lower())
+
+    # 2. Pytest prefixed: "PASSED tests/test_auth.py::test_login"
+    for m in re.finditer(r"\bPASSED\s+(?:[\w./\\]+::)?(test_[a-zA-Z0-9_]+)\b", output):
+        passed_nodes.append(m.group(1).lower())
+
+    # 3. Unittest: "test_login (tests.test_auth.AuthTests) ... ok" or "test_login ... ok"
+    for m in re.finditer(r"(?:^|\s)(test_[a-zA-Z0-9_]+)\s*(?:\([^)]*\))?\s*\.\.\.\s*ok\b", output, re.IGNORECASE | re.MULTILINE):
+        passed_nodes.append(m.group(1).lower())
+
+    # 4. Jest / Vitest: "✓ test_login" or "PASS ... test_login"
+    for m in re.finditer(r"(?:✓|PASS)\s+(?:[\w./\\]+>\s*)?(test_[a-zA-Z0-9_]+)", output):
+        passed_nodes.append(m.group(1).lower())
+
+    return list(set(passed_nodes))
 
 
 class VerificationEngine:
@@ -155,7 +173,7 @@ class VerificationEngine:
         Synthesizes observed evidence into a structured completion report.
         Strictly requires evidence linking checks to acceptance criteria.
         Requires explicit criterion-to-test mappings or structured verification results.
-        Rejects keyword overlap or coincidental word-matching as insufficient proof.
+        Rejects keyword overlap, coincidental word-matching, or fabricated output strings.
         Guarantees that CANCELLED, BLOCKED, or FAILED tasks never report false success.
         """
         # Determine the latest outcome for each verification command/check
@@ -164,8 +182,8 @@ class VerificationEngine:
             key = (c.command or c.check_name).strip()
             latest_checks[key] = c
 
-        passed_checks = [c for c in latest_checks.values() if c.success]
-        unresolved_failed_checks = [c for c in latest_checks.values() if not c.success]
+        passed_checks = [c for c in latest_checks.values() if c.success and c.exit_code == 0]
+        unresolved_failed_checks = [c for c in latest_checks.values() if not (c.success and c.exit_code == 0)]
 
         # Filter for legitimate & relevant checks
         relevant_passed_checks = [
@@ -204,20 +222,35 @@ class VerificationEngine:
 
                 if target_test:
                     target_test_clean = target_test.strip().lower()
-                    for check in relevant_passed_checks:
-                        test_nodes = [n.lower() for n in _extract_test_nodes_and_assertions(check)]
-                        cmd_lower = (check.command or "").lower()
-                        check_name_lower = check.check_name.lower()
-                        output_lower = check.output.lower()
+                    target_test_name = target_test_clean.split("::")[-1].replace(".py", "")
 
-                        if (
-                            any(target_test_clean in node or node in target_test_clean for node in test_nodes)
-                            or target_test_clean in cmd_lower
-                            or target_test_clean in check_name_lower
-                            or target_test_clean in output_lower
-                        ):
+                    for check in relevant_passed_checks:
+                        passed_nodes = _extract_executed_passed_test_nodes(check)
+                        cmd_lower = (check.command or "").lower()
+
+                        # Case A: Executed test node matched directly in runner output
+                        node_matched = target_test_name in passed_nodes or any(
+                            target_test_name in p or p in target_test_name for p in passed_nodes
+                        )
+
+                        # Case B: Explicit test file targeted directly in command line and passed
+                        file_matched = (
+                            (target_test_clean.endswith(".py") or "test_" in target_test_clean)
+                            and target_test_name in cmd_lower
+                            and (
+                                check.exit_code == 0
+                                and (
+                                    "passed" in (check.output or "").lower()
+                                    or "verified" in (check.output or "").lower()
+                                    or "ok" in (check.output or "").lower()
+                                    or len(passed_nodes) > 0
+                                )
+                            )
+                        )
+
+                        if node_matched or file_matched:
                             matching_check = check
-                            matched_proof = f"Explicitly bound test target '{target_test}' executed and passed"
+                            matched_proof = f"Executed test target '{target_test}' passed with exit code 0"
                             matched_artifact = check.evidence_artifact or (check.command or check.check_name)
                             verification_tier = "VERIFIED_TARGETED_TEST"
                             break
@@ -225,14 +258,37 @@ class VerificationEngine:
                 # Check 2: Structured verification assertion on check model
                 if not matching_check:
                     for check in relevant_passed_checks:
+                        passed_nodes = _extract_executed_passed_test_nodes(check)
+
                         for sa in getattr(check, "structured_assertions", []):
                             if sa.criterion.strip().lower() == criterion.strip().lower():
-                                if sa.result.upper() == "PASSED":
-                                    matching_check = check
-                                    matched_proof = f"Structured assertion: '{sa.target_test_or_assertion}' (result: PASSED)"
-                                    matched_artifact = sa.evidence_artifact or check.evidence_artifact or (check.command or check.check_name)
-                                    verification_tier = "VERIFIED_ASSERTION"
-                                    break
+                                if sa.result.upper() != "PASSED":
+                                    continue
+
+                                target_clean = sa.target_test_or_assertion.strip().lower()
+                                target_name = target_clean.split("::")[-1]
+
+                                # Assertion MUST be execution-backed by an executed test node OR a verified artifact file
+                                is_grounded = (
+                                    target_name in passed_nodes
+                                    or any(target_clean in p or p in target_clean for p in passed_nodes)
+                                    or (
+                                        sa.evidence_artifact
+                                        and os.path.exists(sa.evidence_artifact)
+                                        and target_clean in (check.output or "").lower()
+                                        and ("passed" in (check.output or "").lower() or "ok" in (check.output or "").lower())
+                                    )
+                                )
+
+                                if not is_grounded:
+                                    # Fabricated or unbacked assertion record without execution proof
+                                    continue
+
+                                matching_check = check
+                                matched_proof = f"Structured assertion: '{sa.target_test_or_assertion}' (result: PASSED, execution-backed)"
+                                matched_artifact = sa.evidence_artifact or check.evidence_artifact or (check.command or check.check_name)
+                                verification_tier = "VERIFIED_ASSERTION"
+                                break
                         if matching_check:
                             break
 

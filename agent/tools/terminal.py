@@ -6,7 +6,7 @@ import asyncio
 import os
 import sys
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional, List
 import re
 import psutil
 from agent.tools.base import BaseTool
@@ -266,6 +266,19 @@ class WindowsJobSandbox:
             self._handle = None
 
 
+CONTAINER_IMAGE_PATTERN = re.compile(r"^[a-zA-Z0-9_\.-]+(/[a-zA-Z0-9_\.-]+)?(:[a-zA-Z0-9_\.-]+)?$")
+
+
+def get_default_container_user() -> Optional[str]:
+    """Derives a safe non-root user ID for Linux container isolation."""
+    if hasattr(os, "getuid") and hasattr(os, "getgid"):
+        uid = os.getuid()
+        gid = os.getgid()
+        if uid != 0:
+            return f"{uid}:{gid}"
+    return "1000:1000"
+
+
 def build_container_command(
     command: str,
     workspace_path: str,
@@ -273,28 +286,49 @@ def build_container_command(
     memory_limit: str = "512m",
     pids_limit: int = 32,
     allow_network: bool = False,
+    container_name: Optional[str] = None,
+    user: Optional[str] = None,
 ) -> list[str]:
     """
     Constructs an OS container sandbox command line enforcing:
-    1. Filesystem boundary: rootfs is read-only (--read-only), only /workspace is mounted rw.
+    1. Filesystem boundary: rootfs is read-only (--read-only), tmpfs for /tmp, only /workspace is mounted rw.
     2. Network boundary: complete network namespace isolation (--network none) when allow_network=False.
     3. Resource limits: memory limit (--memory) and process fork limit (--pids-limit).
     4. Capability drop: drops all Linux capabilities (--cap-drop all).
+    5. Non-root user: enforces non-root execution (--user).
+    6. Deterministic container identification: sets --name for reliable lifecycle cleanup on timeouts.
+    7. Image validation: strictly validates container image name against regex pattern.
     """
+    if not CONTAINER_IMAGE_PATTERN.match(image):
+        raise SandboxViolationError(f"Unsafe or invalid container image name: '{image}'")
+
     real_ws = os.path.realpath(workspace_path)
     net_flag = "bridge" if allow_network else "none"
-    return [
-        "docker", "run", "--rm", "-i",
+    run_user = user if user is not None else get_default_container_user()
+
+    cmd = ["docker", "run", "--rm", "-i"]
+    if container_name:
+        cmd.extend(["--name", container_name])
+
+    cmd.extend([
         f"--network={net_flag}",
         "--read-only",
         "--cap-drop=ALL",
         f"--memory={memory_limit}",
         f"--pids-limit={pids_limit}",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+    ])
+
+    if run_user:
+        cmd.extend(["--user", run_user])
+
+    cmd.extend([
         "-v", f"{real_ws}:/workspace:rw",
         "-w", "/workspace",
         image,
         "sh", "-c", command,
-    ]
+    ])
+    return cmd
 
 
 def _kill_process_tree(pid: int):
@@ -469,14 +503,32 @@ class RunCommandTool(BaseTool):
                     execution_time_ms=(time.time() - t0) * 1000,
                 )
 
-            container_args = build_container_command(
-                command=command,
-                workspace_path=real_workspace,
-                image=kwargs.get("container_image", "python:3.12-slim"),
-                memory_limit=kwargs.get("container_memory", "512m"),
-                pids_limit=kwargs.get("container_pids", 32),
-                allow_network=allow_network,
-            )
+            import uuid
+            container_name = f"agent-sandbox-{uuid.uuid4().hex[:12]}"
+            container_image = kwargs.get("container_image") or kwargs.get("image") or "python:3.12-slim"
+            container_user = kwargs.get("container_user")
+
+            try:
+                container_args = build_container_command(
+                    command=command,
+                    workspace_path=real_workspace,
+                    image=container_image,
+                    memory_limit=kwargs.get("container_memory", "512m"),
+                    pids_limit=kwargs.get("container_pids", 32),
+                    allow_network=allow_network,
+                    container_name=container_name,
+                    user=container_user,
+                )
+            except SandboxViolationError as sve:
+                return ActionResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    success=False,
+                    output="",
+                    error=f"Container configuration rejected: {str(sve)}",
+                    artifacts={"sandbox_mode": "container", "sandbox_violation": True},
+                    execution_time_ms=(time.time() - t0) * 1000,
+                )
 
             try:
                 process = await asyncio.create_subprocess_exec(
@@ -499,13 +551,28 @@ class RunCommandTool(BaseTool):
                 except asyncio.TimeoutError:
                     if process.pid:
                         _kill_process_tree(process.pid)
+                    # Forcefully stop and remove running container in Docker daemon
+                    try:
+                        cleanup_proc = await asyncio.create_subprocess_exec(
+                            docker_bin, "rm", "-f", container_name,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await asyncio.wait_for(cleanup_proc.wait(), timeout=5.0)
+                    except Exception:
+                        pass
                     return ActionResult(
                         call_id=call_id,
                         tool_name=self.name,
                         success=False,
                         output="",
                         error=f"Container execution timed out after {timeout} seconds.",
-                        artifacts={"sandbox_mode": "container", "isolated": True},
+                        artifacts={
+                            "sandbox_mode": "container",
+                            "isolated": True,
+                            "container_name": container_name,
+                            "container_cleaned_up": True,
+                        },
                         execution_time_ms=(time.time() - t0) * 1000,
                     )
 

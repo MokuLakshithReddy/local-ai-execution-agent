@@ -1411,6 +1411,275 @@ async def test_credential_migration_partial_failure_stages():
                 assert stored.startswith("dpapi:") or stored.startswith("fernet:")
 
 
+@pytest.mark.asyncio
+async def test_container_hardening_non_root_image_validation_and_timeout_cleanup():
+    """Validates Priority 0:
+    1. Container command enforces non-root execution (--user), read-only rootfs, tmpfs, and container name.
+    2. Invalid or dangerous container images are strictly rejected with SandboxViolationError.
+    3. Project-specific container images (Node, Rust, Go) are safely accepted.
+    4. On execution timeout, 'docker rm -f <container_name>' is called to purge the running container."""
+    from unittest.mock import patch, AsyncMock
+    from agent.tools.terminal import (
+        build_container_command,
+        RunCommandTool,
+        SandboxViolationError,
+    )
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        # 1. Non-root user and security flags
+        cmd_args = build_container_command(
+            command="echo 1",
+            workspace_path=temp_dir,
+            image="python:3.12-slim",
+            container_name="test-sandbox-1234",
+            user="1000:1000",
+        )
+        assert "--user" in cmd_args
+        assert "1000:1000" in cmd_args
+        assert "--read-only" in cmd_args
+        assert "--tmpfs" in cmd_args
+        assert "/tmp:rw,noexec,nosuid,size=64m" in cmd_args
+        assert "--name" in cmd_args
+        assert "test-sandbox-1234" in cmd_args
+
+        # 2. Dangerous image rejection
+        for dangerous_image in ["python:3.12; rm -rf /", "bad image $(whoami)", "img&&evil", "python:3.12|sh"]:
+            with pytest.raises(SandboxViolationError, match="Unsafe or invalid container image"):
+                build_container_command(
+                    command="echo 1",
+                    workspace_path=temp_dir,
+                    image=dangerous_image,
+                )
+
+        # 3. Project-specific images accepted safely
+        for safe_image in ["node:20-slim", "rust:1.75-slim", "golang:1.22-alpine", "python:3.11-alpine"]:
+            safe_args = build_container_command(
+                command="echo 1",
+                workspace_path=temp_dir,
+                image=safe_image,
+            )
+            assert safe_image in safe_args
+
+        # 4. Timeout cleanup integration: verifies docker rm -f is called
+        tool = RunCommandTool()
+        mock_proc = AsyncMock()
+        mock_proc.pid = 99999
+        mock_proc.returncode = None
+
+        async def fake_slow_read(*args, **kwargs):
+            await asyncio.sleep(10)
+            return b""
+
+        mock_proc.stdout = AsyncMock()
+        mock_proc.stdout.read = fake_slow_read
+        mock_proc.stderr = AsyncMock()
+        mock_proc.stderr.read = fake_slow_read
+        mock_proc.wait = AsyncMock()
+
+        cleanup_calls = []
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            if args[0] == "/usr/bin/docker" and len(args) > 1 and args[1] == "rm":
+                cleanup_calls.append(args)
+                mock_clean = AsyncMock()
+                mock_clean.wait = AsyncMock(return_value=0)
+                return mock_clean
+            return mock_proc
+
+        with patch("shutil.which", return_value="/usr/bin/docker"), \
+             patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec), \
+             patch("agent.tools.terminal._kill_process_tree"):
+            timeout_res = await tool.execute(
+                call_id="c_timeout_test",
+                workspace_path=temp_dir,
+                command="sleep 100",
+                timeout_seconds=1,
+                sandbox_mode="container",
+            )
+            assert timeout_res.success is False
+            assert "timed out after" in timeout_res.error
+            assert timeout_res.artifacts.get("container_cleaned_up") is True
+            assert timeout_res.artifacts.get("container_name") is not None
+            # Verify cleanup was invoked with docker rm -f <container_name>
+            assert len(cleanup_calls) == 1
+            assert cleanup_calls[0][1] == "rm"
+            assert cleanup_calls[0][2] == "-f"
+            assert cleanup_calls[0][3] == timeout_res.artifacts.get("container_name")
+
+
+def test_credential_vault_concurrent_creation_race_and_validation():
+    """Validates Priority 1:
+    1. Reuses shared validation routine in FileExistsError race branch.
+    2. Rejects insecure file permissions, symlinks, and corrupted keys in concurrent creation.
+    3. Thread-safe initialization under multi-threaded concurrency."""
+    import concurrent.futures
+    from unittest.mock import patch, MagicMock
+    from cryptography.fernet import Fernet
+    from agent.persistence.credentials import CredentialVault, CredentialEncryptionError
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        key_dir = os.path.join(temp_dir, "race_keys")
+        key_file = os.path.join(key_dir, ".vault_key")
+
+        # Case A: Concurrently created key has insecure permissions (simulated)
+        os.makedirs(key_dir, mode=0o700, exist_ok=True)
+        with open(key_file, "wb") as f:
+            f.write(Fernet.generate_key())
+
+        def fake_stat(path):
+            res = MagicMock()
+            if os.path.abspath(str(path)) == os.path.abspath(key_dir):
+                res.st_mode = 0o40700
+            else:
+                res.st_mode = 0o100644  # Insecure 0644 file permissions
+            return res
+
+        with patch("sys.platform", "linux"), patch("os.stat", side_effect=fake_stat):
+            with pytest.raises(CredentialEncryptionError, match="Insecure permissions on vault key"):
+                CredentialVault(key_dir=key_dir, is_windows=False)
+
+        # Case B: Concurrently created key is a symlink
+        symlink_target = os.path.join(temp_dir, "symlink_secret.txt")
+        with open(symlink_target, "wb") as f:
+            f.write(Fernet.generate_key())
+
+        symlink_file = os.path.join(key_dir, ".symlink_key")
+        try:
+            os.symlink(symlink_target, symlink_file)
+            vault = CredentialVault(key_dir=key_dir, is_windows=False)
+            with pytest.raises(CredentialEncryptionError, match="Symlink attack detected"):
+                vault._validate_and_read_posix_key(symlink_file)
+        except (OSError, NotImplementedError):
+            pass  # On Windows without SeCreateSymbolicLinkPrivilege
+
+        # Case C: Concurrently created key is corrupted / empty
+        with open(key_file, "wb") as f:
+            f.write(b"too_short")
+        vault = CredentialVault(key_dir=key_dir, is_windows=False)
+        with pytest.raises(CredentialEncryptionError, match="Corrupted or empty"):
+            vault._validate_and_read_posix_key(key_file)
+
+        # Case D: Multi-threaded concurrent initialization race
+        clean_dir = os.path.join(temp_dir, "multi_race")
+
+        def worker():
+            v = CredentialVault(key_dir=clean_dir, is_windows=False)
+            enc = v.encrypt("shared-secret-data")
+            dec = v.decrypt(enc)
+            return dec
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(worker) for _ in range(16)]
+            results = [f.result() for f in futures]
+
+        assert all(r == "shared-secret-data" for r in results)
+
+
+def test_verifier_rejects_fabricated_output_and_unbacked_assertion_records():
+    """Validates Priority 1: Proof-grade verification evidence.
+    1. Rejects exit code != 0 claiming success even if test name appears in output.
+    2. Rejects fabricated StructuredAssertion records that are not execution-backed.
+    3. Confirms that only genuine executed test nodes with exit code 0 establish verification."""
+    ve = VerificationEngine()
+    criteria = ["Secure authentication required"]
+
+    # 1. Fabricated output: check failed (exit_code != 0), but output mentions test name
+    failing_check = VerificationCheck(
+        check_name="Failing Auth Test",
+        check_type="test",
+        command="pytest tests/test_auth.py",
+        success=False,
+        exit_code=1,
+        output="FAILED tests/test_auth.py::test_auth_security - assertion failed\n1 failed in 0.1s",
+        evidence_summary="test_auth_security FAILED",
+        criterion_bindings={"Secure authentication required": "test_auth_security"},
+    )
+    ve.record_check(failing_check)
+
+    rep1 = ve.evaluate_completion(
+        task_id="t_fab_1",
+        goal="Implement secure auth",
+        actions_taken=["Ran failing test"],
+        modified_files=["agent/api/server.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+    assert rep1.status == TaskStatus.PARTIALLY_COMPLETED
+    assert rep1.acceptance_criteria_satisfied is False
+    assert rep1.criteria_evidence[0].demonstrated is False
+    assert rep1.criteria_evidence[0].verification_tier == "UNVERIFIED"
+
+    # 2. Fabricated StructuredAssertion: caller attaches PASSED record, but check did not execute it
+    ve2 = VerificationEngine()
+    unbacked_check = VerificationCheck(
+        check_name="Echo Test",
+        check_type="test",
+        command="python -c \"print('test executed')\"",
+        success=True,
+        exit_code=0,
+        output="test executed",
+        evidence_summary="Output printed test executed",
+        structured_assertions=[
+            StructuredAssertion(
+                criterion="Secure authentication required",
+                target_test_or_assertion="tests/test_auth.py::test_auth_security",
+                result="PASSED",
+                evidence_artifact=None,
+            )
+        ],
+    )
+    ve2.record_check(unbacked_check)
+
+    rep2 = ve2.evaluate_completion(
+        task_id="t_fab_2",
+        goal="Implement secure auth",
+        actions_taken=["Ran echo test with fabricated assertion"],
+        modified_files=["agent/api/server.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+    # Must be rejected because test_auth_security was NOT an executed test node in output
+    assert rep2.status == TaskStatus.PARTIALLY_COMPLETED
+    assert rep2.acceptance_criteria_satisfied is False
+    assert rep2.criteria_evidence[0].demonstrated is False
+    assert rep2.criteria_evidence[0].verification_tier == "UNVERIFIED"
+
+    # 3. Genuine executed test node with exit code 0
+    ve3 = VerificationEngine()
+    genuine_check = VerificationCheck(
+        check_name="Genuine Pytest Suite",
+        check_type="test",
+        command="pytest tests/test_auth.py",
+        success=True,
+        exit_code=0,
+        output="tests/test_auth.py::test_auth_security PASSED\n1 passed in 0.05s",
+        evidence_summary="test_auth_security PASSED",
+        structured_assertions=[
+            StructuredAssertion(
+                criterion="Secure authentication required",
+                target_test_or_assertion="tests/test_auth.py::test_auth_security",
+                result="PASSED",
+                evidence_artifact="tests/test_auth.py",
+            )
+        ],
+    )
+    ve3.record_check(genuine_check)
+
+    rep3 = ve3.evaluate_completion(
+        task_id="t_fab_3",
+        goal="Implement secure auth",
+        actions_taken=["Ran genuine pytest suite"],
+        modified_files=["agent/api/server.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+    assert rep3.status == TaskStatus.COMPLETED
+    assert rep3.acceptance_criteria_satisfied is True
+    assert rep3.criteria_evidence[0].demonstrated is True
+    assert rep3.criteria_evidence[0].verification_tier == "VERIFIED_ASSERTION"
+
+
+
 
 
 
