@@ -99,6 +99,7 @@ class VerificationCheck(BaseModel):
     structured_assertions: List[StructuredAssertion] = Field(default_factory=list)
     criterion_bindings: Dict[str, str] = Field(default_factory=dict)
     evidence_artifact: Optional[str] = None
+    trusted_execution_record: Optional[Dict[str, Any]] = None
 
 
 class CriterionEvidence(BaseModel):

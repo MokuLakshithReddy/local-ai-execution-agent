@@ -71,6 +71,10 @@ def _is_legitimate_and_relevant_check(
         if cmd == dummy or cmd.startswith(dummy + " ") or cmd.startswith(dummy + ".") or f"&& {dummy}" in cmd or f"; {dummy}" in cmd:
             return False
 
+    # Reject inline script execution or print commands posing as tests
+    if any(fake in cmd for fake in ("python -c", "python3 -c", "node -e", "print(", "printf ", "echo ")):
+        return False
+
     # 2. Must invoke a recognized test/build/lint runner or custom script
     is_valid_runner = any(runner in cmd for runner in VALID_CHECK_RUNNERS) or (
         check.check_type in ("test", "build", "lint", "typecheck") and len(cmd) > 3
@@ -122,9 +126,32 @@ def _extract_executed_passed_test_nodes(check: VerificationCheck) -> List[str]:
     """
     Extracts test node IDs, file targets, and test functions that were demonstrably EXECUTED and PASSED by a runner.
     Only valid if check exited with exit_code == 0 and check.success is True.
-    Rejects targets appearing merely in command arguments, summary strings, or failure traces.
+    Prioritizes trusted structured runner execution records directly from the process.
+    Rejects targets appearing merely in command arguments, summary strings, arbitrary script outputs, or failure traces.
     """
     if check.exit_code != 0 or not check.success:
+        return []
+
+    # 1. Trusted execution record directly captured from structured runner output (e.g. JUnit XML, JSON report)
+    if check.trusted_execution_record and isinstance(check.trusted_execution_record, dict):
+        nodes = check.trusted_execution_record.get("passed_nodes", [])
+        return [str(n).lower() for n in nodes]
+
+    # 2. Reject commands that are not direct executions of recognized test runners
+    cmd = (check.command or "").strip().lower()
+    if not cmd:
+        return []
+
+    # Reject inline code or scripts pretending to be test runners
+    if any(fake in cmd for fake in ("python -c", "python3 -c", "node -e", "print(", "printf ", "echo ")):
+        return []
+
+    is_direct_runner = any(
+        cmd.startswith(runner) or cmd.startswith(f"python -m {runner}") or cmd.startswith(f"python3 -m {runner}")
+        for runner in ("pytest", "unittest", "npx vitest", "jest", "cargo test", "go test")
+    )
+    if not is_direct_runner:
+        # Script execution (e.g. python custom_script.py) without a trusted runner record cannot prove targeted test execution
         return []
 
     output = check.output or ""

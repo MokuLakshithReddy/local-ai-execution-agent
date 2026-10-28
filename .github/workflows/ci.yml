@@ -35,9 +35,14 @@ jobs:
       run: |
         docker pull python:3.12-slim
 
-    - name: Run Test Suite
+    - name: Run Unit & Adversarial Test Suite
       run: |
-        pytest tests/ -v
+        pytest tests/ -v -k "not test_real_docker"
+
+    - name: Run Live Docker Container Security Boundaries Integration Test
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        pytest tests/ -v -k "test_real_docker"
 
   frontend:
     name: Frontend Build & Typecheck

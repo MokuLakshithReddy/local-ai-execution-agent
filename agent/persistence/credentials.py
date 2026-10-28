@@ -6,6 +6,7 @@ Tied directly to the operating system user account without plaintext keys on dis
 """
 import os
 import sys
+import time
 import base64
 import ctypes
 from typing import Optional
@@ -63,9 +64,9 @@ class CredentialVault:
                     f"Insecure permissions on key directory '{self._key_dir}' (mode: {oct(dir_st.st_mode)}). Expected 0700."
                 )
 
-        # 3. If key file already exists, verify permissions and load via shared routine
+        # 3. If key file already exists, verify permissions and load via shared routine with concurrent write tolerance
         if os.path.exists(self._key_file):
-            return self._validate_and_read_posix_key(self._key_file)
+            return self._read_and_validate_with_retry(self._key_file)
 
         # 4. Key does not exist: generate and atomically create with exclusive lock (O_EXCL)
         key = Fernet.generate_key()
@@ -75,16 +76,9 @@ class CredentialVault:
             try:
                 fd = os.open(self._key_file, flags, 0o600)
             except FileExistsError:
-                # Concurrent creator finished first; wait briefly for creator to complete write & flush
-                for _ in range(20):
-                    try:
-                        return self._validate_and_read_posix_key(self._key_file)
-                    except CredentialEncryptionError as err:
-                        if "Corrupted or empty" in str(err):
-                            time.sleep(0.05)
-                            continue
-                        raise
-                return self._validate_and_read_posix_key(self._key_file)
+                # Concurrent creator is in the middle of creating/writing the key.
+                # Retry for up to 1 second to allow concurrent writer to write, flush, and chmod.
+                return self._read_and_validate_with_retry(self._key_file)
 
             with os.fdopen(fd, "wb") as f:
                 f.write(key)
@@ -111,6 +105,24 @@ class CredentialVault:
             raise CredentialEncryptionError(
                 f"POSIX vault key persistence failed. Startup aborted to prevent credential loss: {str(e)}"
             ) from e
+
+    def _read_and_validate_with_retry(self, key_path: str, max_attempts: int = 20, delay_sec: float = 0.05) -> bytes:
+        """
+        Validates and reads the key file with retry backoff to tolerate concurrent writes in progress.
+        Fails closed safely on timeout, corruption, or security violations.
+        """
+        last_err = None
+        for _ in range(max_attempts):
+            try:
+                return self._validate_and_read_posix_key(key_path)
+            except CredentialEncryptionError as err:
+                if "Symlink attack" in str(err):
+                    raise
+                last_err = err
+                time.sleep(delay_sec)
+        raise CredentialEncryptionError(
+            f"Vault key initialization failed after concurrent creation: {last_err}"
+        ) from last_err
 
     def _validate_and_read_posix_key(self, key_path: str) -> bytes:
         """

@@ -1835,6 +1835,123 @@ async def test_real_docker_container_security_boundaries():
         assert c_name not in ps_check.stdout.strip().splitlines()
 
 
+def test_verifier_rejects_fabricated_runner_output_without_trusted_execution_record():
+    """Adversarial Test 1:
+    A command emits fabricated pytest-like output ('tests/test_auth.py::test_login PASSED')
+    via inline script or unverified command without a trusted runner execution record.
+    The verification engine must recognize that text alone does not prove execution,
+    and the requirement must remain strictly UNVERIFIED."""
+    ve = VerificationEngine()
+    criteria = ["User login authentication"]
+
+    # Attacker runs an inline script that prints what looks like passing pytest output
+    fake_check = VerificationCheck(
+        check_name="Fabricated Pytest Execution",
+        check_type="test",
+        command="python -c \"print('tests/test_auth.py::test_login PASSED\\n1 passed in 0.05s')\"",
+        success=True,
+        exit_code=0,
+        output="tests/test_auth.py::test_login PASSED\n1 passed in 0.05s",
+        evidence_summary="tests/test_auth.py::test_login PASSED",
+        criterion_bindings={"User login authentication": "tests/test_auth.py::test_login"},
+        trusted_execution_record=None,  # No trusted runner record
+    )
+    ve.record_check(fake_check)
+
+    report = ve.evaluate_completion(
+        task_id="t_adv_fake_1",
+        goal="Implement user login authentication",
+        actions_taken=["Ran fabricated inline test command"],
+        modified_files=["agent/api/server.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+
+    # Must remain UNVERIFIED and PARTIALLY_COMPLETED
+    assert report.status == TaskStatus.PARTIALLY_COMPLETED
+    assert report.acceptance_criteria_satisfied is False
+    assert len(report.criteria_evidence) == 1
+    assert report.criteria_evidence[0].demonstrated is False
+    assert report.criteria_evidence[0].verification_tier == "UNVERIFIED"
+    assert any("unmet acceptance criterion" in s.lower() or "not proven" in s.lower() for s in report.skipped_or_failed_checks)
+
+
+def test_credential_vault_stress_slow_writes_interrupted_and_permissions():
+    """Stress test for CredentialVault POSIX mode:
+    1. Simultaneous creators under slow write: 10 concurrent threads initialize vault while winning creator simulates slow write/flush.
+    2. Interrupted write: simulates partial/interrupted write (<32 bytes), confirms safe fail-closed CredentialEncryptionError.
+    3. Insecure permissions: verifies directory and key permission checks fail safely.
+    """
+    from agent.persistence.credentials import CredentialVault, CredentialEncryptionError
+    from cryptography.fernet import Fernet
+    import concurrent.futures
+    import threading
+
+    # 1. Simultaneous creators under slow write:
+    # A creator holds a 0-byte key file open while sleeping, while 10 concurrent readers attempt to initialize
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        key_dir = os.path.join(temp_dir, "keys")
+        os.makedirs(key_dir, mode=0o700)
+        key_file = os.path.join(key_dir, "vault.key")
+
+        file_created_event = threading.Event()
+
+        def slow_creator():
+            # Grab exclusive file creation
+            fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | (getattr(os, "O_BINARY", 0)), 0o600)
+            file_created_event.set()
+            time.sleep(0.15)  # Creator is slow to write and flush
+            key = Fernet.generate_key()
+            with os.fdopen(fd, "wb") as f:
+                f.write(key)
+                f.flush()
+            if sys.platform != "win32":
+                os.chmod(key_file, 0o600)
+            v = CredentialVault(key_dir=key_dir, is_windows=False)
+            return v._get_or_create_posix_key()
+
+        def concurrent_reader():
+            file_created_event.wait()  # Guarantee all readers hit the 0-byte in-progress file
+            v = CredentialVault(key_dir=key_dir, is_windows=False)
+            return v._get_or_create_posix_key()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=11) as executor:
+            fut_creator = executor.submit(slow_creator)
+            fut_readers = [executor.submit(concurrent_reader) for _ in range(10)]
+
+            creator_key = fut_creator.result()
+            reader_keys = [f.result() for f in fut_readers]
+
+        assert len(creator_key) >= 32
+        for rk in reader_keys:
+            assert rk == creator_key, "All concurrent readers must obtain the exact same valid key"
+
+    # 2. Interrupted / partial write fails closed safely
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        key_dir = os.path.join(temp_dir, "keys_partial")
+        os.makedirs(key_dir, mode=0o700)
+        key_file = os.path.join(key_dir, "vault.key")
+
+        # Simulate a process that died after writing only 10 bytes
+        with open(key_file, "wb") as f:
+            f.write(b"interrupte")  # only 10 bytes, corrupted
+
+        with pytest.raises(CredentialEncryptionError) as exc_info:
+            CredentialVault(key_dir=key_dir, is_windows=False)
+        assert "Corrupted or empty" in str(exc_info.value) or "initialization failed" in str(exc_info.value)
+
+    # 3. Insecure directory permissions fail closed immediately
+    if sys.platform != "win32":
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            key_dir = os.path.join(temp_dir, "keys_insecure")
+            os.makedirs(key_dir, mode=0o777)
+            os.chmod(key_dir, 0o777)
+            with pytest.raises(CredentialEncryptionError) as exc_info:
+                CredentialVault(key_dir=key_dir, is_windows=False)
+            assert "Insecure permissions" in str(exc_info.value)
+
+
+
 
 
 

@@ -329,6 +329,7 @@ class ExecutionEngine:
                         exit_code=result.artifacts.get("exit_code"),
                         output=result.output,
                         evidence_summary=result.artifacts.get("evidence_summary", ""),
+                        trusted_execution_record=result.artifacts.get("trusted_execution_record"),
                     )
                     verifier.record_check(v_check)
 
