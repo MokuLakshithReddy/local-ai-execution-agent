@@ -1555,6 +1555,8 @@ def test_credential_vault_concurrent_creation_race_and_validation():
         # Case C: Concurrently created key is corrupted / empty
         with open(key_file, "wb") as f:
             f.write(b"too_short")
+        if sys.platform != "win32":
+            os.chmod(key_file, 0o600)
         vault = CredentialVault(key_dir=key_dir, is_windows=False)
         with pytest.raises(CredentialEncryptionError, match="Corrupted or empty"):
             vault._validate_and_read_posix_key(key_file)
