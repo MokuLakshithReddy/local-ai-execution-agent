@@ -2,20 +2,40 @@
 
 # Local-First, Model-Agnostic AI Execution Agent
 
-**A secure, developer-centric agentic framework for delegating real software engineering tasks to LLMs on local environments.**
+**An Evidence-Driven, Local-First Engineering Framework Delegating Real Computer Work to LLMs with Verifiable Proof.**
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688.svg)](https://fastapi.tiangolo.com/)
 [![React + Vite](https://img.shields.io/badge/React-19%20%7C%20Vite-646CFF.svg)](https://vitejs.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-Local--First-003B57.svg)](https://sqlite.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Verification: Passed](https://img.shields.io/badge/Verification-7%20Passed-10b981.svg)](#-live-verification-evidence-log)
 
 </div>
 
 ---
 
+## 🎯 The Evidence-Driven Philosophy
+
+> **"Plausible code is not working code. An AI execution agent is only as dependable as the evidence it produces."**
+
+Most AI coding assistants rely on subjective completion: the model writes code, declares victory in chat, and leaves verification to the human. 
+
+This agent is built around **strict evidence separation**:
+1. **Model Claims** *(Subjective)*: What the LLM believes or intends to do.
+2. **Tool Telemetry** *(Observed)*: Raw stdin/stdout, exit codes, modified files, and execution timestamps.
+3. **Verification Subsystem** *(Objective Evidence)*: Independent test suites, linters, builds, and git diff audits.
+
+An action is **never** considered complete simply because an LLM claims it is done. Every completion must be anchored in captured machine evidence.
+
+---
+
 ## 📑 Table of Contents
 
+- [The Evidence-Driven Philosophy](#-the-evidence-driven-philosophy)
+- [Evidence Architecture & Truth Table](#-evidence-architecture--truth-table)
+- [Live Verification Evidence Log](#-live-verification-evidence-log)
+- [Sample Structured Task Report](#-sample-structured-task-report)
 - [System Architecture](#-system-architecture)
 - [Core Engineering Pillars](#-core-engineering-pillars)
   - [1. Bounded Orchestration Loop & Loop-Guards](#1-bounded-orchestration-loop--loop-guards)
@@ -27,13 +47,95 @@
 - [API & WebSocket Protocol](#-api--websocket-protocol)
   - [REST Endpoints](#rest-endpoints)
   - [WebSocket Event Streams](#websocket-event-streams)
-- [Developer Setup & Contributing](#-developer-setup--contributing)
-  - [Prerequisites](#prerequisites)
-  - [Backend Setup](#backend-setup)
-  - [Frontend Development](#frontend-development)
-  - [Running the Test Suite](#running-the-test-suite)
+- [Developer Setup & Reproducible Verification](#-developer-setup--reproducible-verification)
 - [Project Directory Layout](#-project-directory-layout)
 - [License](#-license)
+
+---
+
+## 📊 Evidence Architecture & Truth Table
+
+The verification engine (`agent/verification/verifier.py`) enforces an unambiguous status matrix. The agent cannot forge a `COMPLETED` status:
+
+| Code Modified? | Verification Tests Executed? | Exit Code | Resulting Task Status | Rationale |
+|:---:|:---:|:---:|:---:|---|
+| **Yes** | **Yes** | `0` (Success) | `COMPLETED` | **Verified Completion**: Changes made and validated by passing test suites. |
+| **Yes** | **Yes** | `!= 0` (Fail) | `PARTIALLY_COMPLETED` | **Failed Verification**: Tests failed; agent cannot claim victory. |
+| **Yes** | **No** | N/A | `PARTIALLY_COMPLETED` | **Unverified Changes**: Files modified, but no automated checks verified them. |
+| **No** | N/A | N/A | `COMPLETED` | **Informational Task**: Read-only exploration (e.g. architecture review). |
+| Any | Timeout / Block | Error | `FAILED` / `BLOCKED` | **Execution Failure**: Runaway loop detected or resource budget exhausted. |
+
+---
+
+## 🧪 Live Verification Evidence Log
+
+The test suite in [`tests/test_core_and_tools.py`](tests/test_core_and_tools.py) tests security invariants, tool bounds, and verifiable outcomes.
+
+### Verified Test Telemetry:
+```
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.7.0
+rootdir: C:\Users\nsrfl\OneDrive\Desktop\MAKE LLM TO CODE
+configfile: pytest.ini
+plugins: anyio-4.15.1, asyncio-1.4.1
+collected 7 items
+
+tests/test_core_and_tools.py::test_resolve_safe_path_security PASSED     [ 14%]
+tests/test_core_and_tools.py::test_security_sanitizer_redaction PASSED   [ 28%]
+tests/test_core_and_tools.py::test_security_sanitizer_injection_defense PASSED [ 42%]
+tests/test_core_and_tools.py::test_permission_manager_levels PASSED      [ 57%]
+tests/test_core_and_tools.py::test_filesystem_tools_lifecycle PASSED     [ 71%]
+tests/test_core_and_tools.py::test_verification_engine_claims PASSED     [ 85%]
+tests/test_core_and_tools.py::test_provider_registry PASSED              [100%]
+
+============================== 7 passed in 0.21s ==============================
+```
+
+#### What Was Proved:
+1. **Path Traversal Security**: Attempted `../../` directory escapes are intercepted and trigger `ValueError` immediately.
+2. **Secret Redaction**: API keys (`sk-*`, `ghp_*`, `AIza*`) are masked with `[REDACTED_SECRET]` before logging.
+3. **Prompt Injection Defense**: Untrusted content containing adversarial override phrases is fenced within untrusted markers.
+4. **Permission Hierarchy**: Read-only tools auto-approved; sensitive terminal commands and destructive deletions quarantined into `PENDING_APPROVAL`.
+5. **Tool Lifecycle**: Safe file creation, chunked slicing, atomic block patching, and regex searching execute within workspace boundaries.
+6. **False-Positive Prevention**: The verification engine rejects a model claim of success if automated checks report non-zero exit codes.
+7. **Multi-Model Dynamic Resolution**: Providers (Gemini, OpenAI, Anthropic, Ollama) instantiate correctly.
+
+---
+
+## 📋 Sample Structured Task Report
+
+Every executed task persists a verifiable `TaskReport` (`agent/core/models.py`) containing the exact trail of evidence:
+
+```json
+{
+  "task_id": "83f1aa41-88a4-42a6-9c37-0fc0db7a4e34",
+  "goal": "Implement input validator in auth.py and verify test coverage with pytest.",
+  "status": "COMPLETED",
+  "summary_of_actions": [
+    "Inspected auth.py via read_file (lines 1-80)",
+    "Applied validation logic via patch_file",
+    "Executed verification command: pytest tests/test_auth.py"
+  ],
+  "files_created_or_modified": [
+    "src/auth.py",
+    "tests/test_auth.py"
+  ],
+  "diff_summary": "diff --git a/src/auth.py b/src/auth.py\n+ def validate_token(token: str) -> bool:\n+     return len(token) > 16",
+  "executed_verification_checks": [
+    {
+      "check_name": "Authentication Unit Tests",
+      "check_type": "test",
+      "command": "pytest tests/test_auth.py",
+      "success": true,
+      "exit_code": 0,
+      "output": "tests/test_auth.py .. [100%]\n2 passed in 0.08s",
+      "evidence_summary": "Verification Check 'Authentication Unit Tests' (test) exited with code 0. PASSED."
+    }
+  ],
+  "skipped_or_failed_checks": [],
+  "unresolved_risks_or_limitations": []
+}
+```
 
 ---
 
@@ -173,15 +275,11 @@ Located in `agent/security/`.
 
 ### 5. Verification & Verifiable Evidence Engine
 
-Located in `agent/verification/`.
+Located in `agent/verification/verifier.py`.
 - Rather than accepting an LLM's assertion ("*I fixed the bug and verified everything works*"), the engine audits:
   1. Did a verification tool (`run_verification`) execute?
   2. Was the command exit code `0`?
   3. Does the git diff reflect the expected changes?
-- **Status Truth Table**:
-  - `COMPLETED`: Automated verification tests ran and all exited with code 0.
-  - `PARTIALLY_COMPLETED`: Code modified, but tests were either skipped, not present, or exited with non-zero code.
-  - `FAILED`: Execution threw unrecoverable errors.
 
 ### 6. Persistence Layer & State Machine
 
@@ -228,64 +326,40 @@ Connect to `ws://localhost:8000/ws` for live streaming:
 
 ---
 
-## 🛠️ Developer Setup & Contributing
+## 🛠️ Developer Setup & Reproducible Verification
 
 ### Prerequisites
 - **Python**: `>= 3.10`
 - **Node.js**: `>= 18.0` & `npm`
 - **Git**
 
-### Backend Setup
+### 1. Setup & Reproduce Verification Evidence
+Clone the repository and run the test suite to independently reproduce the verification telemetry:
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/MokuLakshithReddy/local-ai-execution-agent.git
-   cd local-ai-execution-agent
-   ```
+```bash
+git clone https://github.com/MokuLakshithReddy/local-ai-execution-agent.git
+cd local-ai-execution-agent
 
-2. **Create and activate a virtual environment:**
-   ```bash
-   # Windows
-   python -m venv venv
-   .\venv\Scripts\activate
+# Windows
+python -m venv venv
+.\venv\Scripts\activate
+pip install fastapi uvicorn pydantic httpx python-dotenv aiosqlite pytest pytest-asyncio
 
-   # Linux / macOS
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
+# Execute test suite and verify evidence
+pytest tests/ -v
+```
 
-3. **Install dependencies:**
-   ```bash
-   pip install fastapi uvicorn pydantic httpx python-dotenv aiosqlite pytest pytest-asyncio
-   ```
+### 2. Launch Local Agent Service & Dashboard
+```bash
+python main.py
+```
+Open **[http://127.0.0.1:8000](http://127.0.0.1:8000)** in your browser.
 
-4. **Launch the agent service:**
-   ```bash
-   python main.py
-   ```
-   *The server starts on `http://127.0.0.1:8000` and automatically opens the dashboard.*
-
-### Frontend Development
-
-The frontend is a Vite + React + TypeScript single-page app located in `ui/`:
-
+### 3. Frontend Development
 ```bash
 cd ui
 npm install
 npm run dev
-```
-
-To compile production static assets into `ui/dist` (served directly by FastAPI):
-```bash
-npm run build
-```
-
-### Running the Test Suite
-
-The test suite validates security constraints, tool lifecycles, path sandbox enforcement, and the verification engine:
-
-```bash
-pytest tests/ -v
 ```
 
 ---
@@ -330,7 +404,8 @@ pytest tests/ -v
 │   └── test_core_and_tools.py     # Comprehensive unit tests
 ├── main.py                        # Service entrypoint
 ├── pytest.ini                     # Pytest configuration
-└── README.md                      # Developer documentation
+├── LICENSE                        # MIT License
+└── README.md                      # Evidence-driven developer documentation
 ```
 
 ---
