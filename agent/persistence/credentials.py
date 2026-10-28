@@ -116,7 +116,7 @@ class CredentialVault:
             try:
                 return self._validate_and_read_posix_key(key_path)
             except CredentialEncryptionError as err:
-                if "Symlink attack" in str(err):
+                if "Symlink attack" in str(err) or "Insecure permissions" in str(err):
                     raise
                 last_err = err
                 time.sleep(delay_sec)

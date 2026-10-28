@@ -1940,12 +1940,15 @@ def test_credential_vault_stress_slow_writes_interrupted_and_permissions():
             CredentialVault(key_dir=key_dir, is_windows=False)
         assert "Corrupted or empty" in str(exc_info.value) or "initialization failed" in str(exc_info.value)
 
-    # 3. Insecure directory permissions fail closed immediately
+    # 3. Insecure key permissions fail closed immediately
     if sys.platform != "win32":
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             key_dir = os.path.join(temp_dir, "keys_insecure")
-            os.makedirs(key_dir, mode=0o777)
-            os.chmod(key_dir, 0o777)
+            os.makedirs(key_dir, mode=0o700)
+            key_file = os.path.join(key_dir, "vault.key")
+            with open(key_file, "wb") as f:
+                f.write(Fernet.generate_key())
+            os.chmod(key_file, 0o777)
             with pytest.raises(CredentialEncryptionError) as exc_info:
                 CredentialVault(key_dir=key_dir, is_windows=False)
             assert "Insecure permissions" in str(exc_info.value)
