@@ -62,8 +62,7 @@ jobs:
         REPO: ${{ github.repository }}
         JOB_STATUS: ${{ job.status }}
         JOB_NAME: Backend Tests (${{ matrix.os }})
-      run: |
-        python -c "import urllib.request, json, os; state = 'success' if os.environ['JOB_STATUS'] == 'success' else 'failure'; req = urllib.request.Request(f\"https://api.github.com/repos/{os.environ['REPO']}/statuses/{os.environ['SHA']}\", data=json.dumps({'state': state, 'context': os.environ['JOB_NAME'], 'description': f\"{os.environ['JOB_NAME']}: {state}\"}).encode(), headers={'Authorization': f\"Bearer {os.environ['GH_TOKEN']}\", 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'CI'}); urllib.request.urlopen(req)"
+      run: python .github/scripts/report_status.py
 
   frontend:
     name: Frontend Build & Typecheck
@@ -94,5 +93,4 @@ jobs:
         REPO: ${{ github.repository }}
         JOB_STATUS: ${{ job.status }}
         JOB_NAME: Frontend Build & Typecheck
-      run: |
-        python3 -c "import urllib.request, json, os; state = 'success' if os.environ['JOB_STATUS'] == 'success' else 'failure'; req = urllib.request.Request(f\"https://api.github.com/repos/{os.environ['REPO']}/statuses/{os.environ['SHA']}\", data=json.dumps({'state': state, 'context': os.environ['JOB_NAME'], 'description': f\"{os.environ['JOB_NAME']}: {state}\"}).encode(), headers={'Authorization': f\"Bearer {os.environ['GH_TOKEN']}\", 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'CI'}); urllib.request.urlopen(req)"
+      run: python3 .github/scripts/report_status.py
