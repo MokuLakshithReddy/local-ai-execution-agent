@@ -9,7 +9,7 @@
 [![React + Vite](https://img.shields.io/badge/React-19%20%7C%20Vite-646CFF.svg)](https://vitejs.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-Local--First-003B57.svg)](https://sqlite.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Verification: Passed](https://img.shields.io/badge/Verification-11%20Passed-10b981.svg)](#-live-verification-evidence-log)
+[![Verification: Passed](https://img.shields.io/badge/Verification-19%20Passed-10b981.svg)](#-live-verification-evidence-log)
 
 </div>
 
@@ -35,6 +35,7 @@ An action is **never** considered complete simply because an LLM claims it is do
 - [The Evidence-Driven Philosophy](#-the-evidence-driven-philosophy)
 - [Evidence Architecture & Truth Table](#-evidence-architecture--truth-table)
 - [Live Verification Evidence Log](#-live-verification-evidence-log)
+- [Hardened Defenses & Security Invariants](#-hardened-defenses--security-invariants)
 - [Sample Structured Task Report](#-sample-structured-task-report)
 - [System Architecture](#-system-architecture)
 - [Core Engineering Pillars](#-core-engineering-pillars)
@@ -69,7 +70,7 @@ The verification engine (`agent/verification/verifier.py`) enforces an unambiguo
 
 ## 🧪 Live Verification Evidence Log
 
-The test suite in [`tests/test_core_and_tools.py`](tests/test_core_and_tools.py) tests security invariants, tool bounds, and verifiable outcomes.
+The test suite in [`tests/test_core_and_tools.py`](tests/test_core_and_tools.py) tests security invariants, tool bounds, and verifiable outcomes across all 19 automated integration tests.
 
 ### Verified Test Telemetry:
 ```
@@ -78,33 +79,58 @@ platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.7.0
 rootdir: C:\Users\nsrfl\OneDrive\Desktop\MAKE LLM TO CODE
 configfile: pytest.ini
 plugins: anyio-4.15.1, asyncio-1.4.1
-collected 11 items
+collected 19 items
 
-tests/test_core_and_tools.py::test_resolve_safe_path_security PASSED     [  9%]
-tests/test_core_and_tools.py::test_symlink_containment_security PASSED   [ 18%]
-tests/test_core_and_tools.py::test_credential_vault_encryption PASSED    [ 27%]
-tests/test_core_and_tools.py::test_database_credential_encryption_and_sanitization PASSED [ 36%]
-tests/test_core_and_tools.py::test_security_sanitizer_redaction PASSED   [ 45%]
-tests/test_core_and_tools.py::test_security_sanitizer_injection_defense PASSED [ 54%]
-tests/test_core_and_tools.py::test_permission_manager_levels PASSED      [ 63%]
-tests/test_core_and_tools.py::test_terminal_environment_allowlist PASSED [ 72%]
-tests/test_core_and_tools.py::test_filesystem_tools_lifecycle PASSED     [ 81%]
-tests/test_core_and_tools.py::test_criteria_driven_verification PASSED   [ 90%]
-tests/test_core_and_tools.py::test_api_security_authorization PASSED     [100%]
+tests/test_core_and_tools.py::test_resolve_safe_path_security PASSED     [  5%]
+tests/test_core_and_tools.py::test_symlink_containment_security PASSED   [ 10%]
+tests/test_core_and_tools.py::test_credential_vault_encryption PASSED    [ 15%]
+tests/test_core_and_tools.py::test_database_credential_encryption_and_sanitization PASSED [ 21%]
+tests/test_core_and_tools.py::test_security_sanitizer_redaction PASSED   [ 26%]
+tests/test_core_and_tools.py::test_security_sanitizer_injection_defense PASSED [ 31%]
+tests/test_core_and_tools.py::test_permission_manager_levels PASSED      [ 36%]
+tests/test_core_and_tools.py::test_terminal_environment_allowlist PASSED [ 42%]
+tests/test_core_and_tools.py::test_filesystem_tools_lifecycle PASSED     [ 47%]
+tests/test_core_and_tools.py::test_criteria_driven_verification PASSED   [ 52%]
+tests/test_core_and_tools.py::test_api_security_authorization PASSED     [ 57%]
+tests/test_core_and_tools.py::test_adversarial_bootstrap_attacks PASSED  [ 63%]
+tests/test_core_and_tools.py::test_token_file_acl_protection PASSED      [ 68%]
+tests/test_core_and_tools.py::test_credential_vault_corruption_and_migration PASSED [ 73%]
+tests/test_core_and_tools.py::test_real_process_tree_termination PASSED  [ 78%]
+tests/test_core_and_tools.py::test_verifier_relevance_and_anti_overstating PASSED [ 84%]
+tests/test_core_and_tools.py::test_approval_race_conditions PASSED       [ 89%]
+tests/test_core_and_tools.py::test_task_interruption_and_server_restart PASSED [ 94%]
+tests/test_core_and_tools.py::test_end_to_end_edit_test_fix_lifecycle PASSED [100%]
 
-============================== 11 passed in 0.70s ==============================
+======================= 19 passed, 3 warnings in 2.72s ========================
 ```
-
-#### What Was Proved:
-1. **Authenticated Local API & Strict CORS**: Unauthenticated requests to `/api/tasks` receive `401 Unauthorized`; unauthorized WebSocket connections are dropped with policy violation; wildcard CORS is eliminated; and calls targeting unapproved directories are rejected with `403 Forbidden`.
-2. **Encrypted Credential Vault & Log Sanitization**: API keys are stored in an encrypted vault (`enc:...`), never in plain JSON in SQLite. Log steps, task errors, and WebSocket events are redacted before crossing boundaries.
-3. **Sandboxed Terminal Execution & Process-Tree Killing**: Shell executions use a strict environment allowlist (scrubbing host API keys), bounded memory streaming (preventing runaway buffers), and full recursive child process-tree termination.
-4. **Symlink Boundary Containment**: Canonical `realpath` dereferencing prevents symlinks or junctions from escaping the authorized workspace boundary.
-5. **Criteria-Driven Completion**: Execution tasks (`CODE_MODIFICATION`) cannot claim `COMPLETED` unless files were actually modified and verified by passing automated checks. Cancelled or blocked states are strictly preserved.
 
 ---
 
-## 📋 Sample Structured Task Report
+## 🛡️ Hardened Defenses & Security Invariants
+
+In response to advanced adversarial scenarios, the following protections are enforced:
+
+### 1. Adversarial Session-Token Bootstrap Defense
+- **Hostile Browser Origins**: The `/api/auth/token` endpoint inspects the `Origin` header. Requests bearing unapproved or foreign browser origins (e.g. `https://malicious-site.com`) are rejected with `403 Forbidden`.
+- **Browser Cross-Site Fetch Protection**: Modern browsers send `Sec-Fetch-Site: cross-site` when requests are initiated by third-party origins. Any handshake request with `cross-site` is blocked with `403 Forbidden`.
+- **DNS Rebinding Middleware**: Host headers are strictly validated against `{"localhost", "127.0.0.1", "::1", "testserver"}`. Foreign rebind domains (e.g. `Host: evil.attacker.com:8000`) are rejected immediately with `400 Bad Request`.
+- **User-Only File ACLs**: On Windows, the `.agent_session_token` file is locked down via `icacls` (`/inheritance:r /grant:r %USERNAME%:(R,W)`), ensuring other local Windows users cannot access the session token. On POSIX, `0o600` permissions are enforced.
+
+### 2. OS-Native Credential Storage (Windows DPAPI / Platform Keychain)
+- **Zero Plaintext Keys on Disk**: On Windows, credentials use native **Data Protection API (DPAPI)** via `ctypes.windll.crypt32.CryptProtectData` with `CRYPTPROTECT_UI_FORBIDDEN`. Encryption keys are tied directly to the OS user account credentials.
+- **Corrupted Vault & Tamper Recovery**: Truncated base64, corrupted DPAPI blobs, or missing keys return `None` without unhandled exceptions or crashes.
+- **Transparent Migration**: Retrieving legacy `enc:` (Fernet) or `b64:` credentials automatically re-encrypts and upgrades them to active OS-native encryption.
+
+### 3. Execution Sandboxing & Process Tree Containment
+- **Process-Tree Termination**: Runaway commands and timeouts trigger `_kill_process_tree()`, which uses `psutil` and Windows `taskkill /F /T /PID` to terminate the entire process hierarchy without leaving orphaned background processes.
+- **Environment Scrubbing**: Only essentials (`PATH`, `SYSTEMROOT`, `COMSPEC`, `USERPROFILE`) in `SAFE_ENV_ALLOWLIST` are passed to spawned processes; host tokens and cloud credentials are scrubbed.
+- **Buffer Exhaustion Protection**: Standard streams are bounded at `50 KB`, preventing memory exhaustion from infinite log spews.
+
+### 4. Non-Overstating, Criteria-Driven Verification
+- **Dummy Check Rejection**: Commands such as `echo 1`, `dir`, `true`, `cat`, or trivial probes are blocked from counting toward verification.
+- **Targeted Test Relevance**: A test runner invocation (e.g. `pytest tests/test_unrelated.py`) is rejected if its targeted arguments do not touch the files modified by the task or the goal's key components.
+- **Explicit Skipped Criteria Tracking**: If a goal specifies acceptance criteria (e.g. "lint code and run tests"), any criterion not covered by a passing check is recorded in `skipped_or_failed_checks` and prevents completion.
+- **Resolved Edit/Test/Fix Workflows**: When a check initially fails during reproduction and subsequently passes following a code patch, the verifier accurately records resolution and certifies genuine completion.
 
 Every executed task persists a verifiable `TaskReport` (`agent/core/models.py`) containing the exact trail of evidence:
 

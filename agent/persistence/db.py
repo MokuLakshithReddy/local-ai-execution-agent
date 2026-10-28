@@ -2,6 +2,7 @@
 SQLite database persistence for tasks, logs, approvals, and application settings.
 Includes automatic credential encryption and secret sanitization on all persisted data.
 """
+import asyncio
 import aiosqlite
 import json
 import os
@@ -186,13 +187,13 @@ class Database:
             ]
 
     async def save_setting(self, key: str, value: Any):
-        """Save settings with encryption for sensitive API keys."""
+        """Save settings with OS-native encryption for sensitive API keys."""
         to_store = value
         if key == "app_settings" and isinstance(value, dict):
             to_store = dict(value)
             for k in ("openai_api_key", "anthropic_api_key", "gemini_api_key"):
                 if k in to_store and to_store[k]:
-                    to_store[k] = "enc:" + vault.encrypt(to_store[k])
+                    to_store[k] = vault.encrypt(to_store[k])
 
         try:
             async with aiosqlite.connect(self.db_path) as db:
@@ -208,7 +209,7 @@ class Database:
             await self.init()
 
     async def get_setting(self, key: str, default: Any = None) -> Any:
-        """Get settings, decrypting any encrypted credentials."""
+        """Get settings, decrypting OS-native encrypted credentials."""
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 db.row_factory = aiosqlite.Row
@@ -223,10 +224,21 @@ class Database:
 
                 if key == "app_settings" and isinstance(val, dict):
                     decrypted_val = dict(val)
+                    needs_migration = False
                     for k in ("openai_api_key", "anthropic_api_key", "gemini_api_key"):
                         raw = decrypted_val.get(k)
-                        if raw and isinstance(raw, str) and raw.startswith("enc:"):
-                            decrypted_val[k] = vault.decrypt(raw[4:])
+                        if raw and isinstance(raw, str):
+                            decrypted = vault.decrypt(raw)
+                            if decrypted is not None:
+                                decrypted_val[k] = decrypted
+                                # If stored in legacy scheme (enc: or b64:) or unencrypted, migrate to native vault
+                                if raw.startswith("enc:") or raw.startswith("b64:") or not (raw.startswith("dpapi:") or raw.startswith("fernet:")):
+                                    needs_migration = True
+                            else:
+                                # Corrupted or non-decryptable vault key fallback
+                                decrypted_val[k] = raw
+                    if needs_migration:
+                        asyncio.create_task(self.save_setting(key, decrypted_val))
                     return decrypted_val
 
                 return val

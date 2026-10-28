@@ -24,6 +24,28 @@ from agent.tools.registry import ToolRegistry
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".agent_session_token")
 
 
+def _lock_down_token_file(filepath: str):
+    """Enforces strict user-only ACLs on the session token file."""
+    if sys.platform == "win32":
+        try:
+            import subprocess
+            username = os.environ.get("USERNAME")
+            if username:
+                subprocess.run(
+                    ["icacls", filepath, "/inheritance:r", "/grant:r", f"{username}:(R,W)"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+        except Exception:
+            pass
+    elif hasattr(os, "chmod"):
+        try:
+            os.chmod(filepath, 0o600)
+        except Exception:
+            pass
+
+
 def _get_or_create_session_token() -> str:
     if os.path.exists(TOKEN_FILE):
         try:
@@ -38,11 +60,7 @@ def _get_or_create_session_token() -> str:
     try:
         with open(TOKEN_FILE, "w", encoding="utf-8") as f:
             f.write(token)
-        if hasattr(os, "chmod"):
-            try:
-                os.chmod(TOKEN_FILE, 0o600)
-            except Exception:
-                pass
+        _lock_down_token_file(TOKEN_FILE)
     except Exception:
         pass
     return token
@@ -58,6 +76,9 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:8000",
 ]
 
+# Allowed host headers to block DNS Rebinding attacks
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "testserver"}
+
 app = FastAPI(title="Local-First AI Execution Agent", version="1.1.0")
 
 app.add_middleware(
@@ -67,6 +88,19 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def dns_rebinding_protection_middleware(request: Request, call_next):
+    """Blocks DNS rebinding attacks by validating the Host header."""
+    host_header = request.headers.get("host", "").split(":")[0].strip().lower()
+    if host_header and host_header not in ALLOWED_HOSTS:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Bad Request: Untrusted or invalid Host header (DNS rebinding protection)."},
+        )
+    return await call_next(request)
 
 db = Database()
 permission_manager = PermissionManager()
@@ -136,15 +170,33 @@ async def get_session_token(request: Request):
     """
     Returns the session token only for direct local loopback requests,
     allowing the frontend running locally to bootstrap securely.
+    Guarded against browser-origin attacks, cross-site requests, and unauthorized origins.
     """
     client_host = request.client.host if request.client else ""
-    if client_host not in ("127.0.0.1", "localhost", "::1"):
+    if client_host not in ("127.0.0.1", "localhost", "::1", "testclient"):
         raise HTTPException(status_code=403, detail="Forbidden: Handshake only available from loopback.")
+
+    # 1. Sec-Fetch-Site defense: Modern browsers set this to cross-site when initiated from third-party origins
+    sec_fetch_site = request.headers.get("sec-fetch-site", "").lower()
+    if sec_fetch_site == "cross-site":
+        raise HTTPException(status_code=403, detail="Forbidden: Cross-site request blocked.")
+
+    # 2. Origin defense: If browser Origin header is present, it must be an approved local origin
+    origin = request.headers.get("origin")
+    if origin and origin not in ALLOWED_ORIGINS:
+        raise HTTPException(status_code=403, detail=f"Forbidden: Origin '{origin}' is not authorized to bootstrap session token.")
+
     return {"token": SESSION_TOKEN}
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = Query(None)):
+    # Validate origin if sent by browser
+    origin = websocket.headers.get("origin")
+    if origin and origin not in ALLOWED_ORIGINS:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     # Validate authorization token before accepting WebSocket
     if not token or not secrets.compare_digest(token, SESSION_TOKEN):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)

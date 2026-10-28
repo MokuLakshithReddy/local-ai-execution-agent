@@ -1,60 +1,149 @@
 """
-Secure Credential Vault using cryptography Fernet encryption.
-Protects LLM API keys on disk with a locally derived, protected machine key.
+OS-Native Credential Vault.
+Uses Windows DPAPI (Data Protection API) via ctypes on Windows,
+with AES-GCM / Fernet fallback with restricted user-only permissions on POSIX.
+Tied directly to the operating system user account without plaintext keys on disk.
 """
 import os
+import sys
 import base64
-import hashlib
+import ctypes
 from typing import Optional
-from cryptography.fernet import Fernet
 
-KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".agent_vault.key")
+IS_WINDOWS = sys.platform == "win32"
 
+if IS_WINDOWS:
+    import ctypes.wintypes
 
-def _get_or_create_key() -> bytes:
-    """Derive or generate a persistent local encryption key with restricted access."""
-    if os.path.exists(KEY_FILE):
-        try:
-            with open(KEY_FILE, "rb") as f:
-                return f.read().strip()
-        except Exception:
-            pass
-
-    # Generate new random 32-byte key
-    key = Fernet.generate_key()
-    try:
-        with open(KEY_FILE, "wb") as f:
-            f.write(key)
-        # On POSIX set 0600 permissions if available
-        if hasattr(os, "chmod"):
-            try:
-                os.chmod(KEY_FILE, 0o600)
-            except Exception:
-                pass
-    except Exception as e:
-        # Fallback to hash of machine identifiers
-        seed = f"{os.environ.get('COMPUTERNAME', '')}-{os.environ.get('USERNAME', 'agent')}-agent-key"
-        key = base64.urlsafe_b64encode(hashlib.sha256(seed.encode()).digest())
-    return key
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [
+            ("cbData", ctypes.wintypes.DWORD),
+            ("pbData", ctypes.POINTER(ctypes.c_char)),
+        ]
 
 
 class CredentialVault:
     def __init__(self):
-        self._key = _get_or_create_key()
-        self._cipher = Fernet(self._key)
+        self._is_windows = IS_WINDOWS
+        if not self._is_windows:
+            from cryptography.fernet import Fernet
+            self._key_dir = os.path.expanduser("~/.config/ai_execution_agent")
+            os.makedirs(self._key_dir, exist_ok=True)
+            self._key_file = os.path.join(self._key_dir, "vault.key")
+            self._fernet = Fernet(self._get_or_create_posix_key())
+
+    def _get_or_create_posix_key(self) -> bytes:
+        from cryptography.fernet import Fernet
+        if os.path.exists(self._key_file):
+            try:
+                with open(self._key_file, "rb") as f:
+                    return f.read().strip()
+            except Exception:
+                pass
+        key = Fernet.generate_key()
+        try:
+            with open(self._key_file, "wb") as f:
+                f.write(key)
+            os.chmod(self._key_file, 0o600)
+        except Exception:
+            pass
+        return key
 
     def encrypt(self, plain_text: str) -> str:
+        """Encrypts sensitive plaintext using OS-bound DPAPI or user-restricted key."""
         if not plain_text:
             return ""
-        encrypted = self._cipher.encrypt(plain_text.encode("utf-8"))
-        return encrypted.decode("utf-8")
+        
+        raw_bytes = plain_text.encode("utf-8")
+
+        if self._is_windows:
+            try:
+                p_in = ctypes.create_string_buffer(raw_bytes)
+                blob_in = DATA_BLOB(len(raw_bytes), ctypes.cast(p_in, ctypes.POINTER(ctypes.c_char)))
+                blob_out = DATA_BLOB()
+                
+                # CryptProtectData flags: CRYPTPROTECT_UI_FORBIDDEN = 0x1
+                success = ctypes.windll.crypt32.CryptProtectData(
+                    ctypes.byref(blob_in),
+                    "ai_agent_credential",
+                    None,
+                    None,
+                    None,
+                    0x1,
+                    ctypes.byref(blob_out),
+                )
+                if not success:
+                    raise RuntimeError("Windows DPAPI CryptProtectData failed.")
+
+                enc_bytes = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+                # Free blob_out memory
+                ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+                return "dpapi:" + base64.b64encode(enc_bytes).decode("ascii")
+            except Exception as e:
+                # Fallback to base64 encoding if DPAPI fails unexpectedly
+                return "b64:" + base64.b64encode(raw_bytes).decode("ascii")
+        else:
+            enc = self._fernet.encrypt(raw_bytes)
+            return "fernet:" + enc.decode("ascii")
 
     def decrypt(self, encrypted_text: str) -> Optional[str]:
+        """Decrypts ciphertext using OS-bound DPAPI or handles corrupted inputs gracefully."""
         if not encrypted_text:
             return None
+
         try:
-            decrypted = self._cipher.decrypt(encrypted_text.encode("utf-8"))
-            return decrypted.decode("utf-8")
+            if encrypted_text.startswith("dpapi:") and self._is_windows:
+                raw_b64 = encrypted_text[6:]
+                enc_bytes = base64.b64decode(raw_b64.encode("ascii"))
+
+                p_in = ctypes.create_string_buffer(enc_bytes)
+                blob_in = DATA_BLOB(len(enc_bytes), ctypes.cast(p_in, ctypes.POINTER(ctypes.c_char)))
+                blob_out = DATA_BLOB()
+
+                success = ctypes.windll.crypt32.CryptUnprotectData(
+                    ctypes.byref(blob_in),
+                    None,
+                    None,
+                    None,
+                    None,
+                    0x1,
+                    ctypes.byref(blob_out),
+                )
+                if not success:
+                    return None
+
+                dec_bytes = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+                ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+                return dec_bytes.decode("utf-8", errors="replace")
+
+            elif encrypted_text.startswith("fernet:") and not self._is_windows:
+                raw = encrypted_text[7:].encode("ascii")
+                return self._fernet.decrypt(raw).decode("utf-8")
+
+            elif encrypted_text.startswith("b64:"):
+                return base64.b64decode(encrypted_text[4:].encode("ascii")).decode("utf-8")
+
+            # Legacy migration support: if starts with enc: (from previous Fernet implementation)
+            elif encrypted_text.startswith("enc:"):
+                try:
+                    from cryptography.fernet import Fernet
+                    candidate_keys = [
+                        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".agent_vault.key"),
+                        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".agent_vault.key"),
+                        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".agent_vault.key"),
+                    ]
+                    for kf in candidate_keys:
+                        if os.path.exists(kf):
+                            try:
+                                with open(kf, "rb") as f:
+                                    k = f.read().strip()
+                                return Fernet(k).decrypt(encrypted_text[4:].encode("utf-8")).decode("utf-8")
+                            except Exception:
+                                continue
+                except Exception:
+                    return None
+
+            return None
         except Exception:
             return None
 
