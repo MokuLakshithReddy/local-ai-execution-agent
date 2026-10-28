@@ -690,3 +690,212 @@ async def test_end_to_end_edit_test_fix_lifecycle():
         assert report.acceptance_criteria_satisfied is True
         assert "calc.py" in report.files_created_or_modified
 
+
+@pytest.mark.asyncio
+async def test_legacy_migration_failure_fails_closed():
+    """Validates finding A: If legacy credential re-encryption or persistence fails,
+    fail closed by raising CredentialMigrationError and NEVER return the unmigrated secret."""
+    import json
+    import base64
+    from unittest.mock import patch
+    from agent.persistence.db import Database, CredentialMigrationError
+
+    legacy_secret = "sk-legacy-unmigrated-secret-xyz"
+    legacy_stored = "b64:" + base64.b64encode(legacy_secret.encode("utf-8")).decode("ascii")
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        db_file = os.path.join(temp_dir, "mig_fail.db")
+        db = Database(db_path=db_file)
+        await db.init()
+
+        # Seed legacy credential directly in SQLite
+        async with aiosqlite.connect(db_file) as raw_db:
+            await raw_db.execute(
+                "INSERT INTO settings (key, value_json) VALUES (?, ?)",
+                ("app_settings", json.dumps({"openai_api_key": legacy_stored}))
+            )
+            await raw_db.commit()
+
+        # Deliberately mock save_setting to simulate persistence failure during migration
+        with patch.object(db, "save_setting", side_effect=Exception("Simulated SQLite disk write failure")):
+            with pytest.raises(CredentialMigrationError) as exc_info:
+                await db.get_setting("app_settings")
+            
+            assert "Failed to securely migrate and persist legacy credential" in str(exc_info.value)
+
+        # Confirm that the legacy record in SQLite was not corrupted or exposed
+        async with aiosqlite.connect(db_file) as raw_db:
+            cursor = await raw_db.execute("SELECT value_json FROM settings WHERE key = 'app_settings'")
+            row = await cursor.fetchone()
+            assert row is not None
+
+
+@pytest.mark.asyncio
+async def test_terminal_sandbox_boundaries():
+    """Validates finding B: Enforceable terminal sandbox boundaries:
+    - Blocks external filesystem reads outside the workspace
+    - Blocks workspace escapes (e.g. cd ..)
+    - Blocks unauthorized network tools unless allow_network=True
+    """
+    from agent.tools.terminal import RunCommandTool, SandboxViolationError, validate_sandbox_command
+
+    with tempfile.TemporaryDirectory() as ws_dir:
+        terminal_tool = RunCommandTool()
+
+        # 1. External path access outside workspace should trigger SandboxViolationError
+        ext_path = "C:\\Windows\\win.ini" if sys.platform == "win32" else "/etc/passwd"
+        cmd = f"type {ext_path}" if sys.platform == "win32" else f"cat {ext_path}"
+        res = await terminal_tool.execute(ws_dir, command=cmd)
+        assert res.success is False
+        assert "SandboxViolationError" in str(res.error) or "outside authorized workspace" in str(res.error)
+
+        # 2. Workspace escape commands (cd .., pushd ..) blocked
+        res_escape = await terminal_tool.execute(ws_dir, command="cd .. && dir")
+        assert res_escape.success is False
+        assert "SandboxViolationError" in str(res_escape.error) or "Directory escape command" in str(res_escape.error)
+
+        # 3. Network utilities blocked when allow_network=False (default)
+        res_net = await terminal_tool.execute(ws_dir, command="curl https://api.github.com")
+        assert res_net.success is False
+        assert "SandboxViolationError" in str(res_net.error) or "Network utility 'curl' is blocked" in str(res_net.error)
+
+        # 4. allow_network=True allows command inspection to pass
+        validate_sandbox_command("curl https://api.github.com", ws_dir, allow_network=True)
+
+
+def test_verifier_criteria_mapping_and_evidence():
+    """Validates finding C: Verification tracks explicit acceptance criteria,
+    maps each criterion to concrete evidence, and distinguishes 'command passed' from 'requirement demonstrated'."""
+    ve = VerificationEngine()
+
+    # Define explicit criteria
+    criteria = [
+        "Database migration must fail closed on write error",
+        "API endpoint must return 401 on missing token",
+    ]
+
+    # Check 1: Ran a general test, exit code 0, but only demonstrated API token auth
+    check1 = VerificationCheck(
+        check_name="API Auth Test",
+        check_type="test",
+        command="pytest tests/test_api_auth.py",
+        success=True,
+        exit_code=0,
+        output="1 passed - API endpoint returned 401 on missing token as expected",
+        evidence_summary="API endpoint returned 401 on missing token as expected",
+    )
+    ve.record_check(check1)
+
+    # Evaluate: Check 1 passed, but database migration criteria was not demonstrated
+    report_partial = ve.evaluate_completion(
+        task_id="t_crit_1",
+        goal="Harden database migration and secure API token auth",
+        actions_taken=["Added migration error check", "Added auth check"],
+        modified_files=["agent/persistence/db.py", "agent/api/server.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+
+    # Even though all recorded checks passed, requirement 1 was not demonstrated
+    assert report_partial.status == TaskStatus.PARTIALLY_COMPLETED
+    assert report_partial.acceptance_criteria_satisfied is False
+    assert len(report_partial.criteria_evidence) == 2
+    
+    # Check mapped evidence
+    crit1_ev = next(ce for ce in report_partial.criteria_evidence if "migration" in ce.criterion)
+    crit2_ev = next(ce for ce in report_partial.criteria_evidence if "401" in ce.criterion)
+    assert crit1_ev.demonstrated is False
+    assert crit2_ev.demonstrated is True
+    assert any("not demonstrated" in r.lower() for r in report_partial.unresolved_risks_or_limitations)
+    assert any("not demonstrated" in s.lower() for s in report_partial.skipped_or_failed_checks)
+
+    # Check 2: Now add check demonstrating database migration fail closed
+    check2 = VerificationCheck(
+        check_name="DB Migration Fail Closed Test",
+        check_type="test",
+        command="pytest tests/test_migration.py",
+        success=True,
+        exit_code=0,
+        output="Database migration must fail closed on write error verified",
+        evidence_summary="Database migration must fail closed on write error",
+    )
+    ve.record_check(check2)
+
+    report_complete = ve.evaluate_completion(
+        task_id="t_crit_2",
+        goal="Harden database migration and secure API token auth",
+        actions_taken=["Added migration error check", "Added auth check", "Ran both tests"],
+        modified_files=["agent/persistence/db.py", "agent/api/server.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+    assert report_complete.status == TaskStatus.COMPLETED
+    assert report_complete.acceptance_criteria_satisfied is True
+    assert all(ce.demonstrated for ce in report_complete.criteria_evidence)
+
+
+def test_api_host_ipv6_and_token_permission_failure():
+    """Validates finding D:
+    - Host-header RFC parsing handles IPv6, IPv4, ports, and rejects hostile/malformed hosts.
+    - Token file permission setting failure fails safely by raising RuntimeError."""
+    from unittest.mock import patch
+    from agent.api.server import _extract_hostname, _lock_down_token_file
+
+    # 1. Host header parsing
+    assert _extract_hostname("127.0.0.1:8000") == "127.0.0.1"
+    assert _extract_hostname("127.0.0.1") == "127.0.0.1"
+    assert _extract_hostname("localhost:5173") == "localhost"
+    assert _extract_hostname("localhost") == "localhost"
+    assert _extract_hostname("[::1]:8000") == "::1"
+    assert _extract_hostname("[::1]") == "::1"
+    assert _extract_hostname("::1") == "::1"
+    assert _extract_hostname("[evil.com]:8000") == "evil.com"
+    assert _extract_hostname("malformed:host:with:too:many:colons") == "malformed"
+
+    # 2. Fastapi client tests with IPv6 host header
+    client = TestClient(app)
+    res_ipv6 = client.get("/api/auth/token", headers={"Origin": "http://localhost:5173", "Host": "[::1]:8000"})
+    assert res_ipv6.status_code == 200
+
+    res_ipv4 = client.get("/api/auth/token", headers={"Origin": "http://localhost:5173", "Host": "127.0.0.1:8000"})
+    assert res_ipv4.status_code == 200
+
+    res_localhost = client.get("/api/auth/token", headers={"Origin": "http://localhost:5173", "Host": "localhost:8000"})
+    assert res_localhost.status_code == 200
+
+    # Hostile host header -> 400 Bad Request
+    res_evil = client.get("/api/auth/token", headers={"Origin": "http://localhost:5173", "Host": "evil.attacker.com:8000"})
+    assert res_evil.status_code == 400
+    assert "dns rebinding protection" in res_evil.json()["detail"].lower() or "invalid host header" in res_evil.json()["detail"].lower()
+
+    # 3. Fail-safe token file permission failure
+    with tempfile.NamedTemporaryFile() as tf:
+        with patch("subprocess.run") as mock_sub:
+            mock_sub.return_value.returncode = 1
+            mock_sub.return_value.stderr = "Access denied / icacls error"
+
+            with pytest.raises(RuntimeError, match="Security Failure.*icacls failed"):
+                _lock_down_token_file(tf.name)
+
+
+@pytest.mark.asyncio
+async def test_database_write_error_propagation():
+    """Validates finding E: Database.save_setting() preserves and propagates SQLite write errors
+    instead of masking them as successful writes."""
+    from unittest.mock import patch
+    from agent.persistence.db import Database, DatabaseWriteError
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        db_file = os.path.join(temp_dir, "write_err.db")
+        db = Database(db_path=db_file)
+        await db.init()
+
+        # Simulate SQLite operational failure (e.g. database locked or corrupted disk)
+        with patch("aiosqlite.connect", side_effect=aiosqlite.OperationalError("disk I/O error or database is locked")):
+            with pytest.raises(DatabaseWriteError) as exc_info:
+                await db.save_setting("test_key", {"status": "active"})
+
+            assert "Database write failure in save_setting" in str(exc_info.value)
+
+
+

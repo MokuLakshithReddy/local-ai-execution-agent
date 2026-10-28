@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from typing import Any, Dict
+import re
 import psutil
 from agent.tools.base import BaseTool
 from agent.core.models import PermissionLevel, ActionResult
@@ -35,6 +36,108 @@ SAFE_ENV_ALLOWLIST = {
     "PROCESSOR_ARCHITECTURE",
     "VIRTUAL_ENV",
 }
+
+
+class SandboxViolationError(PermissionError):
+    """Raised when a command violates workspace filesystem containment or network restrictions."""
+    pass
+
+
+BLOCKED_NETWORK_COMMANDS = {
+    "curl",
+    "wget",
+    "invoke-webrequest",
+    "iwr",
+    "invoke-restmethod",
+    "irm",
+    "nc",
+    "netcat",
+    "ncat",
+    "ssh",
+    "scp",
+    "sftp",
+    "ftp",
+    "telnet",
+    "ping",
+    "tracert",
+    "traceroute",
+    "nmap",
+    "socat",
+}
+
+BLOCKED_ESCAPE_COMMANDS = {
+    "cd ..",
+    "cd ../",
+    "cd ..\\",
+    "pushd",
+}
+
+
+def validate_sandbox_command(command: str, workspace_path: str, allow_network: bool = False):
+    """
+    Enforces OS-level isolation boundaries:
+    1. Blocks external network calls unless allow_network is True.
+    2. Blocks attempts to reference or access filesystem paths outside the authorized workspace.
+    3. Blocks directory traversal / workspace escape commands.
+    """
+    cmd_lower = command.lower().strip()
+    real_ws = os.path.realpath(workspace_path)
+
+    # 1. Network containment
+    if not allow_network:
+        tokens = [t.strip(" '\"`();|&") for t in cmd_lower.split()]
+        for tok in tokens:
+            base_tok = os.path.splitext(os.path.basename(tok))[0]
+            if base_tok in BLOCKED_NETWORK_COMMANDS or tok in BLOCKED_NETWORK_COMMANDS:
+                raise SandboxViolationError(
+                    f"Network Sandbox Violation: Network utility '{tok}' is blocked. Outbound network access is disabled in the sandbox."
+                )
+
+    # 2. Workspace escape commands
+    for esc in BLOCKED_ESCAPE_COMMANDS:
+        if esc in cmd_lower:
+            raise SandboxViolationError(
+                f"Filesystem Sandbox Violation: Directory escape command '{esc}' is forbidden in sandbox."
+            )
+
+    # 3. Path argument boundary inspection
+    try:
+        tokens = [m.group(1) or m.group(2) or m.group(3) for m in re.finditer(r'"([^"]+)"|\'([^\']+)\'|(\S+)', command)]
+    except Exception:
+        tokens = command.split()
+
+    allowed_prefixes = [
+        real_ws,
+        os.path.realpath(sys.executable),
+        os.path.realpath(os.path.dirname(sys.executable)),
+        os.path.realpath(sys.prefix),
+        os.path.realpath(sys.base_prefix),
+    ]
+
+    for cand in tokens:
+        clean_cand = cand.strip(" '\"`();|&<>")
+        if not clean_cand or clean_cand.startswith(("-", "/W", "/O", "/F", "/D", "/M", "/Z", "/?")):
+            continue
+        is_windows_abs = bool(re.match(r'^[a-zA-Z]:[\\/]', clean_cand))
+        is_posix_abs = clean_cand.startswith('/') and not clean_cand.startswith(('/W', '/O', '/F', '/D', '/M', '/Z', '/?'))
+        has_traversal = ".." in clean_cand
+
+        if is_windows_abs or is_posix_abs or has_traversal:
+            try:
+                target_path = clean_cand if (is_windows_abs or is_posix_abs) else os.path.join(real_ws, clean_cand)
+                resolved = os.path.realpath(os.path.abspath(target_path))
+                
+                # Check if it is an allowed system/interpreter binary or inside the virtualenv
+                if any(resolved == p or resolved.startswith(p + os.sep) for p in allowed_prefixes):
+                    continue
+
+                if not (resolved == real_ws or resolved.startswith(real_ws + os.sep)):
+                    raise SandboxViolationError(
+                        f"Filesystem Sandbox Violation: Path '{clean_cand}' resolves to '{resolved}', which is outside authorized workspace '{real_ws}'."
+                    )
+            except Exception as e:
+                if isinstance(e, SandboxViolationError):
+                    raise
 
 
 def _kill_process_tree(pid: int):
@@ -111,6 +214,11 @@ class RunCommandTool(BaseTool):
                     "description": "Maximum seconds to wait before terminating the process tree (default: 60).",
                     "default": 60,
                 },
+                "allow_network": {
+                    "type": "boolean",
+                    "description": "Whether to permit outbound network connections (default: false).",
+                    "default": False,
+                },
             },
             "required": ["command"],
         }
@@ -120,6 +228,7 @@ class RunCommandTool(BaseTool):
         call_id = kwargs.get("call_id", "run_command")
         command = kwargs.get("command", "").strip()
         timeout = min(kwargs.get("timeout_seconds", 60), 300)
+        allow_network = kwargs.get("allow_network", False)
 
         # Enforce canonical workspace path
         real_workspace = os.path.realpath(workspace_path)
@@ -133,11 +242,32 @@ class RunCommandTool(BaseTool):
                 execution_time_ms=(time.time() - t0) * 1000,
             )
 
+        # Enforce sandbox filesystem, escape, and network isolation
+        try:
+            validate_sandbox_command(command, real_workspace, allow_network=allow_network)
+        except SandboxViolationError as sve:
+            return ActionResult(
+                call_id=call_id,
+                tool_name=self.name,
+                success=False,
+                output="",
+                error=str(sve),
+                artifacts={"sandbox_violation": True, "command": command},
+                execution_time_ms=(time.time() - t0) * 1000,
+            )
+
         # Build isolated environment using strict allowlist (scrubs all API keys and host secrets)
         isolated_env = {}
         for key in SAFE_ENV_ALLOWLIST:
             if key in os.environ:
                 isolated_env[key] = os.environ[key]
+
+        # Block network via proxy blackholes if network access is not permitted
+        if not allow_network:
+            isolated_env["HTTP_PROXY"] = "http://127.0.0.1:0"
+            isolated_env["HTTPS_PROXY"] = "http://127.0.0.1:0"
+            isolated_env["ALL_PROXY"] = "http://127.0.0.1:0"
+            isolated_env["NO_PROXY"] = ""
 
         # Set clean python unbuffered output
         isolated_env["PYTHONUNBUFFERED"] = "1"

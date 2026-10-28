@@ -7,7 +7,7 @@ from typing import List, Optional
 import os
 import re
 import time
-from agent.core.models import TaskStatus, TaskType, VerificationCheck, TaskReport
+from agent.core.models import TaskStatus, TaskType, VerificationCheck, TaskReport, CriterionEvidence
 
 # Legitimate verification runners
 VALID_CHECK_RUNNERS = [
@@ -128,10 +128,12 @@ class VerificationEngine:
         task_current_status: TaskStatus = TaskStatus.EXECUTING,
         git_diff_summary: Optional[str] = None,
         unresolved_notes: Optional[List[str]] = None,
+        acceptance_criteria: Optional[List[str]] = None,
     ) -> TaskReport:
         """
         Synthesizes observed evidence into a structured completion report.
         Strictly requires evidence linking checks to acceptance criteria.
+        Distinguishes generic 'command passed' from concrete 'requirement demonstrated'.
         Guarantees that CANCELLED, BLOCKED, or FAILED tasks never report false success.
         """
         # Determine the latest outcome for each verification command/check
@@ -154,29 +156,95 @@ class VerificationEngine:
                 f"Check '{fc.check_name}' failed with exit code {fc.exit_code}. Summary: {fc.evidence_summary}"
             )
 
-        # Track explicitly requested criteria that were skipped or not covered by relevant checks
+        criteria_evidence: List[CriterionEvidence] = []
         g_lower = goal.lower()
+
+        # 1. Process explicit acceptance criteria if provided
+        if acceptance_criteria:
+            for criterion in acceptance_criteria:
+                c_lower = criterion.lower()
+                c_words = set(re.findall(r"[a-zA-Z0-9_-]{3,}", c_lower))
+                c_words = {w for w in c_words if w not in {"the", "and", "for", "with", "this", "that", "from", "should", "must", "verify", "check"}}
+
+                # Find relevant check whose command, output, or name explicitly exercises this criterion
+                matching_check = None
+                for check in relevant_passed_checks:
+                    check_text = f"{(check.command or '')} {check.check_name} {check.output}".lower()
+                    if any(w in check_text for w in c_words):
+                        matching_check = check
+                        break
+
+                if matching_check:
+                    criteria_evidence.append(
+                        CriterionEvidence(
+                            criterion=criterion,
+                            requirement=f"Evidence verified via {matching_check.check_name}",
+                            demonstrated=True,
+                            evidence_type="test_execution",
+                            evidence_summary=matching_check.evidence_summary,
+                            linked_check=matching_check.command or matching_check.check_name,
+                        )
+                    )
+                else:
+                    criteria_evidence.append(
+                        CriterionEvidence(
+                            criterion=criterion,
+                            requirement="Concrete test execution demonstrating requirement",
+                            demonstrated=False,
+                            evidence_type="missing_evidence",
+                            evidence_summary="No executed check demonstrated coverage of this specific criterion.",
+                            linked_check=None,
+                        )
+                    )
+                    skipped_or_failed.append(
+                        f"Unmet Acceptance Criterion: '{criterion}' was not demonstrated by concrete verification evidence."
+                    )
+
+        # 2. Derive required criteria from goal keywords
         required_criteria = []
         if any(w in g_lower for w in ("lint", "linter", "eslint", "ruff", "flake8")):
-            required_criteria.append(("Linting", ["lint", "flake8", "ruff", "eslint"]))
+            required_criteria.append(("Linting", ["lint", "flake8", "ruff", "eslint"], "linter_clean"))
         if any(w in g_lower for w in ("test", "tests", "unit test", "pytest", "coverage")):
-            required_criteria.append(("Automated Tests", ["test", "pytest", "unittest", "jest", "vitest"]))
+            required_criteria.append(("Automated Tests", ["test", "pytest", "unittest", "jest", "vitest"], "test_execution"))
         if any(w in g_lower for w in ("typecheck", "mypy", "typescript", "tsc")):
-            required_criteria.append(("Type Checking", ["mypy", "tsc", "typecheck"]))
+            required_criteria.append(("Type Checking", ["mypy", "tsc", "typecheck"], "build_verification"))
         if any(w in g_lower for w in ("build", "compile")):
-            required_criteria.append(("Build / Compilation", ["build", "compile", "tsc"]))
+            required_criteria.append(("Build / Compilation", ["build", "compile", "tsc"], "build_verification"))
 
-        for criterion_name, keywords in required_criteria:
+        for criterion_name, keywords, ev_type in required_criteria:
             matching_checks = [
                 c for c in relevant_passed_checks
                 if any(kw in (c.command or "").lower() or kw in c.check_type.lower() or kw in c.check_name.lower() for kw in keywords)
             ]
-            if not matching_checks:
+            if matching_checks:
+                best = matching_checks[0]
+                criteria_evidence.append(
+                    CriterionEvidence(
+                        criterion=f"Goal requirement: {criterion_name}",
+                        requirement=f"Execute {criterion_name} suite with exit code 0",
+                        demonstrated=True,
+                        evidence_type=ev_type,
+                        evidence_summary=best.evidence_summary,
+                        linked_check=best.command or best.check_name,
+                    )
+                )
+            else:
+                criteria_evidence.append(
+                    CriterionEvidence(
+                        criterion=f"Goal requirement: {criterion_name}",
+                        requirement=f"Execute {criterion_name} suite with exit code 0",
+                        demonstrated=False,
+                        evidence_type="missing_evidence",
+                        evidence_summary=f"No passing check executed for requested {criterion_name}.",
+                        linked_check=None,
+                    )
+                )
                 skipped_or_failed.append(
                     f"Required criterion '{criterion_name}' was requested in goal but no corresponding check was executed or verified."
                 )
 
         risks = list(unresolved_notes or [])
+        any_undemonstrated = any(not ce.demonstrated for ce in criteria_evidence)
 
         # 1. State Consistency Guard:
         # If the task was cancelled, blocked, or failed in the engine, preserve that status
@@ -187,7 +255,7 @@ class VerificationEngine:
         # 2. Criteria Evaluation based on TaskType
         elif task_type == TaskType.INFORMATIONAL:
             # Informational tasks (inspect architecture, search, explain) do not require code changes
-            if unresolved_failed_checks:
+            if unresolved_failed_checks or any_undemonstrated:
                 final_status = TaskStatus.PARTIALLY_COMPLETED
                 criteria_satisfied = False
             else:
@@ -219,10 +287,10 @@ class VerificationEngine:
                     risks.append(
                         "Irrelevant Verification: Executed checks did not demonstrate relevance to the modified files or task acceptance criteria (trivial/dummy command rejected)."
                     )
-            elif skipped_or_failed:
+            elif any_undemonstrated or skipped_or_failed:
                 final_status = TaskStatus.PARTIALLY_COMPLETED
                 criteria_satisfied = False
-                risks.append("Partial Acceptance Criteria: Some requested checks were skipped or failed.")
+                risks.append("Partial Acceptance Criteria: Some requested requirements were not demonstrated by concrete evidence.")
             else:
                 final_status = TaskStatus.COMPLETED
                 criteria_satisfied = True
@@ -233,7 +301,7 @@ class VerificationEngine:
                 final_status = TaskStatus.PARTIALLY_COMPLETED
                 criteria_satisfied = False
                 risks.append("No valid verification check was executed for a verification-specific goal.")
-            elif unresolved_failed_checks or skipped_or_failed:
+            elif unresolved_failed_checks or any_undemonstrated or skipped_or_failed:
                 final_status = TaskStatus.PARTIALLY_COMPLETED
                 criteria_satisfied = False
             else:
@@ -253,6 +321,7 @@ class VerificationEngine:
             diff_summary=git_diff_summary or "(no git diff available)",
             executed_verification_checks=self.recorded_checks,
             skipped_or_failed_checks=skipped_or_failed,
+            criteria_evidence=criteria_evidence,
             unresolved_risks_or_limitations=risks,
             acceptance_criteria_satisfied=criteria_satisfied,
             created_at=time.time(),

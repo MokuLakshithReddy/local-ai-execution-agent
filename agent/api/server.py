@@ -20,30 +20,32 @@ from agent.persistence.db import Database
 from agent.security.permissions import PermissionManager, PermissionPolicy
 from agent.tools.registry import ToolRegistry
 
+import urllib.parse
+
 # Auth Token setup
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".agent_session_token")
 
 
 def _lock_down_token_file(filepath: str):
-    """Enforces strict user-only ACLs on the session token file."""
+    """Enforces strict user-only ACLs on the session token file. Fails safely on error."""
     if sys.platform == "win32":
-        try:
-            import subprocess
-            username = os.environ.get("USERNAME")
-            if username:
-                subprocess.run(
-                    ["icacls", filepath, "/inheritance:r", "/grant:r", f"{username}:(R,W)"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-        except Exception:
-            pass
+        import subprocess
+        username = os.environ.get("USERNAME")
+        if not username:
+            raise RuntimeError("Security Failure: Unable to determine active USERNAME for token ACL configuration.")
+        res = subprocess.run(
+            ["icacls", filepath, "/inheritance:r", "/grant:r", f"{username}:(R,W)"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            raise RuntimeError(f"Security Failure: icacls failed to lock down token file ACLs ({res.stderr.strip()})")
     elif hasattr(os, "chmod"):
         try:
             os.chmod(filepath, 0o600)
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError(f"Security Failure: Failed to set 0600 permissions on token file ({str(e)})") from e
 
 
 def _get_or_create_session_token() -> str:
@@ -52,17 +54,21 @@ def _get_or_create_session_token() -> str:
             with open(TOKEN_FILE, "r", encoding="utf-8") as f:
                 t = f.read().strip()
                 if len(t) >= 32:
+                    _lock_down_token_file(TOKEN_FILE)
                     return t
-        except Exception:
-            pass
+        except Exception as e:
+            if "Security Failure" in str(e):
+                raise
 
     token = secrets.token_urlsafe(32)
     try:
         with open(TOKEN_FILE, "w", encoding="utf-8") as f:
             f.write(token)
         _lock_down_token_file(TOKEN_FILE)
-    except Exception:
-        pass
+    except Exception as e:
+        if "Security Failure" in str(e):
+            raise
+        raise RuntimeError(f"Security Failure: Failed to create and secure token file: {str(e)}") from e
     return token
 
 
@@ -76,8 +82,34 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:8000",
 ]
 
-# Allowed host headers to block DNS Rebinding attacks
-ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]", "testserver"}
+# Allowed host names to block DNS Rebinding attacks
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1", "testserver"}
+
+
+def _extract_hostname(host_header: str) -> str:
+    """Extracts canonical hostname from a Host header, correctly handling IPv4, IPv6, and ports."""
+    if not host_header:
+        return ""
+    host_header = host_header.strip()
+    # Check for bare IPv6 (e.g. '::1' without brackets or port)
+    if ":" in host_header and not host_header.startswith("[") and host_header.count(":") >= 2:
+        try:
+            import ipaddress
+            ipaddress.IPv6Address(host_header)
+            return host_header.lower()
+        except Exception:
+            pass
+    try:
+        parsed = urllib.parse.urlsplit(f"//{host_header}")
+        hostname = parsed.hostname
+        if not hostname:
+            # Fallback for simple hostnames or colons
+            return host_header.split(":")[0].strip("[]").lower()
+        return hostname.strip("[]").lower()
+    except Exception:
+        return host_header.split(":")[0].strip("[]").lower()
+
+
 
 app = FastAPI(title="Local-First AI Execution Agent", version="1.1.0")
 
@@ -92,9 +124,10 @@ app.add_middleware(
 
 @app.middleware("http")
 async def dns_rebinding_protection_middleware(request: Request, call_next):
-    """Blocks DNS rebinding attacks by validating the Host header."""
-    host_header = request.headers.get("host", "").split(":")[0].strip().lower()
-    if host_header and host_header not in ALLOWED_HOSTS:
+    """Blocks DNS rebinding attacks by validating the Host header across IPv4 and IPv6."""
+    host_header = request.headers.get("host", "")
+    hostname = _extract_hostname(host_header)
+    if not hostname or hostname not in ALLOWED_HOSTS:
         from fastapi.responses import JSONResponse
         return JSONResponse(
             status_code=400,

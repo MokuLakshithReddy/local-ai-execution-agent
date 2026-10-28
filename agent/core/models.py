@@ -91,6 +91,15 @@ class VerificationCheck(BaseModel):
     evidence_summary: str
 
 
+class CriterionEvidence(BaseModel):
+    criterion: str
+    requirement: str
+    demonstrated: bool
+    evidence_type: str  # test_execution, file_modification, build_verification, linter_clean
+    evidence_summary: str
+    linked_check: Optional[str] = None
+
+
 class TaskReport(BaseModel):
     task_id: str
     goal: str
@@ -101,6 +110,7 @@ class TaskReport(BaseModel):
     diff_summary: Optional[str] = None
     executed_verification_checks: List[VerificationCheck] = Field(default_factory=list)
     skipped_or_failed_checks: List[str] = Field(default_factory=list)
+    criteria_evidence: List[CriterionEvidence] = Field(default_factory=list)
     unresolved_risks_or_limitations: List[str] = Field(default_factory=list)
     acceptance_criteria_satisfied: bool = False
     created_at: float = Field(default_factory=time.time)

@@ -16,6 +16,16 @@ DB_PATH = "agent_state.db"
 sanitizer = SecuritySanitizer()
 
 
+class DatabaseWriteError(RuntimeError):
+    """Raised when writing to SQLite database fails."""
+    pass
+
+
+class CredentialMigrationError(RuntimeError):
+    """Raised when migrating a legacy credential fails."""
+    pass
+
+
 class Database:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
@@ -187,7 +197,7 @@ class Database:
             ]
 
     async def save_setting(self, key: str, value: Any):
-        """Save settings with OS-native encryption for sensitive API keys."""
+        """Save settings with OS-native encryption for sensitive API keys. Propagates write failures."""
         to_store = value
         if key == "app_settings" and isinstance(value, dict):
             to_store = dict(value)
@@ -205,11 +215,11 @@ class Database:
                     ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json
                 """, (key, json.dumps(to_store)))
                 await db.commit()
-        except Exception:
-            await self.init()
+        except Exception as e:
+            raise DatabaseWriteError(f"Database write failure in save_setting('{key}'): {str(e)}") from e
 
     async def get_setting(self, key: str, default: Any = None) -> Any:
-        """Get settings, decrypting OS-native encrypted credentials."""
+        """Get settings, decrypting OS-native encrypted credentials and migrating legacy formats."""
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 db.row_factory = aiosqlite.Row
@@ -241,11 +251,20 @@ class Database:
                         try:
                             # Immediately re-encrypt with DPAPI and persist securely
                             await self.save_setting(key, decrypted_val)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # If migration fails, do NOT return unmigrated secret to caller
+                            for k in ("openai_api_key", "anthropic_api_key", "gemini_api_key"):
+                                raw_item = val.get(k)
+                                if raw_item and (raw_item.startswith("enc:") or raw_item.startswith("b64:") or not (raw_item.startswith("dpapi:") or raw_item.startswith("fernet:"))):
+                                    decrypted_val[k] = None
+                            raise CredentialMigrationError(
+                                f"Failed to securely migrate and persist legacy credential: {str(e)}"
+                            ) from e
                     return decrypted_val
 
                 return val
+        except CredentialMigrationError:
+            raise
         except Exception:
             await self.init()
             return default
