@@ -2224,35 +2224,45 @@ async def test_run_verification_tool_structured_record_e2e():
                 assert any("test_addition" in node for node in rec_c["passed_nodes"])
 
 
-def _multiprocess_vault_worker(key_dir: str) -> str:
-    """Helper worker for process-level concurrency tests."""
-    from agent.persistence.credentials import CredentialVault
-    v = CredentialVault(key_dir=key_dir, is_windows=False)
-    key = v._get_or_create_posix_key()
-    return key.decode("ascii")
-
-
 def test_credential_vault_multiprocess_concurrency_and_crash_recovery():
     """Validates Finding 3:
     1. Multi-process concurrency: multiple OS processes simultaneously initialize CredentialVault
        and obtain identical encryption keys.
     2. Crash recovery: a process crash leaving a 0-byte key file during initialization does NOT
        wedge the vault permanently; subsequent processes recover safely and establish a valid key."""
-    import multiprocessing
     from agent.persistence.credentials import CredentialVault
 
-    # 1. Multi-process concurrency test
+    # 1. Multi-process concurrency test using independent OS processes
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
         key_dir = os.path.join(temp_dir, "mp_keys")
         os.makedirs(key_dir, mode=0o700)
 
-        ctx = multiprocessing.get_context("spawn")
-        with ctx.Pool(processes=4) as pool:
-            results = pool.map(_multiprocess_vault_worker, [key_dir] * 4)
+        script = (
+            "import sys\n"
+            "from agent.persistence.credentials import CredentialVault\n"
+            "v = CredentialVault(key_dir=sys.argv[1], is_windows=False)\n"
+            "k = v._get_or_create_posix_key()\n"
+            "sys.stdout.write(k.decode('ascii'))\n"
+        )
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, key_dir],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(4)
+        ]
+        results = []
+        for p in procs:
+            out, err = p.communicate(timeout=30)
+            assert p.returncode == 0, f"Process failed with returncode {p.returncode}: {err}"
+            results.append(out.strip())
 
         assert len(results) == 4
         # All distinct OS processes must have obtained the exact same key
         assert len(set(results)) == 1
+        assert len(results[0]) >= 32
 
     # 2. Crash recovery test: 0-byte key file left by crashed process
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
