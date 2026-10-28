@@ -11,6 +11,7 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 from agent.core.models import (
     Task,
     TaskStatus,
+    TaskType,
     PermissionLevel,
     VerificationCheck,
     ActionResult,
@@ -20,7 +21,7 @@ from agent.providers.registry import ProviderRegistry
 from agent.tools.registry import ToolRegistry
 from agent.security.permissions import PermissionManager
 from agent.security.sanitizer import SecuritySanitizer
-from agent.verification.verifier import VerificationEngine
+from agent.verification.verifier import VerificationEngine, infer_task_type
 from agent.persistence.db import Database
 
 
@@ -58,10 +59,20 @@ class ExecutionEngine:
         self.on_event = on_event
         self._active_tasks: Dict[str, bool] = {}  # task_id -> is_running
 
+    def _sanitize_dict(self, obj: Any) -> Any:
+        if isinstance(obj, str):
+            return self.sanitizer.redact_secrets(obj)
+        elif isinstance(obj, dict):
+            return {k: self._sanitize_dict(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._sanitize_dict(item) for item in obj]
+        return obj
+
     async def emit(self, event_type: str, data: Dict[str, Any]):
         if self.on_event:
             try:
-                await self.on_event(event_type, data)
+                sanitized_data = self._sanitize_dict(data)
+                await self.on_event(event_type, sanitized_data)
             except Exception as e:
                 print(f"Error emitting event: {e}")
 
@@ -366,16 +377,22 @@ class ExecutionEngine:
         )
         diff_summary = git_diff_result.output if git_diff_result.success else None
 
+        task_type = getattr(task, "task_type", None) or infer_task_type(task.goal)
+        task.task_type = task_type
+
         final_report = verifier.evaluate_completion(
             task_id=task.id,
             goal=task.goal,
             actions_taken=actions_taken,
             modified_files=modified_files,
+            task_type=task_type,
+            task_current_status=task.status,
             git_diff_summary=diff_summary,
             unresolved_notes=[task.error] if task.error else [],
         )
 
         task.final_report = final_report
+        # Never overwrite CANCELLED, BLOCKED, or FAILED into completed
         if task.status not in (TaskStatus.CANCELLED, TaskStatus.BLOCKED, TaskStatus.FAILED):
             task.status = final_report.status
 

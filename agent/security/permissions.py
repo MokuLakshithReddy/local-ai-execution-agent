@@ -1,11 +1,13 @@
 """
 Permission and safety evaluation system.
-Independent from LLM; enforces boundaries, workspace restrictions, and approval gates.
+Independent from LLM; enforces boundaries, workspace restrictions, symlink containment, and approval gates.
 """
 from typing import Dict, Any, Tuple
 import os
 import uuid
 from agent.core.models import PermissionLevel, ApprovalRequest
+
+PATH_ARGUMENT_KEYS = ("path", "target_path", "file_path", "relative_path")
 
 
 class PermissionPolicy:
@@ -40,15 +42,16 @@ class PermissionManager:
         Evaluates whether an action can execute immediately or requires human approval.
         Returns: (is_allowed_immediately, reason, approval_request_if_pending)
         """
-        # 1. Path safety check for filesystem-affecting tools
-        if "path" in arguments or "target_path" in arguments:
-            path_arg = arguments.get("path") or arguments.get("target_path")
-            if not self._is_path_within_workspace(str(path_arg), workspace_path):
-                return (
-                    False,
-                    f"Forbidden: Path '{path_arg}' lies outside authorized workspace '{workspace_path}'.",
-                    None,
-                )
+        # 1. Symlink-aware path safety check for filesystem-affecting tools
+        for key in PATH_ARGUMENT_KEYS:
+            if key in arguments and arguments[key]:
+                path_arg = str(arguments[key]).strip()
+                if not self._is_path_within_workspace(path_arg, workspace_path):
+                    return (
+                        False,
+                        f"Forbidden: Path '{path_arg}' resolves outside authorized workspace '{workspace_path}'.",
+                        None,
+                    )
 
         # 2. Check permission level against policy
         if permission_level == PermissionLevel.READ_ONLY:
@@ -121,14 +124,26 @@ class PermissionManager:
     def _is_path_within_workspace(path: str, workspace_path: str) -> bool:
         if not path or not workspace_path:
             return False
-        abs_workspace = os.path.abspath(workspace_path)
+        real_workspace = os.path.realpath(workspace_path)
         if os.path.isabs(path):
-            abs_target = os.path.abspath(path)
+            candidate = os.path.abspath(path)
         else:
-            abs_target = os.path.abspath(os.path.join(abs_workspace, path))
-        # Check common path
+            candidate = os.path.abspath(os.path.join(real_workspace, path))
+
+        # Check symlink dereference
+        if os.path.exists(candidate) or os.path.islink(candidate):
+            real_target = os.path.realpath(candidate)
+        else:
+            # For non-existent files to be created, inspect real parent directory
+            parent = os.path.dirname(candidate)
+            while parent and not os.path.exists(parent) and parent != os.path.dirname(parent):
+                parent = os.path.dirname(parent)
+            real_parent = os.path.realpath(parent) if os.path.exists(parent) else parent
+            rel = os.path.relpath(candidate, parent)
+            real_target = os.path.abspath(os.path.join(real_parent, rel))
+
         try:
-            common = os.path.commonpath([abs_target, abs_workspace])
-            return os.path.abspath(common) == abs_workspace
+            common = os.path.commonpath([real_target, real_workspace])
+            return common == real_workspace
         except Exception:
             return False

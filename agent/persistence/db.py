@@ -1,14 +1,18 @@
 """
 SQLite database persistence for tasks, logs, approvals, and application settings.
+Includes automatic credential encryption and secret sanitization on all persisted data.
 """
 import aiosqlite
 import json
 import os
 import time
 from typing import Any, Dict, List, Optional
-from agent.core.models import Task, TaskStatus, TaskReport, ApprovalRequest
+from agent.core.models import Task, TaskStatus, TaskReport
+from agent.persistence.credentials import vault
+from agent.security.sanitizer import SecuritySanitizer
 
 DB_PATH = "agent_state.db"
+sanitizer = SecuritySanitizer()
 
 
 class Database:
@@ -69,8 +73,11 @@ class Database:
 
     async def save_task(self, task: Task):
         async with aiosqlite.connect(self.db_path) as db:
-            plan_str = json.dumps(task.plan)
-            report_str = task.final_report.model_dump_json() if task.final_report else None
+            plan_clean = [sanitizer.redact_secrets(p) for p in task.plan]
+            plan_str = json.dumps(plan_clean)
+            report_str = sanitizer.redact_secrets(task.final_report.model_dump_json()) if task.final_report else None
+            error_clean = sanitizer.redact_secrets(task.error) if task.error else None
+            
             await db.execute("""
                 INSERT INTO tasks (
                     id, goal, workspace_path, model_provider, model_name, status,
@@ -86,7 +93,7 @@ class Database:
             """, (
                 task.id, task.goal, task.workspace_path, task.model_provider, task.model_name,
                 task.status.value, task.current_step, task.max_steps, plan_str, report_str,
-                task.error, task.created_at, time.time()
+                error_clean, task.created_at, time.time()
             ))
             await db.commit()
 
@@ -145,11 +152,19 @@ class Database:
 
     async def log_step(self, step_id: str, task_id: str, step_num: int, step_type: str, content: str, metadata: Dict[str, Any] = None):
         async with aiosqlite.connect(self.db_path) as db:
-            meta_json = json.dumps(metadata or {})
+            clean_content = sanitizer.redact_secrets(content or "")
+            clean_metadata = {}
+            if metadata:
+                for k, v in metadata.items():
+                    if isinstance(v, str):
+                        clean_metadata[k] = sanitizer.redact_secrets(v)
+                    else:
+                        clean_metadata[k] = v
+            meta_json = json.dumps(clean_metadata)
             await db.execute("""
                 INSERT INTO task_steps (step_id, task_id, step_num, step_type, content, metadata_json, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (step_id, task_id, step_num, step_type, content, meta_json, time.time()))
+            """, (step_id, task_id, step_num, step_type, clean_content, meta_json, time.time()))
             await db.commit()
 
     async def get_task_steps(self, task_id: str) -> List[Dict[str, Any]]:
@@ -171,18 +186,50 @@ class Database:
             ]
 
     async def save_setting(self, key: str, value: Any):
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-                INSERT INTO settings (key, value_json) VALUES (?, ?)
-                ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json
-            """, (key, json.dumps(value)))
-            await db.commit()
+        """Save settings with encryption for sensitive API keys."""
+        to_store = value
+        if key == "app_settings" and isinstance(value, dict):
+            to_store = dict(value)
+            for k in ("openai_api_key", "anthropic_api_key", "gemini_api_key"):
+                if k in to_store and to_store[k]:
+                    to_store[k] = "enc:" + vault.encrypt(to_store[k])
+
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL)
+                """)
+                await db.execute("""
+                    INSERT INTO settings (key, value_json) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json
+                """, (key, json.dumps(to_store)))
+                await db.commit()
+        except Exception:
+            await self.init()
 
     async def get_setting(self, key: str, default: Any = None) -> Any:
-        async with aiosqlite.connect(self.db_path) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT value_json FROM settings WHERE key = ?", (key,))
-            row = await cursor.fetchone()
-            if not row:
-                return default
-            return json.loads(row["value_json"])
+        """Get settings, decrypting any encrypted credentials."""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL)
+                """)
+                cursor = await db.execute("SELECT value_json FROM settings WHERE key = ?", (key,))
+                row = await cursor.fetchone()
+                if not row:
+                    return default
+                val = json.loads(row["value_json"])
+
+                if key == "app_settings" and isinstance(val, dict):
+                    decrypted_val = dict(val)
+                    for k in ("openai_api_key", "anthropic_api_key", "gemini_api_key"):
+                        raw = decrypted_val.get(k)
+                        if raw and isinstance(raw, str) and raw.startswith("enc:"):
+                            decrypted_val[k] = vault.decrypt(raw[4:])
+                    return decrypted_val
+
+                return val
+        except Exception:
+            await self.init()
+            return default

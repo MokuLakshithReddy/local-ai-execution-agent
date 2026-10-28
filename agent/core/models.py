@@ -1,5 +1,6 @@
 """
 Core domain models for the AI Execution Agent.
+Includes discrete TaskTypes, acceptance criteria tracking, and verifiable completion reporting.
 """
 from __future__ import annotations
 from enum import Enum
@@ -21,12 +22,18 @@ class TaskStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class TaskType(str, Enum):
+    INFORMATIONAL = "INFORMATIONAL"         # e.g., architecture inspection, code search, questions
+    CODE_MODIFICATION = "CODE_MODIFICATION" # e.g., bug fix, feature development, refactor
+    TEST_AND_VERIFY = "TEST_AND_VERIFY"     # e.g., add test coverage, verify build, benchmark
+
+
 class PermissionLevel(str, Enum):
-    READ_ONLY = "READ_ONLY"                   # e.g., inspect files, git status
-    ROUTINE_MODIFICATION = "ROUTINE_MODIFICATION" # e.g., edit source code, write tests
-    SENSITIVE_OPERATION = "SENSITIVE_OPERATION"   # e.g., run unknown script, install packages
+    READ_ONLY = "READ_ONLY"                         # e.g., inspect files, git status
+    ROUTINE_MODIFICATION = "ROUTINE_MODIFICATION"   # e.g., edit source code, write tests
+    SENSITIVE_OPERATION = "SENSITIVE_OPERATION"     # e.g., run shell scripts, package install
     DESTRUCTIVE_OPERATION = "DESTRUCTIVE_OPERATION" # e.g., delete files, git reset
-    EXTERNAL_SIDE_EFFECT = "EXTERNAL_SIDE_EFFECT" # e.g., deploy, mutate remote db
+    EXTERNAL_SIDE_EFFECT = "EXTERNAL_SIDE_EFFECT"   # e.g., deploy, mutate remote db
 
 
 class ToolParameter(BaseModel):
@@ -87,6 +94,7 @@ class VerificationCheck(BaseModel):
 class TaskReport(BaseModel):
     task_id: str
     goal: str
+    task_type: TaskType = TaskType.CODE_MODIFICATION
     status: TaskStatus
     summary_of_actions: List[str] = Field(default_factory=list)
     files_created_or_modified: List[str] = Field(default_factory=list)
@@ -94,6 +102,7 @@ class TaskReport(BaseModel):
     executed_verification_checks: List[VerificationCheck] = Field(default_factory=list)
     skipped_or_failed_checks: List[str] = Field(default_factory=list)
     unresolved_risks_or_limitations: List[str] = Field(default_factory=list)
+    acceptance_criteria_satisfied: bool = False
     created_at: float = Field(default_factory=time.time)
     completed_at: Optional[float] = None
 
@@ -104,11 +113,13 @@ class Task(BaseModel):
     workspace_path: str
     model_provider: str
     model_name: str
+    task_type: TaskType = TaskType.CODE_MODIFICATION
     status: TaskStatus = TaskStatus.IDLE
     current_step: int = 0
     max_steps: int = 30
     timeout_seconds: int = 600
     plan: List[str] = Field(default_factory=list)
+    acceptance_criteria: List[str] = Field(default_factory=list)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
     error: Optional[str] = None

@@ -9,7 +9,7 @@
 [![React + Vite](https://img.shields.io/badge/React-19%20%7C%20Vite-646CFF.svg)](https://vitejs.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-Local--First-003B57.svg)](https://sqlite.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Verification: Passed](https://img.shields.io/badge/Verification-7%20Passed-10b981.svg)](#-live-verification-evidence-log)
+[![Verification: Passed](https://img.shields.io/badge/Verification-11%20Passed-10b981.svg)](#-live-verification-evidence-log)
 
 </div>
 
@@ -78,27 +78,29 @@ platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.7.0
 rootdir: C:\Users\nsrfl\OneDrive\Desktop\MAKE LLM TO CODE
 configfile: pytest.ini
 plugins: anyio-4.15.1, asyncio-1.4.1
-collected 7 items
+collected 11 items
 
-tests/test_core_and_tools.py::test_resolve_safe_path_security PASSED     [ 14%]
-tests/test_core_and_tools.py::test_security_sanitizer_redaction PASSED   [ 28%]
-tests/test_core_and_tools.py::test_security_sanitizer_injection_defense PASSED [ 42%]
-tests/test_core_and_tools.py::test_permission_manager_levels PASSED      [ 57%]
-tests/test_core_and_tools.py::test_filesystem_tools_lifecycle PASSED     [ 71%]
-tests/test_core_and_tools.py::test_verification_engine_claims PASSED     [ 85%]
-tests/test_core_and_tools.py::test_provider_registry PASSED              [100%]
+tests/test_core_and_tools.py::test_resolve_safe_path_security PASSED     [  9%]
+tests/test_core_and_tools.py::test_symlink_containment_security PASSED   [ 18%]
+tests/test_core_and_tools.py::test_credential_vault_encryption PASSED    [ 27%]
+tests/test_core_and_tools.py::test_database_credential_encryption_and_sanitization PASSED [ 36%]
+tests/test_core_and_tools.py::test_security_sanitizer_redaction PASSED   [ 45%]
+tests/test_core_and_tools.py::test_security_sanitizer_injection_defense PASSED [ 54%]
+tests/test_core_and_tools.py::test_permission_manager_levels PASSED      [ 63%]
+tests/test_core_and_tools.py::test_terminal_environment_allowlist PASSED [ 72%]
+tests/test_core_and_tools.py::test_filesystem_tools_lifecycle PASSED     [ 81%]
+tests/test_core_and_tools.py::test_criteria_driven_verification PASSED   [ 90%]
+tests/test_core_and_tools.py::test_api_security_authorization PASSED     [100%]
 
-============================== 7 passed in 0.21s ==============================
+============================== 11 passed in 0.70s ==============================
 ```
 
 #### What Was Proved:
-1. **Path Traversal Security**: Attempted `../../` directory escapes are intercepted and trigger `ValueError` immediately.
-2. **Secret Redaction**: API keys (`sk-*`, `ghp_*`, `AIza*`) are masked with `[REDACTED_SECRET]` before logging.
-3. **Prompt Injection Defense**: Untrusted content containing adversarial override phrases is fenced within untrusted markers.
-4. **Permission Hierarchy**: Read-only tools auto-approved; sensitive terminal commands and destructive deletions quarantined into `PENDING_APPROVAL`.
-5. **Tool Lifecycle**: Safe file creation, chunked slicing, atomic block patching, and regex searching execute within workspace boundaries.
-6. **False-Positive Prevention**: The verification engine rejects a model claim of success if automated checks report non-zero exit codes.
-7. **Multi-Model Dynamic Resolution**: Providers (Gemini, OpenAI, Anthropic, Ollama) instantiate correctly.
+1. **Authenticated Local API & Strict CORS**: Unauthenticated requests to `/api/tasks` receive `401 Unauthorized`; unauthorized WebSocket connections are dropped with policy violation; wildcard CORS is eliminated; and calls targeting unapproved directories are rejected with `403 Forbidden`.
+2. **Encrypted Credential Vault & Log Sanitization**: API keys are stored in an encrypted vault (`enc:...`), never in plain JSON in SQLite. Log steps, task errors, and WebSocket events are redacted before crossing boundaries.
+3. **Sandboxed Terminal Execution & Process-Tree Killing**: Shell executions use a strict environment allowlist (scrubbing host API keys), bounded memory streaming (preventing runaway buffers), and full recursive child process-tree termination.
+4. **Symlink Boundary Containment**: Canonical `realpath` dereferencing prevents symlinks or junctions from escaping the authorized workspace boundary.
+5. **Criteria-Driven Completion**: Execution tasks (`CODE_MODIFICATION`) cannot claim `COMPLETED` unless files were actually modified and verified by passing automated checks. Cancelled or blocked states are strictly preserved.
 
 ---
 

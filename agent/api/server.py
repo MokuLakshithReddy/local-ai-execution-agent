@@ -1,29 +1,70 @@
 """
 FastAPI Server & WebSocket bridge for the Local-First AI Execution Agent.
+Secured with local session token authorization, strict CORS boundaries,
+and an approved workspace registry.
 """
 import asyncio
 import os
+import secrets
+import sys
 import uuid
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header, Request, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent.core.models import Task, TaskStatus, PermissionLevel
+from agent.core.models import Task, TaskStatus, TaskType
 from agent.core.engine import ExecutionEngine
 from agent.persistence.db import Database
 from agent.security.permissions import PermissionManager, PermissionPolicy
 from agent.tools.registry import ToolRegistry
 
+# Auth Token setup
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".agent_session_token")
 
-app = FastAPI(title="AI Execution Agent", version="1.0.0")
+
+def _get_or_create_session_token() -> str:
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+                t = f.read().strip()
+                if len(t) >= 32:
+                    return t
+        except Exception:
+            pass
+
+    token = secrets.token_urlsafe(32)
+    try:
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+            f.write(token)
+        if hasattr(os, "chmod"):
+            try:
+                os.chmod(TOKEN_FILE, 0o600)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return token
+
+
+SESSION_TOKEN = _get_or_create_session_token()
+
+# Strict CORS: Only allow local loopback origins
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+
+app = FastAPI(title="Local-First AI Execution Agent", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -56,24 +97,64 @@ engine = ExecutionEngine(
 )
 
 
+def verify_auth(
+    x_agent_auth_token: Optional[str] = Header(None, alias="X-Agent-Auth-Token"),
+    authorization: Optional[str] = Header(None),
+):
+    """Verifies that the request provides the local session token."""
+    token = x_agent_auth_token
+    if not token and authorization:
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token = parts[1]
+
+    if not token or not secrets.compare_digest(token, SESSION_TOKEN):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: Missing or invalid local session auth token.",
+        )
+    return token
+
+
 @app.on_event("startup")
 async def on_startup():
     await db.init()
-    # Seed default workspace if none
-    curr_dir = os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+    # Seed current project directory as default approved workspace
+    curr_dir = os.path.realpath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
     existing_ws = await db.get_setting("current_workspace")
     if not existing_ws:
         await db.save_setting("current_workspace", curr_dir)
 
+    approved = await db.get_setting("approved_workspaces", [])
+    if curr_dir not in approved:
+        approved.append(curr_dir)
+        await db.save_setting("approved_workspaces", approved)
+
+
+@app.get("/api/auth/token")
+async def get_session_token(request: Request):
+    """
+    Returns the session token only for direct local loopback requests,
+    allowing the frontend running locally to bootstrap securely.
+    """
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "localhost", "::1"):
+        raise HTTPException(status_code=403, detail="Forbidden: Handshake only available from loopback.")
+    return {"token": SESSION_TOKEN}
+
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = Query(None)):
+    # Validate authorization token before accepting WebSocket
+    if not token or not secrets.compare_digest(token, SESSION_TOKEN):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     await websocket.accept()
     active_connections.append(websocket)
     try:
         while True:
             data = await websocket.receive_json()
-            # Handle client-initiated ping or action if needed
             if data.get("action") == "ping":
                 await websocket.send_json({"type": "pong"})
     except WebSocketDisconnect:
@@ -92,6 +173,10 @@ class CreateTaskRequest(BaseModel):
     custom_base_url: Optional[str] = None
 
 
+class ApproveWorkspaceRequest(BaseModel):
+    workspace_path: str
+
+
 class ResolveApprovalRequest(BaseModel):
     approved: bool
 
@@ -108,22 +193,34 @@ class SaveSettingsRequest(BaseModel):
 
 @app.get("/api/health")
 async def health_check():
-    return {"status": "ok", "app": "Local-First AI Execution Agent"}
+    return {"status": "ok", "app": "Local-First AI Execution Agent", "version": "1.1.0"}
 
 
-@app.get("/api/workspaces")
+@app.get("/api/workspaces", dependencies=[Depends(verify_auth)])
 async def get_workspaces():
     current_ws = await db.get_setting("current_workspace", os.getcwd())
+    approved_ws = await db.get_setting("approved_workspaces", [current_ws])
     return {
         "current": current_ws,
-        "available": [
-            current_ws,
-            os.path.abspath(os.getcwd()),
-        ],
+        "approved": approved_ws,
     }
 
 
-@app.get("/api/models")
+@app.post("/api/workspaces/approve", dependencies=[Depends(verify_auth)])
+async def approve_workspace(req: ApproveWorkspaceRequest):
+    real_path = os.path.realpath(req.workspace_path)
+    if not os.path.exists(real_path) or not os.path.isdir(real_path):
+        raise HTTPException(status_code=400, detail="Invalid workspace path: directory does not exist.")
+
+    approved = await db.get_setting("approved_workspaces", [])
+    if real_path not in approved:
+        approved.append(real_path)
+        await db.save_setting("approved_workspaces", approved)
+
+    return {"status": "approved", "workspace": real_path, "approved_workspaces": approved}
+
+
+@app.get("/api/models", dependencies=[Depends(verify_auth)])
 async def get_supported_models():
     return {
         "providers": [
@@ -161,10 +258,9 @@ async def get_supported_models():
     }
 
 
-@app.get("/api/settings")
+@app.get("/api/settings", dependencies=[Depends(verify_auth)])
 async def get_settings():
     settings = await db.get_setting("app_settings", {})
-    # Redact keys for client display
     return {
         "openai_api_key_set": bool(settings.get("openai_api_key")),
         "anthropic_api_key_set": bool(settings.get("anthropic_api_key")),
@@ -176,7 +272,7 @@ async def get_settings():
     }
 
 
-@app.post("/api/settings")
+@app.post("/api/settings", dependencies=[Depends(verify_auth)])
 async def save_settings(req: SaveSettingsRequest):
     settings = await db.get_setting("app_settings", {})
     if req.openai_api_key is not None:
@@ -190,7 +286,6 @@ async def save_settings(req: SaveSettingsRequest):
     settings["auto_approve_routine"] = req.auto_approve_routine
     settings["auto_approve_sensitive"] = req.auto_approve_sensitive
 
-    # Update policy on permission manager
     permission_manager.policy = PermissionPolicy(
         auto_approve_routine=req.auto_approve_routine,
         auto_approve_sensitive=req.auto_approve_sensitive,
@@ -198,18 +293,29 @@ async def save_settings(req: SaveSettingsRequest):
 
     await db.save_setting("app_settings", settings)
     if req.current_workspace:
-        await db.save_setting("current_workspace", os.path.abspath(req.current_workspace))
+        real_ws = os.path.realpath(req.current_workspace)
+        await db.save_setting("current_workspace", real_ws)
 
     return {"status": "saved"}
 
 
-@app.post("/api/tasks")
+@app.post("/api/tasks", dependencies=[Depends(verify_auth)])
 async def create_task(req: CreateTaskRequest):
-    workspace = req.workspace_path or await db.get_setting("current_workspace", os.getcwd())
-    if not os.path.exists(workspace):
-        raise HTTPException(status_code=400, detail=f"Workspace path does not exist: {workspace}")
+    target_ws = req.workspace_path or await db.get_setting("current_workspace", os.getcwd())
+    real_ws = os.path.realpath(target_ws)
 
-    # Resolve API key
+    if not os.path.exists(real_ws) or not os.path.isdir(real_ws):
+        raise HTTPException(status_code=400, detail=f"Workspace path does not exist: {target_ws}")
+
+    # Validate against Approved Workspace Registry
+    approved_workspaces = await db.get_setting("approved_workspaces", [])
+    if real_ws not in approved_workspaces:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Forbidden: Workspace '{real_ws}' has not been approved in the workspace registry.",
+        )
+
+    # Resolve API key securely
     settings = await db.get_setting("app_settings", {})
     api_key = req.api_key
     if not api_key:
@@ -233,13 +339,13 @@ async def create_task(req: CreateTaskRequest):
     task = Task(
         id=task_id,
         goal=req.goal,
-        workspace_path=os.path.abspath(workspace),
+        workspace_path=real_ws,
         model_provider=req.model_provider,
         model_name=req.model_name,
         max_steps=req.max_steps,
     )
 
-    # Launch asynchronously in background
+    # Launch in background
     asyncio.create_task(
         engine.run_task(
             task=task,
@@ -251,13 +357,13 @@ async def create_task(req: CreateTaskRequest):
     return {"task_id": task_id, "status": "started"}
 
 
-@app.get("/api/tasks")
+@app.get("/api/tasks", dependencies=[Depends(verify_auth)])
 async def list_tasks():
     tasks = await db.list_tasks(limit=30)
     return {"tasks": [t.model_dump() for t in tasks]}
 
 
-@app.get("/api/tasks/{task_id}")
+@app.get("/api/tasks/{task_id}", dependencies=[Depends(verify_auth)])
 async def get_task_details(task_id: str):
     task = await db.get_task(task_id)
     if not task:
@@ -266,20 +372,20 @@ async def get_task_details(task_id: str):
     return {"task": task.model_dump(), "steps": steps}
 
 
-@app.post("/api/tasks/{task_id}/cancel")
+@app.post("/api/tasks/{task_id}/cancel", dependencies=[Depends(verify_auth)])
 async def cancel_task(task_id: str):
     engine.cancel_task(task_id)
     return {"status": "cancellation_requested", "task_id": task_id}
 
 
-@app.get("/api/approvals/pending")
+@app.get("/api/approvals/pending", dependencies=[Depends(verify_auth)])
 async def get_pending_approvals():
     return {
         "approvals": [a.model_dump() for a in permission_manager.pending_approvals.values()]
     }
 
 
-@app.post("/api/approvals/{approval_id}")
+@app.post("/api/approvals/{approval_id}", dependencies=[Depends(verify_auth)])
 async def resolve_approval(approval_id: str, req: ResolveApprovalRequest):
     resolved = permission_manager.resolve_approval(approval_id, req.approved)
     if not resolved:
@@ -288,10 +394,11 @@ async def resolve_approval(approval_id: str, req: ResolveApprovalRequest):
     return {"status": "resolved", "approval": resolved.model_dump()}
 
 
-@app.get("/api/diff")
+@app.get("/api/diff", dependencies=[Depends(verify_auth)])
 async def get_workspace_diff(workspace_path: Optional[str] = None):
     ws = workspace_path or await db.get_setting("current_workspace", os.getcwd())
-    res = await tool_registry.execute_tool("git_diff", workspace_path=ws)
+    real_ws = os.path.realpath(ws)
+    res = await tool_registry.execute_tool("git_diff", workspace_path=real_ws)
     return {"diff": res.output if res.success else "", "error": res.error}
 
 

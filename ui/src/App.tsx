@@ -91,15 +91,38 @@ export default function App() {
   })
   const [inputApiKey, setInputApiKey] = useState('')
 
+  const authTokenRef = useRef<string>('')
+
   const wsRef = useRef<WebSocket | null>(null)
   const timelineEndRef = useRef<HTMLDivElement | null>(null)
 
+  const authFetch = async (url: string, options: RequestInit = {}) => {
+    const headers = new Headers(options.headers || {})
+    if (authTokenRef.current) {
+      headers.set('X-Agent-Auth-Token', authTokenRef.current)
+    }
+    return fetch(url, { ...options, headers })
+  }
+
   // Initialize
   useEffect(() => {
-    loadSettings()
-    loadWorkspaces()
-    loadTaskHistory()
-    setupWebSocket()
+    const initAuthAndData = async () => {
+      try {
+        const tokenRes = await fetch('http://localhost:8000/api/auth/token')
+        if (tokenRes.ok) {
+          const { token } = await tokenRes.json()
+          authTokenRef.current = token
+          loadSettings(token)
+          loadWorkspaces(token)
+          loadTaskHistory(token)
+          setupWebSocket(token)
+        }
+      } catch (err) {
+        console.warn('Initial session auth failed or server offline', err)
+      }
+    }
+
+    initAuthAndData()
 
     return () => {
       if (wsRef.current) wsRef.current.close()
@@ -111,8 +134,9 @@ export default function App() {
     timelineEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [timeline])
 
-  const setupWebSocket = () => {
-    const wsUrl = `ws://${window.location.hostname || 'localhost'}:8000/ws`
+  const setupWebSocket = (token?: string) => {
+    const tok = token || authTokenRef.current
+    const wsUrl = `ws://${window.location.hostname || 'localhost'}:8000/ws?token=${encodeURIComponent(tok)}`
     const ws = new WebSocket(wsUrl)
     wsRef.current = ws
 
@@ -126,7 +150,7 @@ export default function App() {
     }
 
     ws.onclose = () => {
-      setTimeout(setupWebSocket, 3000)
+      setTimeout(() => setupWebSocket(), 3000)
     }
   }
 
@@ -208,9 +232,11 @@ export default function App() {
     }
   }
 
-  const loadSettings = async () => {
+  const loadSettings = async (tok?: string) => {
     try {
-      const res = await fetch('http://localhost:8000/api/settings')
+      const headers: any = {}
+      if (tok || authTokenRef.current) headers['X-Agent-Auth-Token'] = tok || authTokenRef.current
+      const res = await fetch('http://localhost:8000/api/settings', { headers })
       if (res.ok) {
         const data = await res.json()
         setSettings(data)
@@ -221,9 +247,11 @@ export default function App() {
     }
   }
 
-  const loadWorkspaces = async () => {
+  const loadWorkspaces = async (tok?: string) => {
     try {
-      const res = await fetch('http://localhost:8000/api/workspaces')
+      const headers: any = {}
+      if (tok || authTokenRef.current) headers['X-Agent-Auth-Token'] = tok || authTokenRef.current
+      const res = await fetch('http://localhost:8000/api/workspaces', { headers })
       if (res.ok) {
         const data = await res.json()
         if (data.current) setCurrentWorkspace(data.current)
@@ -231,9 +259,11 @@ export default function App() {
     } catch (e) {}
   }
 
-  const loadTaskHistory = async () => {
+  const loadTaskHistory = async (tok?: string) => {
     try {
-      const res = await fetch('http://localhost:8000/api/tasks')
+      const headers: any = {}
+      if (tok || authTokenRef.current) headers['X-Agent-Auth-Token'] = tok || authTokenRef.current
+      const res = await fetch('http://localhost:8000/api/tasks', { headers })
       if (res.ok) {
         const data = await res.json()
         setHistoryTasks(data.tasks || [])
@@ -243,7 +273,7 @@ export default function App() {
 
   const fetchDiff = async () => {
     try {
-      const res = await fetch('http://localhost:8000/api/diff')
+      const res = await authFetch('http://localhost:8000/api/diff')
       if (res.ok) {
         const data = await res.json()
         setGitDiff(data.diff || '')
@@ -261,7 +291,7 @@ export default function App() {
     setActiveTab('timeline')
 
     try {
-      const res = await fetch('http://localhost:8000/api/tasks', {
+      const res = await authFetch('http://localhost:8000/api/tasks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -291,7 +321,7 @@ export default function App() {
   const cancelTask = async () => {
     if (!currentTaskId) return
     try {
-      await fetch(`http://localhost:8000/api/tasks/${currentTaskId}/cancel`, { method: 'POST' })
+      await authFetch(`http://localhost:8000/api/tasks/${currentTaskId}/cancel`, { method: 'POST' })
       setTaskStatus('CANCELLED')
     } catch (e) {}
   }
@@ -299,7 +329,7 @@ export default function App() {
   const resolveApproval = async (approved: boolean) => {
     if (!pendingApproval) return
     try {
-      await fetch(`http://localhost:8000/api/approvals/${pendingApproval.approval_id}`, {
+      await authFetch(`http://localhost:8000/api/approvals/${pendingApproval.approval_id}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ approved }),
@@ -322,7 +352,7 @@ export default function App() {
         if (provider === 'anthropic') payload.anthropic_api_key = inputApiKey.trim()
       }
 
-      await fetch('http://localhost:8000/api/settings', {
+      await authFetch('http://localhost:8000/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),

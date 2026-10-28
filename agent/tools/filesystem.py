@@ -13,25 +13,39 @@ MAX_READ_BYTES = 100_000  # 100 KB safety limit per read
 
 
 def resolve_safe_path(workspace_path: str, sub_path: str) -> str:
-    """Safely resolves and validates that a relative/absolute path is inside the workspace."""
+    """Safely resolves and validates that a relative/absolute path and any symbolic links stay within the workspace."""
     if not sub_path:
-        return os.path.abspath(workspace_path)
+        return os.path.realpath(workspace_path)
     
-    # If path is already absolute, verify it's within workspace
+    workspace_real = os.path.realpath(workspace_path)
+    
+    # If path is absolute, check its canonical path; otherwise join to workspace
     if os.path.isabs(sub_path):
-        resolved = os.path.abspath(sub_path)
+        candidate = os.path.abspath(sub_path)
     else:
-        resolved = os.path.abspath(os.path.join(workspace_path, sub_path))
+        candidate = os.path.abspath(os.path.join(workspace_real, sub_path))
 
-    workspace_abs = os.path.abspath(workspace_path)
+    # Resolve all symbolic links and junctions to their real canonical target
+    if os.path.exists(candidate) or os.path.islink(candidate):
+        resolved_real = os.path.realpath(candidate)
+    else:
+        # If candidate does not exist yet (e.g. creating new file), resolve nearest existing parent
+        parent = os.path.dirname(candidate)
+        while parent and not os.path.exists(parent) and parent != os.path.dirname(parent):
+            parent = os.path.dirname(parent)
+        real_parent = os.path.realpath(parent) if os.path.exists(parent) else parent
+        rel_from_parent = os.path.relpath(candidate, parent)
+        resolved_real = os.path.abspath(os.path.join(real_parent, rel_from_parent))
+
+    # Check that canonical path is strictly contained within real workspace
     try:
-        common = os.path.commonpath([resolved, workspace_abs])
-        if common != workspace_abs:
-            raise ValueError(f"Path traversal detected: '{sub_path}' is outside workspace '{workspace_path}'")
+        common = os.path.commonpath([resolved_real, workspace_real])
+        if common != workspace_real:
+            raise ValueError(f"Path traversal or symlink escape detected: '{sub_path}' resolves to '{resolved_real}', which is outside authorized workspace '{workspace_real}'")
     except Exception as e:
-        raise ValueError(f"Invalid path check: {str(e)}")
+        raise ValueError(f"Security validation error: {str(e)}")
         
-    return resolved
+    return resolved_real
 
 
 class ListDirTool(BaseTool):

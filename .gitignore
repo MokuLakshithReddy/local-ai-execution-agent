@@ -7,3 +7,6 @@ dist/
 agent_state.db
 .pytest_cache/
 .env
+.agent_session_token
+.agent_vault.key
+*.key
