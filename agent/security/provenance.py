@@ -90,6 +90,8 @@ def _lock_down_key_file(filepath: str) -> None:
             capture_output=True,
             text=True,
             check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=15,
         )
         if reset_res.returncode != 0:
             raise VerificationSecretStorageError(
@@ -102,6 +104,8 @@ def _lock_down_key_file(filepath: str) -> None:
             capture_output=True,
             text=True,
             check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=15,
         )
         if grant_res.returncode != 0:
             raise VerificationSecretStorageError(
@@ -114,6 +118,8 @@ def _lock_down_key_file(filepath: str) -> None:
             capture_output=True,
             text=True,
             check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=15,
         )
         if audit_res.returncode != 0:
             raise VerificationSecretStorageError(

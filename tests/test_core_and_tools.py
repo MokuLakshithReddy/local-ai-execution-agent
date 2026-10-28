@@ -2793,8 +2793,17 @@ def test_verification_secret_concurrent_creation_race_handled():
         with open(key_file, "wb") as f:
             f.write(seeded_key)
 
-        # Simulate FileExistsError on atomic open
-        with patch("os.open", side_effect=FileExistsError("File already exists")):
+        # Simulate FileExistsError on atomic open for initial creation
+        orig_os_open = os.open
+        race_simulated = False
+        def mock_os_open(path, flags, *args, **kwargs):
+            nonlocal race_simulated
+            if not race_simulated and (flags & getattr(os, "O_CREAT", 0)) and (flags & getattr(os, "O_EXCL", 0)):
+                race_simulated = True
+                raise FileExistsError("File already exists")
+            return orig_os_open(path, flags, *args, **kwargs)
+
+        with patch("os.open", side_effect=mock_os_open):
             secret = get_verification_secret(config_dir=temp_dir)
             assert secret == seeded_key
     reset_verification_secret()
@@ -2814,14 +2823,14 @@ def test_windows_key_file_acl_enforcement():
     try:
         if sys.platform == "win32":
             # Explicitly inject a hostile pre-existing permissive ACE (Everyone:R)
-            subprocess.run(["icacls", tmp_name, "/grant", "Everyone:(R)"], check=True)
-            pre_acl = subprocess.run(["icacls", tmp_name], capture_output=True, text=True).stdout
+            subprocess.run(["icacls", tmp_name, "/grant", "Everyone:(R)"], check=True, stdin=subprocess.DEVNULL, timeout=15)
+            pre_acl = subprocess.run(["icacls", tmp_name], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15).stdout
             assert "everyone" in pre_acl.lower()
 
             # Execute lockdown: must strip Everyone:(R) and grant strictly to USERNAME
             _lock_down_key_file(tmp_name)
 
-            post_acl = subprocess.run(["icacls", tmp_name], capture_output=True, text=True).stdout
+            post_acl = subprocess.run(["icacls", tmp_name], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15).stdout
             post_entries = post_acl.lower().replace(tmp_name.lower(), "")
             assert "everyone" not in post_entries
             assert "users" not in post_entries
@@ -3703,8 +3712,9 @@ def test_verification_secret_multithreaded_concurrency():
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = [executor.submit(worker_task, i) for i in range(16)]
-            concurrent.futures.wait(futures)
+            done, not_done = concurrent.futures.wait(futures, timeout=30.0)
 
+        assert len(not_done) == 0, f"Thread pool workers timed out: {len(not_done)} threads still active"
         assert len(errors) == 0, f"Concurrent thread errors encountered: {errors}"
 
 

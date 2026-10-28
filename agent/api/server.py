@@ -33,16 +33,18 @@ def _lock_down_token_file(filepath: str):
         username = os.environ.get("USERNAME")
         if not username:
             raise RuntimeError("Security Failure: Unable to determine active USERNAME for token ACL configuration.")
-        subprocess.run(["icacls", filepath, "/reset"], capture_output=True, text=True, check=False)
+        subprocess.run(["icacls", filepath, "/reset"], capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL, timeout=15)
         res = subprocess.run(
             ["icacls", filepath, "/inheritance:r", "/grant:r", f"{username}:(R,W)"],
             capture_output=True,
             text=True,
             check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=15,
         )
         if res.returncode != 0:
             raise RuntimeError(f"Security Failure: icacls failed to lock down token file ACLs ({res.stderr.strip()})")
-        audit_res = subprocess.run(["icacls", filepath], capture_output=True, text=True, check=False)
+        audit_res = subprocess.run(["icacls", filepath], capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL, timeout=15)
         acl_entries = audit_res.stdout.lower().replace(filepath.lower(), "")
         if "everyone" in acl_entries or "builtin\\users" in acl_entries:
             raise RuntimeError(f"Security Failure: Token file retained permissive ACL: {audit_res.stdout.strip()}")

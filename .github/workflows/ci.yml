@@ -15,6 +15,7 @@ jobs:
   test:
     name: Backend Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -45,7 +46,7 @@ jobs:
 
     - name: Run Unit & Adversarial Test Suite
       run: |
-        pytest tests/ -v -k "not test_real_docker"
+        pytest tests/ -v --durations=10 -k "not test_real_docker"
 
     - name: Run Live Docker Container Security Boundaries Integration Test
       if: matrix.os == 'ubuntu-latest'
@@ -67,6 +68,7 @@ jobs:
   frontend:
     name: Frontend Build & Typecheck
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v4
 
