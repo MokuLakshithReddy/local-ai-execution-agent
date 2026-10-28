@@ -507,8 +507,10 @@ class RunCommandTool(BaseTool):
                     output="",
                     error=(
                         "Security Failure: Host execution without sandboxing is strictly disabled. "
-                        "To permit unisolated host process execution, set environment variable "
-                        "AGENT_ALLOW_UNISOLATED_HOST_EXECUTION=1 in trusted environments."
+                        "Unisolated host execution is a trusted-development-only option and is NEVER "
+                        "the default for tasks that may run untrusted code. "
+                        "To permit unisolated host process execution in trusted development environments, "
+                        "set environment variable AGENT_ALLOW_UNISOLATED_HOST_EXECUTION=1."
                     ),
                     artifacts={
                         "sandbox_mode": "host",

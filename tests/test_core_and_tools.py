@@ -3429,6 +3429,146 @@ def test_verification_secret_rotation_failures_fail_closed_and_preserve_state():
         assert verify_trusted_execution_record(rec, secret=initial_secret) is True
 
 
+def test_verification_secret_rotation_post_replace_lockdown_failure_rollback():
+    """Validates Concern 1:
+    If post-replacement permission lockdown fails (_lock_down_key_file on key_file),
+    rotate_verification_secret() automatically and atomically rolls back the key on disk
+    to the prior established secret, cleans up staging files, preserves the in-memory cache,
+    and raises VerificationSecretStorageError so the application never accepts invalid or insecure state.
+    """
+    from agent.security.provenance import (
+        get_verification_secret,
+        rotate_verification_secret,
+        reset_verification_secret,
+        issue_trusted_execution_record,
+        verify_trusted_execution_record,
+        VerificationSecretStorageError,
+        _lock_down_key_file,
+    )
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cfg_dir = os.path.join(temp_dir, "rollback_test")
+        reset_verification_secret()
+
+        # 1. Establish initial secret and issue record
+        initial_secret = get_verification_secret(config_dir=cfg_dir)
+        rec = issue_trusted_execution_record(
+            run_id="run_rb",
+            runner="pytest",
+            command="pytest tests/",
+            exit_code=0,
+            total=1,
+            passed=1,
+            failed=0,
+            passed_nodes=["test_rb"],
+            secret=initial_secret,
+        )
+        assert verify_trusted_execution_record(rec, secret=initial_secret) is True
+
+        # 2. Mock _lock_down_key_file to fail on first attempt for key_file (post-replace),
+        # but permit the rollback attempt to lock down the restored key
+        key_file_path = os.path.realpath(os.path.join(cfg_dir, "verification.key"))
+        real_lock_down = _lock_down_key_file
+        attempt = [0]
+
+        def failing_lockdown(filepath: str):
+            real_path = os.path.realpath(filepath)
+            # Fail on first call targeting key_file post-replace
+            if real_path == key_file_path and attempt[0] == 0:
+                attempt[0] += 1
+                raise VerificationSecretStorageError("Simulated post-replace ACL lockdown failure")
+            return real_lock_down(filepath)
+
+        with patch("agent.security.provenance._lock_down_key_file", side_effect=failing_lockdown):
+            with pytest.raises(VerificationSecretStorageError) as exc:
+                rotate_verification_secret(config_dir=cfg_dir)
+            assert "Failed to rotate verification secret" in str(exc.value)
+
+        # 3. Assert atomic rollback succeeded:
+        # Disk must contain the initial_secret, not the unpersisted new_secret
+        with open(key_file_path, "rb") as f:
+            disk_content = f.read()
+        assert disk_content == initial_secret
+
+        # Active secret in cache and re-fetched is still initial_secret
+        assert get_verification_secret(config_dir=cfg_dir) == initial_secret
+
+        # Historical records continue to verify successfully!
+        assert verify_trusted_execution_record(rec, secret=initial_secret) is True
+
+        # 4. Catastrophic failure recovery test: if post-replace lockdown fails AND rollback lockdown ALSO fails, key is evicted to fail closed
+        def fail_on_target_key_file(filepath: str):
+            if os.path.realpath(filepath) == key_file_path:
+                raise VerificationSecretStorageError("Unrecoverable permission error on target key_file")
+            return real_lock_down(filepath)
+
+        with patch("agent.security.provenance._lock_down_key_file", side_effect=fail_on_target_key_file):
+            with pytest.raises(VerificationSecretStorageError) as exc_catastrophic:
+                rotate_verification_secret(config_dir=cfg_dir)
+            assert "Catastrophic secret rotation failure" in str(exc_catastrophic.value)
+        # Key file was evicted from disk
+        assert not os.path.exists(key_file_path)
+
+
+def test_verification_secret_multithreaded_concurrency():
+    """Validates Concern 4:
+    Concurrent execution across multiple worker threads:
+    Multiple threads reading, issuing, verifying records, and rotating secrets
+    operate safely under module-level synchronization (_SECRET_LOCK) without race conditions.
+    """
+    import concurrent.futures
+    from agent.security.provenance import (
+        get_verification_secret,
+        rotate_verification_secret,
+        reset_verification_secret,
+        issue_trusted_execution_record,
+        verify_trusted_execution_record,
+        is_ephemeral_mode,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        dir_x = os.path.join(temp_dir, "concurrent_x")
+        dir_y = os.path.join(temp_dir, "concurrent_y")
+        reset_verification_secret()
+
+        errors = []
+
+        def worker_task(worker_id: int):
+            try:
+                target_dir = dir_x if (worker_id % 2 == 0) else dir_y
+                for _ in range(5):
+                    sec = get_verification_secret(config_dir=target_dir)
+                    assert len(sec) == 32
+                    assert is_ephemeral_mode(config_dir=target_dir) is False
+
+                    rec = issue_trusted_execution_record(
+                        run_id=f"run_thread_{worker_id}",
+                        runner="pytest",
+                        command="pytest tests/",
+                        exit_code=0,
+                        total=1,
+                        passed=1,
+                        failed=0,
+                        passed_nodes=[f"test_node_{worker_id}"],
+                        secret=sec,
+                    )
+                    assert verify_trusted_execution_record(rec, secret=sec) is True
+
+                    # Worker 0 periodically rotates
+                    if worker_id == 0:
+                        rotate_verification_secret(config_dir=dir_x)
+            except Exception as e:
+                errors.append(e)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(worker_task, i) for i in range(16)]
+            concurrent.futures.wait(futures)
+
+        assert len(errors) == 0, f"Concurrent thread errors encountered: {errors}"
+
+
+
 
 
 
