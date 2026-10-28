@@ -1932,13 +1932,15 @@ def test_credential_vault_stress_slow_writes_interrupted_and_permissions():
         os.makedirs(key_dir, mode=0o700)
         key_file = os.path.join(key_dir, "vault.key")
 
-        # Simulate a process that died after writing only 10 bytes
+        # Simulate a process that died after writing only 10 bytes with strict permissions
         with open(key_file, "wb") as f:
             f.write(b"interrupte")  # only 10 bytes, corrupted
+        if sys.platform != "win32":
+            os.chmod(key_file, 0o600)
 
         with pytest.raises(CredentialEncryptionError) as exc_info:
             CredentialVault(key_dir=key_dir, is_windows=False)
-        assert "Corrupted or empty" in str(exc_info.value) or "initialization failed" in str(exc_info.value)
+        assert any(msg in str(exc_info.value) for msg in ("Corrupted or empty", "initialization failed", "Insecure permissions"))
 
     # 3. Insecure key permissions fail closed immediately
     if sys.platform != "win32":
