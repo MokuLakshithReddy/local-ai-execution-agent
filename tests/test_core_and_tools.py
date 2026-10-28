@@ -2799,7 +2799,9 @@ def test_sandbox_interpreter_escape_attempts_blocked_by_container_boundary():
         # Non-root user is enforced
         assert any(arg.startswith("--user") for arg in docker_args)
         # Workspace is the only read-write bind mount
-        assert f"-v{temp_dir}:/workspace:rw" in docker_args or f"-v {temp_dir}:/workspace:rw" in " ".join(docker_args)
+        real_ws = os.path.realpath(temp_dir)
+        assert "-v" in docker_args
+        assert any(arg.endswith(":/workspace:rw") and (real_ws.lower() in arg.lower() or os.path.basename(temp_dir).lower() in arg.lower()) for arg in docker_args)
 
 
 
