@@ -75,11 +75,25 @@ class CredentialVault:
             try:
                 fd = os.open(self._key_file, flags, 0o600)
             except FileExistsError:
-                # Concurrent creator finished first: validate and read their key through shared routine
+                # Concurrent creator finished first; wait briefly for creator to complete write & flush
+                for _ in range(20):
+                    try:
+                        return self._validate_and_read_posix_key(self._key_file)
+                    except CredentialEncryptionError as err:
+                        if "Corrupted or empty" in str(err):
+                            time.sleep(0.05)
+                            continue
+                        raise
                 return self._validate_and_read_posix_key(self._key_file)
 
             with os.fdopen(fd, "wb") as f:
                 f.write(key)
+                f.flush()
+                if hasattr(os, "fdatasync"):
+                    try:
+                        os.fdatasync(f.fileno())
+                    except Exception:
+                        pass
 
             if sys.platform != "win32":
                 os.chmod(self._key_file, 0o600)

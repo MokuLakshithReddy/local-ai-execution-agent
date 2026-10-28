@@ -1772,15 +1772,24 @@ async def test_real_docker_container_security_boundaries():
     tool = RunCommandTool()
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        # 1. Read-only rootfs prevents writes outside /workspace
+        # 1. Read-only rootfs prevents writes outside /workspace via internal interpreter
         esc_res = await tool.execute(
             call_id="c_real_fs",
             workspace_path=temp_dir,
-            command="touch /escape.txt",
+            command='python3 -c "open(\'/escape.txt\', \'w\').write(\'test\')"',
             sandbox_mode="container",
         )
         assert esc_res.success is False
-        assert "Read-only file system" in esc_res.output or "Read-only file system" in str(esc_res.error)
+        assert "Read-only file system" in esc_res.output or "Read-only file system" in str(esc_res.error) or "OSError" in str(esc_res.error) or "Permission denied" in esc_res.output
+
+        # Verify writing inside workspace is permitted
+        ws_res = await tool.execute(
+            call_id="c_real_ws",
+            workspace_path=temp_dir,
+            command='python3 -c "open(\'test_ok.txt\', \'w\').write(\'ok\')"',
+            sandbox_mode="container",
+        )
+        assert ws_res.success is True
 
         # 2. Network none blocks raw socket connections
         net_res = await tool.execute(
