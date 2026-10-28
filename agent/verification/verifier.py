@@ -280,27 +280,60 @@ class VerificationEngine:
 
                 if target_test:
                     target_test_clean = target_test.strip().lower()
-                    target_test_stem = os.path.splitext(os.path.basename(target_test_clean))[0]
-                    target_test_name = target_test_clean.split("::")[-1].replace(".py", "")
+                    has_specific_fn = "::" in target_test_clean
+                    if has_specific_fn:
+                        parts = target_test_clean.split("::")
+                        target_test_name = parts[-1].replace(".py", "")
+                        target_test_stem = None
+                    else:
+                        target_test_name = target_test_clean.replace(".py", "")
+                        target_test_stem = os.path.splitext(os.path.basename(target_test_clean))[0]
 
                     for check in relevant_passed_checks:
                         passed_nodes = _extract_executed_passed_test_nodes(check)
 
+                        # Extract skipped / failed nodes from trusted execution record if present
+                        skipped_or_failed_nodes = set()
+                        if check.trusted_execution_record:
+                            if isinstance(check.trusted_execution_record, dict):
+                                sn = check.trusted_execution_record.get("skipped_nodes", [])
+                                fn = check.trusted_execution_record.get("failed_nodes", [])
+                            else:
+                                sn = getattr(check.trusted_execution_record, "skipped_nodes", [])
+                                fn = getattr(check.trusted_execution_record, "failed_nodes", [])
+                            skipped_or_failed_nodes = {str(n).strip().lower() for n in (sn + fn)}
+
+                        # A skipped or failed test node can NEVER match as passed
+                        if target_test_clean in skipped_or_failed_nodes or target_test_name in skipped_or_failed_nodes:
+                            continue
+
                         # Must match an actually executed and passed test node parsed from runner telemetry
-                        node_matched = (
-                            target_test_clean in passed_nodes
-                            or target_test_name in passed_nodes
-                            or target_test_stem in passed_nodes
-                            or any(
-                                p == target_test_clean
-                                or p == target_test_name
-                                or p == target_test_stem
-                                or p.endswith(f"::{target_test_name}")
-                                or p.endswith(f"/{target_test_clean}")
-                                or p.endswith(f"\\{target_test_clean}")
-                                for p in passed_nodes
+                        if has_specific_fn:
+                            node_matched = (
+                                target_test_clean in passed_nodes
+                                or target_test_name in passed_nodes
+                                or any(
+                                    p == target_test_clean
+                                    or p == target_test_name
+                                    or p.endswith(f"::{target_test_name}")
+                                    for p in passed_nodes
+                                )
                             )
-                        )
+                        else:
+                            node_matched = (
+                                target_test_clean in passed_nodes
+                                or target_test_name in passed_nodes
+                                or (target_test_stem and target_test_stem in passed_nodes)
+                                or any(
+                                    p == target_test_clean
+                                    or p == target_test_name
+                                    or (target_test_stem and p == target_test_stem)
+                                    or p.endswith(f"::{target_test_name}")
+                                    or p.endswith(f"/{target_test_clean}")
+                                    or p.endswith(f"\\{target_test_clean}")
+                                    for p in passed_nodes
+                                )
+                            )
 
                         if node_matched:
                             matching_check = check

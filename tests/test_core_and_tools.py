@@ -2165,20 +2165,23 @@ def test_credential_vault_multiprocess_concurrency_and_crash_recovery():
 
 
 def test_trusted_execution_record_individual_field_tampering_rejected():
-    """Validates Blocker 1:
-    All security-relevant fields (run_id, runner, command, exit_code, total, passed, failed,
-    passed_nodes, failed_nodes, timestamp) are signed. Tampering with ANY individual field
-    invalidates the cryptographic signature and causes verification to fail."""
+    """Validates:
+    All security-relevant fields (run_id, runner, command, exit_code, total, passed, failed, skipped,
+    passed_nodes, failed_nodes, skipped_nodes, timestamp) are canonically serialized via deterministic JSON
+    and signed with HMAC-SHA256. Tampering with ANY individual field invalidates the cryptographic
+    signature and causes verification to fail."""
     original = issue_trusted_execution_record(
         run_id="run_100",
         runner="pytest",
         command="pytest tests/test_security.py",
         exit_code=0,
-        total=2,
+        total=3,
         passed=2,
         failed=0,
+        skipped=1,
         passed_nodes=["tests/test_security.py::test_boundary", "test_boundary"],
         failed_nodes=[],
+        skipped_nodes=["tests/test_security.py::test_skipped_opt"],
     )
     assert verify_trusted_execution_record(original) is True
 
@@ -2204,7 +2207,7 @@ def test_trusted_execution_record_individual_field_tampering_rejected():
 
     # 5. Modify total count
     t = original.model_copy()
-    t.total = 3
+    t.total = 4
     assert verify_trusted_execution_record(t) is False
 
     # 6. Modify passed count
@@ -2217,32 +2220,42 @@ def test_trusted_execution_record_individual_field_tampering_rejected():
     t.failed = 1
     assert verify_trusted_execution_record(t) is False
 
-    # 8. Modify passed_nodes
+    # 8. Modify skipped count
+    t = original.model_copy()
+    t.skipped = 0
+    assert verify_trusted_execution_record(t) is False
+
+    # 9. Modify passed_nodes
     t = original.model_copy()
     t.passed_nodes = ["tests/test_other.py::test_tampered"]
     assert verify_trusted_execution_record(t) is False
 
-    # 9. Modify failed_nodes
+    # 10. Modify failed_nodes
     t = original.model_copy()
     t.failed_nodes = ["tests/test_security.py::test_failed"]
     assert verify_trusted_execution_record(t) is False
 
-    # 10. Modify timestamp
+    # 11. Modify skipped_nodes
+    t = original.model_copy()
+    t.skipped_nodes = ["tests/test_security.py::test_different_skipped"]
+    assert verify_trusted_execution_record(t) is False
+
+    # 12. Modify timestamp
     t = original.model_copy()
     t.timestamp = original.timestamp + 10.0
     assert verify_trusted_execution_record(t) is False
 
-    # 11. Modify signature
+    # 13. Modify signature
     t = original.model_copy()
     t.signature = "a" * 64
     assert verify_trusted_execution_record(t) is False
 
-    # 12. Inconsistent counts (passed + failed != total)
+    # 14. Inconsistent counts (passed + failed + skipped != total)
     t = original.model_copy()
     t.total = 10
     assert verify_trusted_execution_record(t) is False
 
-    # 13. Zero testcases
+    # 15. Zero testcases
     t = original.model_copy()
     t.total = 0
     t.passed = 0
@@ -2250,7 +2263,7 @@ def test_trusted_execution_record_individual_field_tampering_rejected():
 
 
 def test_parse_junit_xml_report_rejects_zero_tests_and_counts_cases_accurately():
-    """Validates Blocker 2:
+    """Validates:
     1. JUnit parser rejects reports with 0 test cases (returns None).
     2. JUnit parser counts testcases, not identifier tokens (failed count accurately equals failed testcases).
     3. Rejects reports with inconsistent counts or 0 passed tests.
@@ -2285,12 +2298,13 @@ def test_parse_junit_xml_report_rejects_zero_tests_and_counts_cases_accurately()
         assert parsed["total"] == 2
         assert parsed["passed"] == 1
         assert parsed["failed"] == 1
+        assert parsed["skipped"] == 0
         # Identifier list contains the aliases
         assert len(parsed["passed_nodes"]) >= 2
         assert len(parsed["failed_nodes"]) >= 2
 
         # Case 3: issue_trusted_execution_record rejects zero tests or count inconsistency
-        with pytest.raises(ValueError, match="Zero-test or inconsistent reports"):
+        with pytest.raises(ValueError, match="Zero-test, zero-pass, or count-inconsistent"):
             issue_trusted_execution_record(
                 run_id="r_zero",
                 runner="pytest",
@@ -2302,7 +2316,7 @@ def test_parse_junit_xml_report_rejects_zero_tests_and_counts_cases_accurately()
                 passed_nodes=[],
             )
 
-        with pytest.raises(ValueError, match="Zero-test or inconsistent reports"):
+        with pytest.raises(ValueError, match="Zero-test, zero-pass, or count-inconsistent"):
             issue_trusted_execution_record(
                 run_id="r_inconsistent",
                 runner="pytest",
@@ -2311,8 +2325,213 @@ def test_parse_junit_xml_report_rejects_zero_tests_and_counts_cases_accurately()
                 total=5,
                 passed=2,
                 failed=1,
+                skipped=0,
                 passed_nodes=["test_a", "test_b"],
             )
+
+
+def test_junit_xml_report_skipped_tests_handling_and_verification_rejection():
+    """Validates Issue 1:
+    1. Skipped tests are NEVER classified as passed.
+    2. Skipped-only test reports return None and cannot issue trusted records.
+    3. Mixed test reports track passed, failed, and skipped separately.
+    4. Downstream verification engine keeps criteria bound to skipped tests as UNVERIFIED."""
+    from agent.tools.verification import parse_junit_xml_report
+    from agent.verification.verifier import VerificationEngine
+    from agent.core.models import VerificationCheck, TaskStatus, TaskType
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Case A: Skipped-only report (2 skipped, 0 passed) -> MUST return None (cannot certify passing verification)
+        skipped_only_xml = os.path.join(temp_dir, "skipped_only.xml")
+        with open(skipped_only_xml, "w") as f:
+            f.write(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<testsuites>\n'
+                '  <testsuite name="pytest" tests="2">\n'
+                '    <testcase classname="tests.test_auth" file="tests/test_auth.py" name="test_feature_a" time="0.00">\n'
+                '      <skipped message="not supported on this os"/>\n'
+                '    </testcase>\n'
+                '    <testcase classname="tests.test_auth" file="tests/test_auth.py" name="test_feature_b" time="0.00">\n'
+                '      <skipped message="conditional skip"/>\n'
+                '    </testcase>\n'
+                '  </testsuite>\n'
+                '</testsuites>'
+            )
+        assert parse_junit_xml_report(skipped_only_xml) is None
+
+        # Case B: Mixed report (1 passed, 1 skipped, 1 failed)
+        mixed_xml = os.path.join(temp_dir, "mixed.xml")
+        with open(mixed_xml, "w") as f:
+            f.write(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<testsuites>\n'
+                '  <testsuite name="pytest" tests="3">\n'
+                '    <testcase classname="tests.test_auth" file="tests/test_auth.py" name="test_login" time="0.02"/>\n'
+                '    <testcase classname="tests.test_auth" file="tests/test_auth.py" name="test_sso" time="0.00">\n'
+                '      <skipped message="enterprise license required"/>\n'
+                '    </testcase>\n'
+                '    <testcase classname="tests.test_auth" file="tests/test_auth.py" name="test_oauth" time="0.01">\n'
+                '      <failure message="AssertionError">OAuth error</failure>\n'
+                '    </testcase>\n'
+                '  </testsuite>\n'
+                '</testsuites>'
+            )
+        parsed = parse_junit_xml_report(mixed_xml)
+        assert parsed is not None
+        assert parsed["total"] == 3
+        assert parsed["passed"] == 1
+        assert parsed["failed"] == 1
+        assert parsed["skipped"] == 1
+
+        # Confirm node partitions: skipped test is strictly in skipped_nodes, NEVER in passed_nodes
+        assert any("test_login" in node for node in parsed["passed_nodes"])
+        assert not any("test_sso" in node for node in parsed["passed_nodes"])
+        assert any("test_sso" in node for node in parsed["skipped_nodes"])
+        assert any("test_oauth" in node for node in parsed["failed_nodes"])
+
+        # Case C: Mixed report (2 passed, 1 skipped, 0 failed) -> valid trusted record issued
+        mixed_pass_xml = os.path.join(temp_dir, "mixed_pass.xml")
+        with open(mixed_pass_xml, "w") as f:
+            f.write(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<testsuites>\n'
+                '  <testsuite name="pytest" tests="3">\n'
+                '    <testcase classname="tests.test_auth" file="tests/test_auth.py" name="test_login" time="0.02"/>\n'
+                '    <testcase classname="tests.test_auth" file="tests/test_auth.py" name="test_logout" time="0.01"/>\n'
+                '    <testcase classname="tests.test_auth" file="tests/test_auth.py" name="test_sso" time="0.00">\n'
+                '      <skipped message="optional"/>\n'
+                '    </testcase>\n'
+                '  </testsuite>\n'
+                '</testsuites>'
+            )
+        parsed_pass = parse_junit_xml_report(mixed_pass_xml)
+        assert parsed_pass is not None
+        assert parsed_pass["total"] == 3
+        assert parsed_pass["passed"] == 2
+        assert parsed_pass["failed"] == 0
+        assert parsed_pass["skipped"] == 1
+
+        rec = issue_trusted_execution_record(
+            run_id="run_mixed",
+            runner="pytest",
+            command="pytest tests/test_auth.py",
+            exit_code=0,
+            total=parsed_pass["total"],
+            passed=parsed_pass["passed"],
+            failed=parsed_pass["failed"],
+            skipped=parsed_pass["skipped"],
+            passed_nodes=parsed_pass["passed_nodes"],
+            failed_nodes=parsed_pass["failed_nodes"],
+            skipped_nodes=parsed_pass["skipped_nodes"],
+        )
+        assert verify_trusted_execution_record(rec) is True
+
+        # Case D: Downstream verification engine test
+        # Target criterion A is bound to test_sso (which was SKIPPED) -> MUST remain UNVERIFIED!
+        # Target criterion B is bound to test_login (which was PASSED) -> MUST be VERIFIED!
+        engine = VerificationEngine()
+        check = VerificationCheck(
+            check_name="Pytest Suite",
+            check_type="test",
+            command="pytest tests/test_auth.py",
+            success=True,
+            exit_code=0,
+            output="collected 3 items\n2 passed, 1 skipped in 0.05s",
+            evidence_summary="2 passed, 1 skipped",
+            trusted_execution_record=rec,
+        )
+        engine.record_check(check)
+
+        criteria = ["Implement SSO authentication", "Implement user login"]
+        bindings = {
+            "Implement SSO authentication": "tests/test_auth.py::test_sso",
+            "Implement user login": "tests/test_auth.py::test_login",
+        }
+
+        report = engine.evaluate_completion(
+            task_id="t_skipped_verification",
+            goal="Implement authentication features",
+            actions_taken=["Added login and sso stub"],
+            modified_files=["agent/auth.py"],
+            task_type=TaskType.CODE_MODIFICATION,
+            acceptance_criteria=criteria,
+            criterion_bindings=bindings,
+        )
+
+        evidence_by_crit = {e.criterion: e for e in report.criteria_evidence}
+        # SSO was skipped: must NOT be satisfied!
+        assert evidence_by_crit["Implement SSO authentication"].demonstrated is False
+        assert evidence_by_crit["Implement SSO authentication"].verification_tier == "UNVERIFIED"
+
+        # Login was passed: satisfied!
+        assert evidence_by_crit["Implement user login"].demonstrated is True
+        assert evidence_by_crit["Implement user login"].verification_tier == "VERIFIED_TARGETED_TEST"
+
+        assert report.acceptance_criteria_satisfied is False  # Because SSO is unverified!
+
+
+def test_verification_secret_lifecycle_persistence_and_restart():
+    """Validates Issue 3:
+    1. Verification secret persists across simulated process restarts.
+    2. Records issued before restart verify successfully after restart.
+    3. AGENT_VERIFICATION_SECRET environment variable overrides persistent storage.
+    4. Signatures signed with a different key are rejected."""
+    from agent.security.provenance import (
+        get_verification_secret,
+        reset_verification_secret,
+        set_verification_secret,
+        get_secret_storage_path,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Override config dir to use isolated temp directory
+        reset_verification_secret()
+        key_file = get_secret_storage_path(config_dir=temp_dir)
+
+        # 1. First session: generate and store secret
+        secret_session_1 = get_verification_secret(config_dir=temp_dir)
+        assert len(secret_session_1) == 32
+        assert os.path.exists(key_file)
+
+        # Issue record in session 1
+        record = issue_trusted_execution_record(
+            run_id="session_1_run",
+            runner="pytest",
+            command="pytest tests/",
+            exit_code=0,
+            total=1,
+            passed=1,
+            failed=0,
+            passed_nodes=["test_one"],
+        )
+        assert verify_trusted_execution_record(record) is True
+
+        # 2. Simulate process restart by resetting memory cache
+        reset_verification_secret()
+
+        # Session 2 retrieves key from disk
+        secret_session_2 = get_verification_secret(config_dir=temp_dir)
+        assert secret_session_2 == secret_session_1
+
+        # The previously issued record must still verify successfully across restarts!
+        assert verify_trusted_execution_record(record) is True
+
+        # 3. Test verification failure with a different key
+        other_key = b"A" * 32
+        set_verification_secret(other_key)
+        assert verify_trusted_execution_record(record) is False
+
+        # 4. Test environment variable override
+        test_env_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        os.environ["AGENT_VERIFICATION_SECRET"] = test_env_key
+        reset_verification_secret()
+        try:
+            env_secret = get_verification_secret(config_dir=temp_dir)
+            assert env_secret == bytes.fromhex(test_env_key)
+        finally:
+            del os.environ["AGENT_VERIFICATION_SECRET"]
+            reset_verification_secret()
+
 
 
 
