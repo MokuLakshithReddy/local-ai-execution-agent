@@ -63,6 +63,7 @@ jobs:
         REPO: ${{ github.repository }}
         JOB_STATUS: ${{ job.status }}
         JOB_NAME: Backend Tests (${{ matrix.os }})
+        STRICT_STATUS_REPORTING: "1"
       run: python .github/scripts/report_status.py
 
   frontend:
@@ -95,4 +96,5 @@ jobs:
         REPO: ${{ github.repository }}
         JOB_STATUS: ${{ job.status }}
         JOB_NAME: Frontend Build & Typecheck
+        STRICT_STATUS_REPORTING: "1"
       run: python3 .github/scripts/report_status.py

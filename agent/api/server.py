@@ -30,6 +30,7 @@ def _lock_down_token_file(filepath: str):
     """Enforces strict user-only ACLs on the session token file. Fails safely on error."""
     if sys.platform == "win32":
         import subprocess
+        from agent.security.provenance import validate_windows_acl_allowlist
         username = os.environ.get("USERNAME")
         if not username:
             raise RuntimeError("Security Failure: Unable to determine active USERNAME for token ACL configuration.")
@@ -45,9 +46,16 @@ def _lock_down_token_file(filepath: str):
         if res.returncode != 0:
             raise RuntimeError(f"Security Failure: icacls failed to lock down token file ACLs ({res.stderr.strip()})")
         audit_res = subprocess.run(["icacls", filepath], capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL, timeout=15)
-        acl_entries = audit_res.stdout.lower().replace(filepath.lower(), "")
-        if "everyone" in acl_entries or "builtin\\users" in acl_entries:
-            raise RuntimeError(f"Security Failure: Token file retained permissive ACL: {audit_res.stdout.strip()}")
+        if audit_res.returncode != 0:
+            raise RuntimeError(f"Security Failure: icacls failed to audit token file ACLs ({audit_res.stderr.strip()})")
+        try:
+            validate_windows_acl_allowlist(
+                icacls_stdout=audit_res.stdout,
+                filepath=filepath,
+                expected_username=username,
+            )
+        except Exception as err:
+            raise RuntimeError(f"Security Failure: Token file retained unauthorized ACL: {err}") from err
     elif hasattr(os, "chmod"):
         try:
             os.chmod(filepath, 0o600)

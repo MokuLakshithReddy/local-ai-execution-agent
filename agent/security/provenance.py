@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import stat
 import sys
@@ -64,15 +65,106 @@ def get_secret_storage_path(config_dir: Optional[str] = None) -> str:
     return os.path.join(base_dir, "verification.key")
 
 
+def validate_windows_acl_allowlist(
+    icacls_stdout: str,
+    filepath: str,
+    expected_username: str,
+    allowed_principals: Optional[set[str]] = None,
+    allowed_rights: Optional[set[str]] = None,
+) -> list[tuple[str, str]]:
+    """
+    Rigorously parses icacls output and proves that EVERY access control entry
+    belongs strictly to an authorized principal on the allowlist with authorized permissions.
+    Fails closed if any unauthorized, unexpected, or unknown principal is found,
+    or if permissions exceed allowed rights, or if the expected user is missing.
+    """
+    norm_filepath = os.path.normpath(filepath).lower()
+    raw_filepath = filepath.lower()
+
+    if allowed_rights is None:
+        # Default allowed rights for key and token files: Read and Write
+        allowed_rights = {"(R,W)", "(W,R)", "(R)", "(W)", "(RX)"}
+
+    expected_user = expected_username.strip().lower()
+    extra_allowed = {p.strip().lower() for p in allowed_principals} if allowed_principals else set()
+
+    lines = icacls_stdout.strip().splitlines()
+    entries: list[tuple[str, str]] = []
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        lower_line = line.lower()
+        if "successfully processed" in lower_line or "failed processing" in lower_line:
+            continue
+
+        if lower_line.startswith(norm_filepath):
+            line = line[len(norm_filepath):].strip()
+        elif lower_line.startswith(raw_filepath):
+            line = line[len(raw_filepath):].strip()
+
+        if not line:
+            continue
+
+        ace_matches = re.findall(
+            r'([A-Za-z0-9_\\\-\.\* ]+?):(\((?:[A-Za-z0-9,()]|\([A-Za-z0-9]+\))+\))',
+            line,
+        )
+
+        if not ace_matches:
+            raise VerificationSecretStorageError(
+                f"Security Failure: Failed to parse ACL entry line '{line}' for file '{filepath}'"
+            )
+
+        for principal, perms in ace_matches:
+            entries.append((principal.strip(), perms.strip()))
+
+    if not entries:
+        raise VerificationSecretStorageError(
+            f"Security Failure: No valid ACL entries found in icacls output for '{filepath}'"
+        )
+
+    # Validate EVERY entry against the strict allowlist
+    found_expected_user = False
+    for principal, perms in entries:
+        p_lower = principal.lower()
+        user_component = p_lower.split("\\")[-1] if "\\" in p_lower else p_lower
+
+        is_authorized_user = (p_lower == expected_user or user_component == expected_user)
+        is_extra_allowed = (p_lower in extra_allowed or user_component in extra_allowed)
+
+        if not (is_authorized_user or is_extra_allowed):
+            raise VerificationSecretStorageError(
+                f"Security Failure: Unauthorized principal '{principal}' (permissions: {perms}) found in ACL for '{filepath}'. Not in allowlist."
+            )
+
+        clean_perms = perms.upper().replace(" ", "")
+        if clean_perms not in allowed_rights:
+            raise VerificationSecretStorageError(
+                f"Security Failure: Principal '{principal}' has unauthorized permissions '{perms}' for '{filepath}' (allowed: {allowed_rights})."
+            )
+
+        if is_authorized_user:
+            found_expected_user = True
+
+    if not found_expected_user:
+        raise VerificationSecretStorageError(
+            f"Security Failure: Expected authorized user '{expected_username}' is missing from ACL for '{filepath}'."
+        )
+
+    return entries
+
+
 def _lock_down_key_file(filepath: str) -> None:
     """
     Enforces strict user-only permissions:
     - On Windows: 
         1. Resets ACLs (icacls /reset) to eradicate any pre-existing explicit hostile or permissive ACEs.
         2. Strips inheritance and grants (R,W) exclusively to the active USERNAME (icacls /inheritance:r /grant:r).
-        3. Audits the resulting ACL: strictly verifies that no unauthorized or permissive principals
-           (e.g. Everyone, Users, BUILTIN\\Users, Authenticated Users, Guests, ANONYMOUS) possess access,
-           and that the active user is granted access. Fails closed on any unexpected ACE.
+        3. Audits the resulting ACL: parses all entries and strictly proves that EVERY remaining entry
+           belongs to an authorized principal on the allowlist with allowed permissions (R,W).
+           Fails closed on any unexpected or unauthorized ACE.
     - On POSIX: Uses chmod 0o600 (owner read/write only).
     Fails closed if permissions cannot be enforced or verified.
     """
@@ -112,7 +204,7 @@ def _lock_down_key_file(filepath: str) -> None:
                 f"Security Failure: icacls failed to lock down key ACLs: {grant_res.stderr.strip()}"
             )
 
-        # 3. Audit resulting ACL to confirm no hostile or permissive ACEs remain
+        # 3. Audit resulting ACL to confirm no hostile, unexpected, or unauthorized ACEs remain via strict allowlist
         audit_res = subprocess.run(
             ["icacls", filepath],
             capture_output=True,
@@ -126,27 +218,11 @@ def _lock_down_key_file(filepath: str) -> None:
                 f"Security Failure: icacls failed to audit resulting key ACLs: {audit_res.stderr.strip()}"
             )
 
-        # Remove the file path from audit string so that directory names like "C:\Users" don't trigger false positives
-        acl_output = audit_res.stdout.lower()
-        acl_entries = acl_output.replace(filepath.lower(), "")
-        forbidden_principals = [
-            "everyone",
-            "builtin\\users",
-            "authenticated users",
-            "guests",
-            "builtin\\guests",
-            "anonymous",
-        ]
-        for principal in forbidden_principals:
-            if principal in acl_entries:
-                raise VerificationSecretStorageError(
-                    f"Security Failure: Key file '{filepath}' retains unauthorized or permissive ACL for '{principal}': {audit_res.stdout.strip()}"
-                )
-
-        if username.lower() not in acl_entries:
-            raise VerificationSecretStorageError(
-                f"Security Failure: Key file '{filepath}' active user '{username}' missing from audited ACL: {audit_res.stdout.strip()}"
-            )
+        validate_windows_acl_allowlist(
+            icacls_stdout=audit_res.stdout,
+            filepath=filepath,
+            expected_username=username,
+        )
     elif hasattr(os, "chmod"):
         try:
             os.chmod(filepath, 0o600)

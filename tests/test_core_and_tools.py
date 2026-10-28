@@ -2812,9 +2812,10 @@ def test_verification_secret_concurrent_creation_race_handled():
 def test_windows_key_file_acl_enforcement():
     """Validates Issue 5 & Remaining Issue 1:
     On Windows, _lock_down_key_file resets explicit ACLs to eliminate pre-existing hostile ACEs,
-    strips inheritance, grants user-only access, and audits the ACL to ensure no unauthorized principals remain."""
+    strips inheritance, grants user-only access, and audits the ACL via a complete allowlist
+    to prove that EVERY remaining access entry is explicitly authorized."""
     import subprocess
-    from agent.security.provenance import _lock_down_key_file, VerificationSecretStorageError
+    from agent.security.provenance import _lock_down_key_file, validate_windows_acl_allowlist, VerificationSecretStorageError
 
     with tempfile.NamedTemporaryFile(delete=False) as tf:
         tf.write(b"X" * 32)
@@ -2827,14 +2828,17 @@ def test_windows_key_file_acl_enforcement():
             pre_acl = subprocess.run(["icacls", tmp_name], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15).stdout
             assert "everyone" in pre_acl.lower()
 
-            # Execute lockdown: must strip Everyone:(R) and grant strictly to USERNAME
+            # Execute lockdown: must strip Everyone:(R), grant strictly to USERNAME, and validate allowlist
             _lock_down_key_file(tmp_name)
 
             post_acl = subprocess.run(["icacls", tmp_name], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15).stdout
-            post_entries = post_acl.lower().replace(tmp_name.lower(), "")
-            assert "everyone" not in post_entries
-            assert "users" not in post_entries
-            assert os.environ.get("USERNAME").lower() in post_entries
+            parsed = validate_windows_acl_allowlist(post_acl, tmp_name, os.environ.get("USERNAME"))
+            assert len(parsed) >= 1
+            # Every parsed entry must strictly match the authorized username with authorized permissions
+            for p, perm in parsed:
+                p_user = p.split("\\")[-1] if "\\" in p else p
+                assert p_user.lower() == os.environ.get("USERNAME").lower()
+                assert perm in ("(R,W)", "(W,R)", "(R)", "(W)")
         else:
             _lock_down_key_file(tmp_name)
     finally:
@@ -2843,6 +2847,66 @@ def test_windows_key_file_acl_enforcement():
                 os.remove(tmp_name)
             except Exception:
                 pass
+
+
+def test_windows_acl_allowlist_parsing_and_adversarial_principals():
+    """Validates Remaining Concern 1 (P1):
+    Windows ACL audit parses ACL entries and performs a complete allowlist check.
+    Proves that unexpected/foreign principals and excessive permissions are strictly rejected."""
+    from agent.security.provenance import validate_windows_acl_allowlist, VerificationSecretStorageError
+
+    dummy_path = "C:\\agent\\keys\\verification.key"
+
+    # 1. Valid: Authorized user with expected (R,W) permissions
+    valid_icacls = f"{dummy_path} CORP\\alice:(R,W)\nSuccessfully processed 1 files; Failed processing 0 files"
+    entries = validate_windows_acl_allowlist(valid_icacls, dummy_path, "alice")
+    assert len(entries) == 1
+    assert entries[0] == ("CORP\\alice", "(R,W)")
+
+    # 2. Adversarial: Unexpected principal (not in known forbidden list, but an arbitrary unauthorized account)
+    adversarial_unexpected = (
+        f"{dummy_path} CORP\\alice:(R,W)\n"
+        f"              AdversaryServiceAccount:(R)\n"
+        f"Successfully processed 1 files; Failed processing 0 files"
+    )
+    with pytest.raises(VerificationSecretStorageError) as exc_unauth:
+        validate_windows_acl_allowlist(adversarial_unexpected, dummy_path, "alice")
+    assert "Unauthorized principal 'AdversaryServiceAccount'" in str(exc_unauth.value)
+    assert "Not in allowlist" in str(exc_unauth.value)
+
+    # 3. Adversarial: Unexpected group account
+    adversarial_group = (
+        f"{dummy_path} CORP\\alice:(R,W)\n"
+        f"              SecurityAuditorGroup:(R,W)\n"
+        f"Successfully processed 1 files; Failed processing 0 files"
+    )
+    with pytest.raises(VerificationSecretStorageError) as exc_grp:
+        validate_windows_acl_allowlist(adversarial_group, dummy_path, "alice")
+    assert "Unauthorized principal 'SecurityAuditorGroup'" in str(exc_grp.value)
+
+    # 4. Adversarial: Excessive permissions for authorized user (Full control F)
+    adversarial_excessive = (
+        f"{dummy_path} CORP\\alice:(F)\n"
+        f"Successfully processed 1 files; Failed processing 0 files"
+    )
+    with pytest.raises(VerificationSecretStorageError) as exc_excessive:
+        validate_windows_acl_allowlist(adversarial_excessive, dummy_path, "alice")
+    assert "has unauthorized permissions '(F)'" in str(exc_excessive.value)
+
+    # 5. Missing expected authorized user
+    adversarial_missing_user = (
+        f"{dummy_path} CORP\\bob:(R,W)\n"
+        f"Successfully processed 1 files; Failed processing 0 files"
+    )
+    with pytest.raises(VerificationSecretStorageError) as exc_missing:
+        validate_windows_acl_allowlist(adversarial_missing_user, dummy_path, "alice", allowed_principals={"bob"})
+    assert "Expected authorized user 'alice' is missing" in str(exc_missing.value)
+
+    # 6. Malformed ACL content line fails closed
+    malformed_icacls = f"{dummy_path} corrupted_line_without_permissions_syntax\n"
+    with pytest.raises(VerificationSecretStorageError) as exc_malformed:
+        validate_windows_acl_allowlist(malformed_icacls, dummy_path, "alice")
+    assert "Failed to parse ACL entry line" in str(exc_malformed.value)
 
 
 def test_malformed_and_truncated_junit_xml():
@@ -3716,6 +3780,80 @@ def test_verification_secret_multithreaded_concurrency():
 
         assert len(not_done) == 0, f"Thread pool workers timed out: {len(not_done)} threads still active"
         assert len(errors) == 0, f"Concurrent thread errors encountered: {errors}"
+
+
+def test_ci_status_reporter_strict_and_failure_modes():
+    """Validates Remaining Concern 2 (P2):
+    Tests CI status reporting script under strict mode, missing environment variables,
+    API errors (e.g. 403 Forbidden without statuses:write), and successful execution."""
+    import importlib.util
+    from unittest.mock import patch, MagicMock
+    import urllib.error
+
+    # Load report_status script dynamically
+    script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".github", "scripts", "report_status.py")
+    spec = importlib.util.spec_from_file_location("report_status", script_path)
+    assert spec is not None and spec.loader is not None
+    report_status = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(report_status)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        summary_file = os.path.join(temp_dir, "step_summary.md")
+
+        # 1. Incomplete configuration with STRICT_STATUS_REPORTING=1 -> sys.exit(1)
+        with patch.dict(os.environ, {"STRICT_STATUS_REPORTING": "1", "GH_TOKEN": ""}, clear=True):
+            with pytest.raises(SystemExit) as exc_exit:
+                report_status.main()
+            assert exc_exit.value.code == 1
+
+        # 2. Incomplete configuration with STRICT_STATUS_REPORTING=0 -> does NOT exit
+        with patch.dict(os.environ, {"STRICT_STATUS_REPORTING": "0", "GH_TOKEN": ""}, clear=True):
+            report_status.main()  # Must not raise
+
+        valid_env = {
+            "GH_TOKEN": "ghp_fake_test_token_123",
+            "SHA": "abc1234567890",
+            "REPO": "owner/repo",
+            "JOB_STATUS": "success",
+            "JOB_NAME": "Backend Tests (ubuntu-latest)",
+            "GITHUB_STEP_SUMMARY": summary_file,
+        }
+
+        # 3. API Error (HTTP 403 Forbidden) with STRICT_STATUS_REPORTING=1 -> sys.exit(1) and error summary recorded
+        with patch.dict(os.environ, {**valid_env, "STRICT_STATUS_REPORTING": "1"}):
+            mock_403 = urllib.error.HTTPError("https://api.github.com", 403, "Forbidden: Resource not accessible", {}, None)
+            with patch("urllib.request.urlopen", side_effect=mock_403):
+                with pytest.raises(SystemExit) as exc_api_fail:
+                    report_status.main()
+                assert exc_api_fail.value.code == 1
+
+            assert os.path.exists(summary_file)
+            with open(summary_file, "r", encoding="utf-8") as sf:
+                summary_content = sf.read()
+            assert "Commit Status Publication Failed" in summary_content
+            assert "403" in summary_content
+
+        # 4. API Error with STRICT_STATUS_REPORTING=0 -> does not raise SystemExit
+        with patch.dict(os.environ, {**valid_env, "STRICT_STATUS_REPORTING": "0"}):
+            mock_500 = urllib.error.HTTPError("https://api.github.com", 500, "Internal Server Error", {}, None)
+            with patch("urllib.request.urlopen", side_effect=mock_500):
+                report_status.main()  # Must not raise
+
+        # 5. Successful status reporting (HTTP 201)
+        if os.path.exists(summary_file):
+            os.remove(summary_file)
+        with patch.dict(os.environ, {**valid_env, "STRICT_STATUS_REPORTING": "1"}):
+            mock_resp = MagicMock()
+            mock_resp.status = 201
+            mock_resp.__enter__.return_value = mock_resp
+            with patch("urllib.request.urlopen", return_value=mock_resp):
+                report_status.main()
+
+            assert os.path.exists(summary_file)
+            with open(summary_file, "r", encoding="utf-8") as sf:
+                summary_success = sf.read()
+            assert "Commit Status Published" in summary_success
+            assert "Backend Tests (ubuntu-latest)" in summary_success
 
 
 
