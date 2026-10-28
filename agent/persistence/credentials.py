@@ -35,7 +35,12 @@ class CredentialVault:
         self._key_file = os.path.join(self._key_dir, "vault.key")
         if not self._is_windows:
             from cryptography.fernet import Fernet
-            self._fernet = Fernet(self._get_or_create_posix_key())
+            try:
+                self._fernet = Fernet(self._get_or_create_posix_key())
+            except Exception as e:
+                if isinstance(e, CredentialEncryptionError):
+                    raise
+                raise CredentialEncryptionError(f"Failed to initialize Fernet with vault key: {e}") from e
 
     def _get_or_create_posix_key(self) -> bytes:
         from cryptography.fernet import Fernet
@@ -110,6 +115,7 @@ class CredentialVault:
         """
         Validates and reads the key file with retry backoff to tolerate concurrent writes in progress.
         Fails closed safely on timeout, corruption, or security violations.
+        Recovers safely if a creator crashed during initialization leaving an abandoned incomplete file (< 32 bytes).
         """
         last_err = None
         for _ in range(max_attempts):
@@ -120,6 +126,17 @@ class CredentialVault:
                     raise
                 last_err = err
                 time.sleep(delay_sec)
+
+        # Crash recovery: if a previous creator process crashed during initialization leaving
+        # an incomplete key (< 32 bytes) that was never established or used for encryption,
+        # safely remove the abandoned file and re-attempt atomic key generation.
+        try:
+            if os.path.exists(key_path) and os.path.getsize(key_path) < 32:
+                os.remove(key_path)
+                return self._get_or_create_posix_key()
+        except Exception:
+            pass
+
         raise CredentialEncryptionError(
             f"Vault key initialization failed after concurrent creation: {last_err}"
         ) from last_err
@@ -154,6 +171,12 @@ class CredentialVault:
 
         if not content or len(content) < 32:
             raise CredentialEncryptionError(f"Corrupted or empty vault key file '{key_path}'.")
+
+        try:
+            from cryptography.fernet import Fernet
+            Fernet(content)
+        except Exception as e:
+            raise CredentialEncryptionError(f"Corrupted or invalid Fernet key in '{key_path}': {str(e)}") from e
 
         return content
 

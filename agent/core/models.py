@@ -4,9 +4,10 @@ Includes discrete TaskTypes, acceptance criteria tracking, and verifiable comple
 """
 from __future__ import annotations
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 import time
+from agent.security.provenance import TrustedExecutionRecord
 
 
 class TaskStatus(str, Enum):
@@ -99,7 +100,7 @@ class VerificationCheck(BaseModel):
     structured_assertions: List[StructuredAssertion] = Field(default_factory=list)
     criterion_bindings: Dict[str, str] = Field(default_factory=dict)
     evidence_artifact: Optional[str] = None
-    trusted_execution_record: Optional[Dict[str, Any]] = None
+    trusted_execution_record: Optional[Union[TrustedExecutionRecord, Dict[str, Any]]] = None
 
 
 class CriterionEvidence(BaseModel):

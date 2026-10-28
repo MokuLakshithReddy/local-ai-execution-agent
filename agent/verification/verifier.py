@@ -7,6 +7,7 @@ from typing import List, Optional, Dict
 import os
 import re
 import time
+from agent.security.provenance import verify_trusted_execution_record, TrustedExecutionRecord
 from agent.core.models import (
     TaskStatus,
     TaskType,
@@ -132,10 +133,17 @@ def _extract_executed_passed_test_nodes(check: VerificationCheck) -> List[str]:
     if check.exit_code != 0 or not check.success:
         return []
 
-    # 1. Trusted execution record directly captured from structured runner output (e.g. JUnit XML, JSON report)
-    if check.trusted_execution_record and isinstance(check.trusted_execution_record, dict):
-        nodes = check.trusted_execution_record.get("passed_nodes", [])
-        return [str(n).lower() for n in nodes]
+    # 1. Validate cryptographic provenance of trusted execution record
+    if check.trusted_execution_record:
+        if verify_trusted_execution_record(check.trusted_execution_record):
+            if isinstance(check.trusted_execution_record, dict):
+                nodes = check.trusted_execution_record.get("passed_nodes", [])
+            else:
+                nodes = getattr(check.trusted_execution_record, "passed_nodes", [])
+            return [str(n).lower() for n in nodes]
+        else:
+            # Forged or tampered execution record detected: refuse immediately
+            return []
 
     # 2. Reject commands that are not direct executions of recognized test runners
     cmd = (check.command or "").strip().lower()

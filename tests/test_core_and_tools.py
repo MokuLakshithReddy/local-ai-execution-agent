@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from agent.core.models import PermissionLevel, VerificationCheck, TaskStatus, TaskType, Task, StructuredAssertion
 from agent.security.permissions import PermissionManager, PermissionPolicy
 from agent.security.sanitizer import SecuritySanitizer
+from agent.security.provenance import issue_trusted_execution_record, verify_trusted_execution_record, TrustedExecutionRecord
 from agent.verification.verifier import VerificationEngine, infer_task_type
 from agent.tools.filesystem import resolve_safe_path, ListDirTool, ReadFileTool, WriteFileTool, PatchFileTool, SearchFilesTool
 from agent.tools.terminal import RunCommandTool, _read_bounded_stream
@@ -1926,23 +1927,40 @@ def test_credential_vault_stress_slow_writes_interrupted_and_permissions():
         for rk in reader_keys:
             assert rk == creator_key, "All concurrent readers must obtain the exact same valid key"
 
-    # 2. Interrupted / partial write fails closed safely
+    # 2. Corrupted key >= 32 bytes fails closed safely (never auto-deleted, never accepted)
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        key_dir = os.path.join(temp_dir, "keys_partial")
+        key_dir = os.path.join(temp_dir, "keys_corrupt")
         os.makedirs(key_dir, mode=0o700)
         key_file = os.path.join(key_dir, "vault.key")
 
-        # Simulate a process that died after writing only 10 bytes with strict permissions
         with open(key_file, "wb") as f:
-            f.write(b"interrupte")  # only 10 bytes, corrupted
+            f.write(b"corrupted_invalid_fernet_content_with_at_least_32_bytes")
         if sys.platform != "win32":
             os.chmod(key_file, 0o600)
 
         with pytest.raises(CredentialEncryptionError) as exc_info:
             CredentialVault(key_dir=key_dir, is_windows=False)
-        assert any(msg in str(exc_info.value) for msg in ("Corrupted or empty", "initialization failed", "Insecure permissions"))
+        assert any(msg in str(exc_info.value) for msg in ("Failed to initialize Fernet", "Corrupted or empty", "initialization failed"))
 
-    # 3. Insecure key permissions fail closed immediately
+    # 3. Crash recovery: incomplete key (< 32 bytes) left by crashed process is safely recovered
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        key_dir = os.path.join(temp_dir, "keys_partial")
+        os.makedirs(key_dir, mode=0o700)
+        key_file = os.path.join(key_dir, "vault.key")
+
+        # Simulate a process that crashed after writing only 10 bytes
+        with open(key_file, "wb") as f:
+            f.write(b"interrupte")
+        if sys.platform != "win32":
+            os.chmod(key_file, 0o600)
+
+        # New instance recovers cleanly rather than leaving vault permanently wedged
+        v_recovered = CredentialVault(key_dir=key_dir, is_windows=False)
+        assert len(v_recovered._get_or_create_posix_key()) >= 32
+        enc = v_recovered.encrypt("secret_recovered")
+        assert v_recovered.decrypt(enc) == "secret_recovered"
+
+    # 4. Insecure key permissions fail closed immediately
     if sys.platform != "win32":
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
             key_dir = os.path.join(temp_dir, "keys_insecure")
@@ -1954,6 +1972,187 @@ def test_credential_vault_stress_slow_writes_interrupted_and_permissions():
             with pytest.raises(CredentialEncryptionError) as exc_info:
                 CredentialVault(key_dir=key_dir, is_windows=False)
             assert "Insecure permissions" in str(exc_info.value)
+
+
+def test_verifier_rejects_forged_execution_record():
+    """Validates Finding 2:
+    The verifier must reject any trusted_execution_record dictionary or record that lacks
+    valid cryptographic provenance from the verification subsystem, keeping the criterion UNVERIFIED."""
+    ve = VerificationEngine()
+    criteria = ["User authentication security"]
+
+    # 1. Attacker attaches a forged execution record dictionary without valid HMAC signature
+    forged_dict_check = VerificationCheck(
+        check_name="Forged Record Check",
+        check_type="test",
+        command="pytest tests/test_auth.py",
+        success=True,
+        exit_code=0,
+        output="tests/test_auth.py::test_login PASSED\n1 passed in 0.05s",
+        evidence_summary="Fake summary",
+        criterion_bindings={"User authentication security": "tests/test_auth.py::test_login"},
+        trusted_execution_record={"run_id": "fake_id", "runner": "pytest", "command": "pytest tests/test_auth.py", "exit_code": 0, "total": 1, "passed": 1, "failed": 0, "passed_nodes": ["tests/test_auth.py::test_login"], "signature": "bad_sig"},
+    )
+    ve.record_check(forged_dict_check)
+
+    rep1 = ve.evaluate_completion(
+        task_id="t_forge_1",
+        goal="Harden auth",
+        actions_taken=["Ran check with forged execution record"],
+        modified_files=["agent/api/auth.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+    assert rep1.status == TaskStatus.PARTIALLY_COMPLETED
+    assert rep1.acceptance_criteria_satisfied is False
+    assert rep1.criteria_evidence[0].demonstrated is False
+    assert rep1.criteria_evidence[0].verification_tier == "UNVERIFIED"
+
+    # 2. Genuine record issued by verification subsystem with valid cryptographic provenance
+    ve2 = VerificationEngine()
+    genuine_record = issue_trusted_execution_record(
+        run_id="run_legit_1",
+        runner="pytest",
+        command="pytest tests/test_auth.py",
+        exit_code=0,
+        total=1,
+        passed=1,
+        failed=0,
+        passed_nodes=["tests/test_auth.py::test_login", "test_login", "tests/test_auth.py"],
+    )
+    assert verify_trusted_execution_record(genuine_record) is True
+
+    legit_check = VerificationCheck(
+        check_name="Legitimate Record Check",
+        check_type="test",
+        command="pytest tests/test_auth.py",
+        success=True,
+        exit_code=0,
+        output="tests/test_auth.py::test_login PASSED\n1 passed in 0.05s",
+        evidence_summary="Genuine summary",
+        criterion_bindings={"User authentication security": "tests/test_auth.py::test_login"},
+        trusted_execution_record=genuine_record.model_dump(),
+    )
+    ve2.record_check(legit_check)
+
+    rep2 = ve2.evaluate_completion(
+        task_id="t_forge_2",
+        goal="Harden auth",
+        actions_taken=["Ran check with authentic execution record"],
+        modified_files=["agent/api/auth.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+    assert rep2.status == TaskStatus.COMPLETED
+    assert rep2.acceptance_criteria_satisfied is True
+    assert rep2.criteria_evidence[0].demonstrated is True
+    assert rep2.criteria_evidence[0].verification_tier == "VERIFIED_TARGETED_TEST"
+
+
+@pytest.mark.asyncio
+async def test_run_verification_tool_structured_record_e2e():
+    """Validates Finding 1:
+    RunVerificationCheckTool writes the structured JUnit XML report inside the workspace
+    (supporting both container mounts and host execution), parses it on the host, issues
+    a cryptographically verified TrustedExecutionRecord, and cleans up the temporary report."""
+    from agent.tools.verification import RunVerificationCheckTool
+
+    tool = RunVerificationCheckTool()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        # Create a sample test file inside the workspace
+        test_file = os.path.join(temp_dir, "test_math.py")
+        with open(test_file, "w") as f:
+            f.write("def test_addition():\n    assert 2 + 2 == 4\n")
+
+        res = await tool.execute(
+            workspace_path=temp_dir,
+            call_id="call_verify_e2e",
+            command=f'"{sys.executable}" -m pytest test_math.py',
+            check_name="Math Test",
+            check_type="test",
+            sandbox_mode="host",
+            require_sandbox=False,
+        )
+
+        assert res.success is True
+        assert res.artifacts is not None
+        rec = res.artifacts.get("trusted_execution_record")
+        assert rec is not None
+        assert verify_trusted_execution_record(rec) is True
+        assert any("test_addition" in node for node in rec["passed_nodes"])
+
+        # Confirm temporary XML report in workspace was cleaned up
+        xml_leftovers = [f for f in os.listdir(temp_dir) if f.startswith(".verification_report_")]
+        assert len(xml_leftovers) == 0
+
+        # If Docker daemon is available, execute through real container boundary
+        if is_docker_daemon_available():
+            res_c = await tool.execute(
+                workspace_path=temp_dir,
+                call_id="call_verify_container_e2e",
+                command="pytest test_math.py",
+                check_name="Math Test Container",
+                check_type="test",
+                sandbox_mode="container",
+            )
+            assert res_c.success is True
+            assert res_c.artifacts is not None
+            rec_c = res_c.artifacts.get("trusted_execution_record")
+            assert rec_c is not None
+            assert verify_trusted_execution_record(rec_c) is True
+            assert any("test_addition" in node for node in rec_c["passed_nodes"])
+
+
+def _multiprocess_vault_worker(key_dir: str) -> str:
+    """Helper worker for process-level concurrency tests."""
+    from agent.persistence.credentials import CredentialVault
+    v = CredentialVault(key_dir=key_dir, is_windows=False)
+    key = v._get_or_create_posix_key()
+    return key.decode("ascii")
+
+
+def test_credential_vault_multiprocess_concurrency_and_crash_recovery():
+    """Validates Finding 3:
+    1. Multi-process concurrency: multiple OS processes simultaneously initialize CredentialVault
+       and obtain identical encryption keys.
+    2. Crash recovery: a process crash leaving a 0-byte key file during initialization does NOT
+       wedge the vault permanently; subsequent processes recover safely and establish a valid key."""
+    import multiprocessing
+    from agent.persistence.credentials import CredentialVault
+
+    # 1. Multi-process concurrency test
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        key_dir = os.path.join(temp_dir, "mp_keys")
+        os.makedirs(key_dir, mode=0o700)
+
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(processes=4) as pool:
+            results = pool.map(_multiprocess_vault_worker, [key_dir] * 4)
+
+        assert len(results) == 4
+        # All distinct OS processes must have obtained the exact same key
+        assert len(set(results)) == 1
+
+    # 2. Crash recovery test: 0-byte key file left by crashed process
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        key_dir = os.path.join(temp_dir, "mp_crashed_keys")
+        os.makedirs(key_dir, mode=0o700)
+        key_file = os.path.join(key_dir, "vault.key")
+
+        # Simulate process crash leaving 0-byte file
+        with open(key_file, "wb") as f:
+            pass
+        if sys.platform != "win32":
+            os.chmod(key_file, 0o600)
+
+        # Subsequent process recovers rather than failing forever
+        v = CredentialVault(key_dir=key_dir, is_windows=False)
+        key = v._get_or_create_posix_key()
+        assert len(key) >= 32
+        enc = v.encrypt("recovered_after_crash")
+        assert v.decrypt(enc) == "recovered_after_crash"
+
 
 
 

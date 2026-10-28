@@ -3,7 +3,6 @@ Verification tools: runs tests, linters, builds, and registers verifiable outcom
 Captures trusted execution evidence directly from the test-runner process via structured output.
 """
 import os
-import tempfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -11,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from agent.tools.base import BaseTool
 from agent.tools.terminal import RunCommandTool
 from agent.core.models import PermissionLevel, ActionResult
+from agent.security.provenance import issue_trusted_execution_record, TrustedExecutionRecord
 
 
 def parse_junit_xml_report(xml_path: str) -> Optional[Dict[str, Any]]:
@@ -113,40 +113,47 @@ class RunVerificationCheckTool(BaseTool):
         check_type = kwargs.get("check_type", "test")
         command = (kwargs.get("command") or "").strip()
 
-        # If running a pytest suite, attach structured junitxml destination to capture genuine runner evidence
-        xml_report_path = None
+        # If running a pytest suite, attach structured junitxml destination inside workspace
+        # This guarantees availability across container bind-mounts and host execution
+        report_filename = None
+        report_host_path = None
         exec_cmd = command
         is_pytest = "pytest" in command.lower()
         if is_pytest and "--junitxml" not in command and "--help" not in command:
-            xml_report_path = os.path.join(tempfile.gettempdir(), f"pytest_report_{uuid.uuid4().hex}.xml")
-            exec_cmd = f"{command} --junitxml=\"{xml_report_path}\""
+            report_filename = f".verification_report_{uuid.uuid4().hex}.xml"
+            report_host_path = os.path.join(workspace_path, report_filename)
+            # Use relative path so it correctly targets /workspace in container or workspace_path on host
+            exec_cmd = f"{command} --junitxml=\"{report_filename}\""
 
+        cmd_kwargs = {k: v for k, v in kwargs.items() if k not in ("call_id", "command", "check_name", "check_type")}
         try:
             res = await self._command_tool.execute(
                 workspace_path=workspace_path,
                 call_id=call_id,
                 command=exec_cmd,
                 timeout_seconds=90,
+                **cmd_kwargs,
             )
 
             exit_code = res.artifacts.get("exit_code") if res.artifacts else None
             is_success = (exit_code == 0)
 
             # Extract structured execution record if generated directly by runner
-            trusted_record = None
-            if xml_report_path and os.path.exists(xml_report_path):
-                parsed = parse_junit_xml_report(xml_report_path)
-                if parsed:
-                    trusted_record = {
-                        "runner": "pytest",
-                        "structured_report_path": xml_report_path,
-                        "total": parsed["total"],
-                        "passed": parsed["passed"],
-                        "failed": parsed["failed"],
-                        "passed_nodes": parsed["passed_nodes"],
-                        "verified_at": time.time(),
-                        "is_trusted": True,
-                    }
+            trusted_record: Optional[TrustedExecutionRecord] = None
+            if report_host_path and os.path.exists(report_host_path):
+                parsed = parse_junit_xml_report(report_host_path)
+                if parsed and is_success:
+                    trusted_record = issue_trusted_execution_record(
+                        run_id=call_id,
+                        runner="pytest",
+                        command=command,
+                        exit_code=exit_code,
+                        total=parsed["total"],
+                        passed=parsed["passed"],
+                        failed=parsed["failed"],
+                        passed_nodes=parsed["passed_nodes"],
+                        failed_nodes=parsed["failed_nodes"],
+                    )
 
             evidence = (
                 f"Verification Check '{check_name}' ({check_type}) exited with code {exit_code}. "
@@ -166,13 +173,13 @@ class RunVerificationCheckTool(BaseTool):
                     "exit_code": exit_code,
                     "evidence_summary": evidence,
                     "passed": is_success,
-                    "trusted_execution_record": trusted_record,
+                    "trusted_execution_record": trusted_record.model_dump() if trusted_record else None,
                 },
                 execution_time_ms=(time.time() - t0) * 1000,
             )
         finally:
-            if xml_report_path and os.path.exists(xml_report_path):
+            if report_host_path and os.path.exists(report_host_path):
                 try:
-                    os.remove(xml_report_path)
+                    os.remove(report_host_path)
                 except Exception:
                     pass
