@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 _CACHED_SECRETS: Dict[str, bytes] = {}
 _IS_EPHEMERAL_MAP: Dict[str, bool] = {}
 _ACTIVE_CONFIG_DIR: Optional[str] = None
+_CURRENT_ENV_SECRET: Optional[str] = None
 _CACHED_SECRET: Optional[bytes] = None
 _IS_EPHEMERAL: bool = False
 
@@ -46,10 +47,11 @@ def _get_canonical_config_key(config_dir: Optional[str] = None) -> str:
 
 def is_ephemeral_mode(config_dir: Optional[str] = None) -> bool:
     """Returns True if the runtime is currently using an ephemeral in-memory signing secret."""
-    global _IS_EPHEMERAL
-    if config_dir:
-        canonical_key = _get_canonical_config_key(config_dir)
-        return _IS_EPHEMERAL_MAP.get(canonical_key, _IS_EPHEMERAL)
+    global _IS_EPHEMERAL, _ACTIVE_CONFIG_DIR
+    target_dir = config_dir if config_dir is not None else _ACTIVE_CONFIG_DIR
+    if target_dir:
+        canonical_key = _get_canonical_config_key(target_dir)
+        return _IS_EPHEMERAL_MAP.get(canonical_key, False)
     return _IS_EPHEMERAL
 
 
@@ -139,7 +141,15 @@ def get_verification_secret(
        labeled with ephemeral=True.
     5. Config Directory Scoping: Secrets are scoped and cached per canonical config directory.
     """
-    global _CACHED_SECRET, _IS_EPHEMERAL, _ACTIVE_CONFIG_DIR
+    global _CACHED_SECRET, _IS_EPHEMERAL, _ACTIVE_CONFIG_DIR, _CURRENT_ENV_SECRET
+    current_env = os.environ.get("AGENT_VERIFICATION_SECRET")
+    if current_env != _CURRENT_ENV_SECRET:
+        _CACHED_SECRETS.clear()
+        _IS_EPHEMERAL_MAP.clear()
+        _CACHED_SECRET = None
+        _IS_EPHEMERAL = False
+        _CURRENT_ENV_SECRET = current_env
+
     target_dir = config_dir if config_dir is not None else _ACTIVE_CONFIG_DIR
     canonical_key = _get_canonical_config_key(target_dir)
     if config_dir is not None:
@@ -307,6 +317,15 @@ def rotate_verification_secret(config_dir: Optional[str] = None) -> bytes:
         _lock_down_key_file(tmp_path)
         os.replace(tmp_path, key_file)
         _lock_down_key_file(key_file)
+    except Exception as rot_err:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        raise VerificationSecretStorageError(
+            f"Failed to rotate verification secret at '{key_file}': {rot_err}"
+        ) from rot_err
     finally:
         if os.path.exists(tmp_path):
             try:
@@ -344,19 +363,22 @@ def set_verification_secret(
 
 def reset_verification_secret(config_dir: Optional[str] = None) -> None:
     """Resets the cached verification secret to force re-evaluation from environment or persistent file."""
-    global _CACHED_SECRET, _IS_EPHEMERAL, _ACTIVE_CONFIG_DIR
+    global _CACHED_SECRET, _IS_EPHEMERAL, _ACTIVE_CONFIG_DIR, _CURRENT_ENV_SECRET
     if config_dir is not None:
         canonical_key = _get_canonical_config_key(config_dir)
         _CACHED_SECRETS.pop(canonical_key, None)
         _IS_EPHEMERAL_MAP.pop(canonical_key, None)
         if _ACTIVE_CONFIG_DIR == config_dir:
             _ACTIVE_CONFIG_DIR = None
+            _CACHED_SECRET = None
+            _IS_EPHEMERAL = False
     else:
         _CACHED_SECRETS.clear()
         _IS_EPHEMERAL_MAP.clear()
         _ACTIVE_CONFIG_DIR = None
-    _CACHED_SECRET = None
-    _IS_EPHEMERAL = False
+        _CACHED_SECRET = None
+        _IS_EPHEMERAL = False
+        _CURRENT_ENV_SECRET = None
 
 
 class TrustedExecutionRecord(BaseModel):

@@ -1900,6 +1900,50 @@ async def test_real_docker_container_security_boundaries():
         )
         assert c_name not in ps_check.stdout.strip().splitlines()
 
+        # 5. Isolation from host files: host files outside /workspace are unmounted and inaccessible
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as host_outside_dir:
+            host_secret_file = os.path.join(host_outside_dir, "host_secret.txt")
+            with open(host_secret_file, "w") as f:
+                f.write("UNAUTHORIZED_HOST_DATA")
+            posix_path = host_secret_file.replace("\\", "/")
+            read_host_res = await tool.execute(
+                call_id="c_real_read_outside",
+                workspace_path=temp_dir,
+                command=f'python3 -c "open(\'{posix_path}\').read()"',
+                sandbox_mode="container",
+            )
+            assert read_host_res.success is False
+            assert (
+                "No such file" in str(read_host_res.error)
+                or "No such file" in read_host_res.output
+                or "FileNotFoundError" in str(read_host_res.error)
+                or "Permission denied" in str(read_host_res.error)
+            )
+
+        # 6. Mount permissions: /tmp is tmpfs and writable, while rootfs remains read-only
+        tmpfs_res = await tool.execute(
+            call_id="c_real_tmpfs",
+            workspace_path=temp_dir,
+            command='python3 -c "open(\'/tmp/tmp_test.txt\', \'w\').write(\'tmpfs_ok\'); print(open(\'/tmp/tmp_test.txt\').read())"',
+            sandbox_mode="container",
+        )
+        assert tmpfs_res.success is True
+        assert "tmpfs_ok" in tmpfs_res.output
+
+        # 7. Fail-closed guarantee: container startup failure NEVER silently executes on host
+        host_canary = os.path.join(temp_dir, "host_canary_fail.txt")
+        fail_res = await tool.execute(
+            call_id="c_real_fail_closed",
+            workspace_path=temp_dir,
+            command=f'python3 -c "open(\'host_canary_fail.txt\', \'w\').write(\'LEAKED\')"',
+            sandbox_mode="container",
+            image="nonexistent_invalid_docker_image_xyz:deadbeef",
+        )
+        assert fail_res.success is False
+        assert not os.path.exists(host_canary), (
+            "Security Failure: Container startup failure must NEVER silently fall back to host execution!"
+        )
+
 
 def test_verifier_rejects_fabricated_runner_output_without_trusted_execution_record():
     """Adversarial Test 1:
@@ -3151,6 +3195,239 @@ def test_verification_secret_multi_config_dir_scoping():
 
         # Old record issued under secret_a1 no longer verifies under rotated secret_a2
         assert verify_trusted_execution_record(rec_a, secret=secret_a2) is False
+
+
+@pytest.mark.asyncio
+async def test_terminal_sandbox_mode_and_require_sandbox_combinations():
+    """Validates Issue 1:
+    Decoupling of sandbox_mode and require_sandbox in terminal tool.
+    1. sandbox_mode='container', require_sandbox=False dispatches to container without host error.
+    2. sandbox_mode='container', require_sandbox=True dispatches to container.
+    3. sandbox_mode='host', require_sandbox=True is rejected.
+    4. sandbox_mode='host', require_sandbox=False without AGENT_ALLOW_UNISOLATED_HOST_EXECUTION=1 is rejected.
+    5. sandbox_mode='host', require_sandbox=False with AGENT_ALLOW_UNISOLATED_HOST_EXECUTION=1 runs on host.
+    6. sandbox_mode='unknown' is rejected with invalid mode error.
+    """
+    from agent.tools.terminal import RunCommandTool
+    from unittest.mock import patch, AsyncMock
+
+    tool = RunCommandTool()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        def make_mock_proc(*args, **kwargs):
+            p = AsyncMock()
+            p.returncode = 0
+            p.stdout = AsyncMock()
+            p.stdout.read = AsyncMock(side_effect=[b"CONTAINER_OK\n", b""])
+            p.stderr = AsyncMock()
+            p.stderr.read = AsyncMock(side_effect=[b"", b""])
+            p.wait = AsyncMock(return_value=0)
+            return p
+
+        # 1. sandbox_mode='container', require_sandbox=False:
+        # Verifies dispatch succeeds and does NOT trigger host permission rejection even though require_sandbox=False
+        with patch("shutil.which", return_value="/usr/bin/docker"), \
+             patch("asyncio.create_subprocess_exec", side_effect=make_mock_proc) as mock_exec:
+            res_c_req_false = await tool.execute(
+                workspace_path=temp_dir,
+                command="echo test",
+                sandbox_mode="container",
+                require_sandbox=False,
+            )
+            assert res_c_req_false.success is True
+            assert "CONTAINER_OK" in res_c_req_false.output
+            assert mock_exec.called
+            called_args = mock_exec.call_args[0]
+            assert called_args[0] == "docker"
+
+        # 2. sandbox_mode='container', require_sandbox=True:
+        with patch("shutil.which", return_value="/usr/bin/docker"), \
+             patch("asyncio.create_subprocess_exec", side_effect=make_mock_proc) as mock_exec:
+            res_c_req_true = await tool.execute(
+                workspace_path=temp_dir,
+                command="echo test",
+                sandbox_mode="container",
+                require_sandbox=True,
+            )
+            assert res_c_req_true.success is True
+            assert "CONTAINER_OK" in res_c_req_true.output
+            assert mock_exec.called
+
+        # 3. sandbox_mode='host', require_sandbox=True:
+        res_h_req_true = await tool.execute(
+            workspace_path=temp_dir,
+            command="echo test",
+            sandbox_mode="host",
+            require_sandbox=True,
+        )
+        assert res_h_req_true.success is False
+        assert "Host execution rejected: require_sandbox=True" in res_h_req_true.error
+        assert res_h_req_true.artifacts.get("sandbox_violation") is True
+
+        # 4. sandbox_mode='host', require_sandbox=False without env var:
+        os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
+        res_h_req_false_blocked = await tool.execute(
+            workspace_path=temp_dir,
+            command="echo test",
+            sandbox_mode="host",
+            require_sandbox=False,
+        )
+        assert res_h_req_false_blocked.success is False
+        assert "Host execution without sandboxing is strictly disabled" in res_h_req_false_blocked.error
+        assert res_h_req_false_blocked.artifacts.get("security_warning") == "UNISOLATED_HOST_EXECUTION_BLOCKED"
+
+        # 5. sandbox_mode='host', require_sandbox=False with env var:
+        os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
+        try:
+            res_h_req_false_allowed = await tool.execute(
+                workspace_path=temp_dir,
+                command=f'"{sys.executable}" -c "print(\'HOST_SUCCESS\')"',
+                sandbox_mode="host",
+                require_sandbox=False,
+            )
+            assert res_h_req_false_allowed.success is True
+            assert "HOST_SUCCESS" in res_h_req_false_allowed.output
+            assert res_h_req_false_allowed.artifacts.get("security_warning") == "UNISOLATED_HOST_EXECUTION"
+        finally:
+            os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
+
+        # 6. Invalid sandbox_mode
+        res_invalid = await tool.execute(
+            workspace_path=temp_dir,
+            command="echo test",
+            sandbox_mode="virtualbox",
+        )
+        assert res_invalid.success is False
+        assert "Invalid sandbox_mode: 'virtualbox'" in res_invalid.error
+        assert res_invalid.artifacts.get("sandbox_violation") is True
+
+
+def test_verification_signing_key_cache_lifecycle_and_dynamic_environment():
+    """Validates Issue 2:
+    Signing-key cache lifecycle, directory isolation, ephemeral state isolation,
+    and dynamic AGENT_VERIFICATION_SECRET mutation during process lifetime.
+    """
+    import hashlib
+    from agent.security.provenance import (
+        get_verification_secret,
+        reset_verification_secret,
+        rotate_verification_secret,
+        set_verification_secret,
+        is_ephemeral_mode,
+        issue_trusted_execution_record,
+        verify_trusted_execution_record,
+    )
+
+    os.environ.pop("AGENT_VERIFICATION_SECRET", None)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        dir_1 = os.path.join(temp_dir, "cfg_1")
+        dir_2 = os.path.join(temp_dir, "cfg_2")
+        reset_verification_secret()
+
+        # Step 1: Distinct directories maintain independent keys
+        k1 = get_verification_secret(config_dir=dir_1)
+        k2 = get_verification_secret(config_dir=dir_2)
+        assert k1 != k2
+        assert len(k1) == 32 and len(k2) == 32
+
+        # Step 2: Resetting one directory does not purge the other directory's cache
+        reset_verification_secret(config_dir=dir_1)
+        assert get_verification_secret(config_dir=dir_2) == k2
+
+        # Step 3: Rotating dir_1 does not alter dir_2
+        k1_rotated = rotate_verification_secret(config_dir=dir_1)
+        assert k1_rotated != k1
+        assert get_verification_secret(config_dir=dir_1) == k1_rotated
+        assert get_verification_secret(config_dir=dir_2) == k2
+
+        # Step 4: Ephemeral mode status does not leak across directory switches
+        set_verification_secret(b"e" * 32, is_ephemeral=True, config_dir=dir_1)
+        assert is_ephemeral_mode(config_dir=dir_1) is True
+        assert is_ephemeral_mode(config_dir=dir_2) is False
+
+        # Step 5: Dynamic environment variable mutation and reversion
+        try:
+            os.environ["AGENT_VERIFICATION_SECRET"] = "dynamic_secret_alpha"
+            s_alpha = get_verification_secret()
+            assert s_alpha == hashlib.sha256(b"dynamic_secret_alpha").digest()
+
+            os.environ["AGENT_VERIFICATION_SECRET"] = "dynamic_secret_beta"
+            s_beta = get_verification_secret()
+            assert s_beta == hashlib.sha256(b"dynamic_secret_beta").digest()
+            assert s_alpha != s_beta
+        finally:
+            os.environ.pop("AGENT_VERIFICATION_SECRET", None)
+
+        # Unsetting reverts cleanly to persistent storage
+        s_reverted_2 = get_verification_secret(config_dir=dir_2)
+        assert s_reverted_2 == k2
+
+
+def test_verification_secret_rotation_failures_fail_closed_and_preserve_state():
+    """Validates Issue 5:
+    Interrupted writes, permission errors, and atomic rollback during secret rotation.
+    Failed rotation cannot leave the application reporting a new key when disk was not updated.
+    """
+    from agent.security.provenance import (
+        get_verification_secret,
+        rotate_verification_secret,
+        reset_verification_secret,
+        issue_trusted_execution_record,
+        verify_trusted_execution_record,
+        VerificationSecretStorageError,
+    )
+    from unittest.mock import patch
+
+    os.environ.pop("AGENT_VERIFICATION_SECRET", None)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cfg_dir = os.path.join(temp_dir, "rot_test")
+        reset_verification_secret()
+
+        # Establish initial secret
+        initial_secret = get_verification_secret(config_dir=cfg_dir)
+        rec = issue_trusted_execution_record(
+            run_id="run_init",
+            runner="pytest",
+            command="pytest tests/",
+            exit_code=0,
+            total=1,
+            passed=1,
+            failed=0,
+            passed_nodes=["test_ok"],
+            secret=initial_secret,
+        )
+        assert verify_trusted_execution_record(rec, secret=initial_secret) is True
+
+        # 1. Simulate write/flush failure (e.g. disk full) during rotation
+        with patch("os.fsync", side_effect=OSError("Disk full / I/O error")):
+            with pytest.raises(VerificationSecretStorageError) as exc_info:
+                rotate_verification_secret(config_dir=cfg_dir)
+            assert "Failed to rotate verification secret" in str(exc_info.value)
+
+        # Confirm no temp files leaked in key dir
+        temp_files = [f for f in os.listdir(cfg_dir) if f.startswith(".vkey_rot_")]
+        assert len(temp_files) == 0
+
+        # State is preserved: active secret is still initial_secret, and rec still verifies
+        assert get_verification_secret(config_dir=cfg_dir) == initial_secret
+        assert verify_trusted_execution_record(rec, secret=initial_secret) is True
+
+        # 2. Simulate atomic replace failure (e.g. permission denied)
+        with patch("os.replace", side_effect=PermissionError("EACCES: permission denied")):
+            with pytest.raises(VerificationSecretStorageError) as exc_info2:
+                rotate_verification_secret(config_dir=cfg_dir)
+            assert "Failed to rotate verification secret" in str(exc_info2.value)
+
+        # Confirm temp files cleaned up
+        temp_files = [f for f in os.listdir(cfg_dir) if f.startswith(".vkey_rot_")]
+        assert len(temp_files) == 0
+
+        # State is preserved: disk and in-memory cache still hold initial_secret
+        with open(os.path.join(cfg_dir, "verification.key"), "rb") as f:
+            disk_key = f.read()
+        assert disk_key == initial_secret
+        assert get_verification_secret(config_dir=cfg_dir) == initial_secret
+        assert verify_trusted_execution_record(rec, secret=initial_secret) is True
+
 
 
 

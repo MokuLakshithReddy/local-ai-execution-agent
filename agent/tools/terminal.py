@@ -475,29 +475,30 @@ class RunCommandTool(BaseTool):
         sandbox_mode = kwargs.get("sandbox_mode", "container")  # "container" or "host"
         require_sandbox = kwargs.get("require_sandbox", True)
 
-        # 1. Reject host execution if sandbox is required (host path cannot guarantee OS isolation)
-        if sandbox_mode == "host" and require_sandbox:
-            return ActionResult(
-                call_id=call_id,
-                tool_name=self.name,
-                success=False,
-                output="",
-                error=(
-                    "Host execution rejected: require_sandbox=True requires an OS-enforced container sandbox. "
-                    "Host process execution cannot guarantee OS-enforced filesystem and network isolation across operating systems. "
-                    "Use sandbox_mode='container' for genuine isolation, or explicitly pass require_sandbox=False to permit unisolated host execution."
-                ),
-                artifacts={
-                    "sandbox_mode": "host",
-                    "sandbox_violation": True,
-                    "require_sandbox": True,
-                    "isolated": False,
-                },
-                execution_time_ms=(time.time() - t0) * 1000,
-            )
+        # 1. Host Execution Mode Handling
+        if sandbox_mode == "host":
+            # 1a. Host mode with require_sandbox=True is rejected (host path cannot guarantee OS isolation)
+            if require_sandbox:
+                return ActionResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    success=False,
+                    output="",
+                    error=(
+                        "Host execution rejected: require_sandbox=True requires an OS-enforced container sandbox. "
+                        "Host process execution cannot guarantee OS-enforced filesystem and network isolation across operating systems. "
+                        "Use sandbox_mode='container' for genuine isolation, or explicitly pass require_sandbox=False to permit unisolated host execution."
+                    ),
+                    artifacts={
+                        "sandbox_mode": "host",
+                        "sandbox_violation": True,
+                        "require_sandbox": True,
+                        "isolated": False,
+                    },
+                    execution_time_ms=(time.time() - t0) * 1000,
+                )
 
-        # Gate unisolated host mode behind explicit trusted configuration
-        if sandbox_mode == "host" or not require_sandbox:
+            # 1b. Host mode with require_sandbox=False is gated behind explicit trusted configuration
             if os.environ.get("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION") != "1":
                 return ActionResult(
                     call_id=call_id,
@@ -512,12 +513,22 @@ class RunCommandTool(BaseTool):
                     artifacts={
                         "sandbox_mode": "host",
                         "sandbox_violation": True,
-                        "require_sandbox": require_sandbox,
+                        "require_sandbox": False,
                         "isolated": False,
                         "security_warning": "UNISOLATED_HOST_EXECUTION_BLOCKED",
                     },
                     execution_time_ms=(time.time() - t0) * 1000,
                 )
+        elif sandbox_mode != "container":
+            return ActionResult(
+                call_id=call_id,
+                tool_name=self.name,
+                success=False,
+                output="",
+                error=f"Invalid sandbox_mode: '{sandbox_mode}'. Supported modes: 'container', 'host'.",
+                artifacts={"sandbox_violation": True, "sandbox_mode": sandbox_mode},
+                execution_time_ms=(time.time() - t0) * 1000,
+            )
 
         # 2. Container Sandbox Execution Mode (Default)
         if sandbox_mode == "container":
