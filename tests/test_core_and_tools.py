@@ -2232,7 +2232,7 @@ def test_credential_vault_multiprocess_concurrency_and_crash_recovery():
        wedge the vault permanently; subsequent processes recover safely and establish a valid key."""
     from agent.persistence.credentials import CredentialVault
 
-    # 1. Multi-process concurrency test using independent OS processes
+    # 1. Multi-process concurrency test using independent OS processes with robust child cleanup
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
         key_dir = os.path.join(temp_dir, "mp_keys")
         os.makedirs(key_dir, mode=0o700)
@@ -2254,10 +2254,24 @@ def test_credential_vault_multiprocess_concurrency_and_crash_recovery():
             for _ in range(4)
         ]
         results = []
-        for p in procs:
-            out, err = p.communicate(timeout=30)
-            assert p.returncode == 0, f"Process failed with returncode {p.returncode}: {err}"
-            results.append(out.strip())
+        try:
+            for p in procs:
+                out, err = p.communicate(timeout=30)
+                assert p.returncode == 0, f"Process failed with returncode {p.returncode}: {err}"
+                results.append(out.strip())
+        finally:
+            # Reaping cleanup block: terminate, wait, and kill any lingering child processes
+            for p in procs:
+                if p.poll() is None:
+                    try:
+                        p.terminate()
+                        p.wait(timeout=2)
+                    except Exception:
+                        try:
+                            p.kill()
+                            p.wait(timeout=2)
+                        except Exception:
+                            pass
 
         assert len(results) == 4
         # All distinct OS processes must have obtained the exact same key
@@ -2820,10 +2834,10 @@ def test_verification_secret_concurrent_creation_race_handled():
 
 
 def test_windows_key_file_acl_enforcement():
-    """Validates Issue 5 & Remaining Issue 1:
+    """Validates Issue 5 & Remaining Issue 1 & P1/P2:
     On Windows, _lock_down_key_file resets explicit ACLs to eliminate pre-existing hostile ACEs,
     strips inheritance, grants user-only access, and audits the ACL via a complete allowlist
-    to prove that EVERY remaining access entry is explicitly authorized."""
+    to prove that EVERY remaining access entry is explicitly authorized with strictly (R,W) permissions."""
     import subprocess
     from agent.security.provenance import _lock_down_key_file, validate_windows_acl_allowlist, VerificationSecretStorageError
 
@@ -2844,11 +2858,14 @@ def test_windows_key_file_acl_enforcement():
             post_acl = subprocess.run(["icacls", tmp_name], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15).stdout
             parsed = validate_windows_acl_allowlist(post_acl, tmp_name, os.environ.get("USERNAME"))
             assert len(parsed) >= 1
-            # Every parsed entry must strictly match the authorized username with authorized permissions
+            # Every parsed entry must strictly match the authorized username with authorized (R,W) permissions
+            expected_username = os.environ.get("USERNAME", "").lower()
+            expected_domain = os.environ.get("USERDOMAIN", "").lower()
             for p, perm in parsed:
-                p_user = p.split("\\")[-1] if "\\" in p else p
-                assert p_user.lower() == os.environ.get("USERNAME").lower()
-                assert perm in ("(R,W)", "(W,R)", "(R)", "(W)")
+                p_lower = p.lower()
+                assert p_lower == expected_username or p_lower == f"{expected_domain}\\{expected_username}"
+                assert perm in ("(R,W)", "(W,R)")
+                assert "(I)" not in perm
         else:
             _lock_down_key_file(tmp_name)
     finally:
@@ -2860,63 +2877,218 @@ def test_windows_key_file_acl_enforcement():
 
 
 def test_windows_acl_allowlist_parsing_and_adversarial_principals():
-    """Validates Remaining Concern 1 (P1):
+    """Validates Remaining Concern 1 (P1 & P2):
     Windows ACL audit parses ACL entries and performs a complete allowlist check.
-    Proves that unexpected/foreign principals and excessive permissions are strictly rejected."""
+    Proves that:
+    1. Unexpected/foreign domain identities (e.g. OTHERDOMAIN\\username) are strictly rejected.
+    2. Inherited entries (e.g. (I)) are strictly rejected.
+    3. Unexpected rights (e.g. (R), (RX), (M), (F), (W)) are strictly rejected under default policy.
+    4. Malformed ACL output fails closed.
+    5. Exact permitted rights can be configured for specific file types."""
+    from unittest.mock import patch
     from agent.security.provenance import validate_windows_acl_allowlist, VerificationSecretStorageError
 
     dummy_path = "C:\\agent\\keys\\verification.key"
 
-    # 1. Valid: Authorized user with expected (R,W) permissions
-    valid_icacls = f"{dummy_path} CORP\\alice:(R,W)\nSuccessfully processed 1 files; Failed processing 0 files"
-    entries = validate_windows_acl_allowlist(valid_icacls, dummy_path, "alice")
-    assert len(entries) == 1
-    assert entries[0] == ("CORP\\alice", "(R,W)")
+    # 1. Valid: Authorized user with expected (R,W) permissions matching complete identity
+    with patch.dict(os.environ, {"USERDOMAIN": "CORP", "COMPUTERNAME": "WIN-NODE1"}):
+        valid_icacls = f"{dummy_path} CORP\\alice:(R,W)\nSuccessfully processed 1 files; Failed processing 0 files"
+        entries = validate_windows_acl_allowlist(valid_icacls, dummy_path, "alice")
+        assert len(entries) == 1
+        assert entries[0] == ("CORP\\alice", "(R,W)")
 
-    # 2. Adversarial: Unexpected principal (not in known forbidden list, but an arbitrary unauthorized account)
+        # Also valid with local unqualified identity
+        valid_local = f"{dummy_path} alice:(W,R)\nSuccessfully processed 1 files; Failed processing 0 files"
+        entries_local = validate_windows_acl_allowlist(valid_local, dummy_path, "alice")
+        assert len(entries_local) == 1
+
+        # Also valid when expected_username explicitly specifies domain
+        entries_qualified = validate_windows_acl_allowlist(valid_icacls, dummy_path, "CORP\\alice")
+        assert len(entries_qualified) == 1
+
+    # 2. Adversarial (P1): Unexpected domain identity (OTHERDOMAIN\alice when expected is alice in CORP)
+    with patch.dict(os.environ, {"USERDOMAIN": "CORP", "COMPUTERNAME": "WIN-NODE1"}):
+        adversarial_domain = (
+            f"{dummy_path} OTHERDOMAIN\\alice:(R,W)\n"
+            f"Successfully processed 1 files; Failed processing 0 files"
+        )
+        with pytest.raises(VerificationSecretStorageError) as exc_domain:
+            validate_windows_acl_allowlist(adversarial_domain, dummy_path, "alice")
+        assert "Unauthorized principal 'OTHERDOMAIN\\alice'" in str(exc_domain.value)
+        assert "Not in strict allowlist" in str(exc_domain.value)
+
+    # 3. Adversarial (P2): Inherited entries (inheritance was not stripped)
+    inherited_entry = (
+        f"{dummy_path} CORP\\alice:(I)(R,W)\n"
+        f"Successfully processed 1 files; Failed processing 0 files"
+    )
+    with pytest.raises(VerificationSecretStorageError) as exc_inh:
+        validate_windows_acl_allowlist(inherited_entry, dummy_path, "CORP\\alice")
+    assert "Inherited ACL entry" in str(exc_inh.value)
+    assert "Inheritance was not properly stripped" in str(exc_inh.value)
+
+    # 4. Adversarial (P1 & P2): Permission combinations (strict policy requires (R,W) or (W,R))
+    # (RX) must be rejected
+    with pytest.raises(VerificationSecretStorageError) as exc_rx:
+        validate_windows_acl_allowlist(f"{dummy_path} CORP\\alice:(RX)\n", dummy_path, "CORP\\alice")
+    assert "unauthorized permissions '(RX)'" in str(exc_rx.value)
+
+    # (R) read-only must be rejected by default (key files require read-write)
+    with pytest.raises(VerificationSecretStorageError) as exc_r:
+        validate_windows_acl_allowlist(f"{dummy_path} CORP\\alice:(R)\n", dummy_path, "CORP\\alice")
+    assert "unauthorized permissions '(R)'" in str(exc_r.value)
+
+    # (F) Full control must be rejected
+    with pytest.raises(VerificationSecretStorageError) as exc_f:
+        validate_windows_acl_allowlist(f"{dummy_path} CORP\\alice:(F)\n", dummy_path, "CORP\\alice")
+    assert "unauthorized permissions '(F)'" in str(exc_f.value)
+
+    # (M) Modify must be rejected
+    with pytest.raises(VerificationSecretStorageError) as exc_m:
+        validate_windows_acl_allowlist(f"{dummy_path} CORP\\alice:(M)\n", dummy_path, "CORP\\alice")
+    assert "unauthorized permissions '(M)'" in str(exc_m.value)
+
+    # Allowed rights can be customized for read-only files if specified
+    ro_entries = validate_windows_acl_allowlist(
+        f"{dummy_path} CORP\\alice:(R)\nSuccessfully processed 1 files; Failed processing 0 files",
+        dummy_path,
+        "CORP\\alice",
+        allowed_rights={"(R)"},
+    )
+    assert len(ro_entries) == 1
+
+    # 5. Adversarial: Unexpected principal (not in allowlist)
     adversarial_unexpected = (
         f"{dummy_path} CORP\\alice:(R,W)\n"
-        f"              AdversaryServiceAccount:(R)\n"
+        f"              AdversaryServiceAccount:(R,W)\n"
         f"Successfully processed 1 files; Failed processing 0 files"
     )
     with pytest.raises(VerificationSecretStorageError) as exc_unauth:
-        validate_windows_acl_allowlist(adversarial_unexpected, dummy_path, "alice")
+        validate_windows_acl_allowlist(adversarial_unexpected, dummy_path, "CORP\\alice")
     assert "Unauthorized principal 'AdversaryServiceAccount'" in str(exc_unauth.value)
-    assert "Not in allowlist" in str(exc_unauth.value)
+    assert "Not in strict allowlist" in str(exc_unauth.value)
 
-    # 3. Adversarial: Unexpected group account
+    # 6. Adversarial: Unexpected group account
     adversarial_group = (
         f"{dummy_path} CORP\\alice:(R,W)\n"
         f"              SecurityAuditorGroup:(R,W)\n"
         f"Successfully processed 1 files; Failed processing 0 files"
     )
     with pytest.raises(VerificationSecretStorageError) as exc_grp:
-        validate_windows_acl_allowlist(adversarial_group, dummy_path, "alice")
+        validate_windows_acl_allowlist(adversarial_group, dummy_path, "CORP\\alice")
     assert "Unauthorized principal 'SecurityAuditorGroup'" in str(exc_grp.value)
 
-    # 4. Adversarial: Excessive permissions for authorized user (Full control F)
-    adversarial_excessive = (
-        f"{dummy_path} CORP\\alice:(F)\n"
-        f"Successfully processed 1 files; Failed processing 0 files"
-    )
-    with pytest.raises(VerificationSecretStorageError) as exc_excessive:
-        validate_windows_acl_allowlist(adversarial_excessive, dummy_path, "alice")
-    assert "has unauthorized permissions '(F)'" in str(exc_excessive.value)
-
-    # 5. Missing expected authorized user
+    # 7. Missing expected authorized user
     adversarial_missing_user = (
         f"{dummy_path} CORP\\bob:(R,W)\n"
         f"Successfully processed 1 files; Failed processing 0 files"
     )
     with pytest.raises(VerificationSecretStorageError) as exc_missing:
-        validate_windows_acl_allowlist(adversarial_missing_user, dummy_path, "alice", allowed_principals={"bob"})
-    assert "Expected authorized user 'alice' is missing" in str(exc_missing.value)
+        validate_windows_acl_allowlist(adversarial_missing_user, dummy_path, "CORP\\alice", allowed_principals={"CORP\\bob"})
+    assert "Expected authorized user 'CORP\\alice' is missing" in str(exc_missing.value)
 
-    # 6. Malformed ACL content line fails closed
+    # 8. Malformed ACL content line fails closed
     malformed_icacls = f"{dummy_path} corrupted_line_without_permissions_syntax\n"
     with pytest.raises(VerificationSecretStorageError) as exc_malformed:
-        validate_windows_acl_allowlist(malformed_icacls, dummy_path, "alice")
+        validate_windows_acl_allowlist(malformed_icacls, dummy_path, "CORP\\alice")
     assert "Failed to parse ACL entry line" in str(exc_malformed.value)
+
+    # 9. Truncated line missing permission tokens
+    truncated_icacls = f"{dummy_path} CORP\\alice:\n"
+    with pytest.raises(VerificationSecretStorageError) as exc_truncated:
+        validate_windows_acl_allowlist(truncated_icacls, dummy_path, "CORP\\alice")
+    assert "Failed to parse ACL entry line" in str(exc_truncated.value)
+
+    # 10. Empty icacls output fails closed
+    empty_icacls = f"{dummy_path}\nSuccessfully processed 1 files; Failed processing 0 files"
+    with pytest.raises(VerificationSecretStorageError) as exc_empty:
+        validate_windows_acl_allowlist(empty_icacls, dummy_path, "CORP\\alice")
+    assert "No valid ACL entries found" in str(exc_empty.value)
+
+
+def test_windows_acl_lockdown_command_failures_and_timeout_handling():
+    """Validates P2:
+    Windows key-file and token-file lockdown handle icacls command failures and timeouts safely:
+    1. Non-zero returncode on /reset fails closed.
+    2. Non-zero returncode on /inheritance:r fails closed.
+    3. Non-zero returncode on audit fails closed.
+    4. subprocess.TimeoutExpired during key lockdown fails closed with VerificationSecretStorageError.
+    5. subprocess.TimeoutExpired during token lockdown fails closed with RuntimeError."""
+    from unittest.mock import patch, MagicMock
+    import subprocess
+    from agent.security.provenance import _lock_down_key_file, VerificationSecretStorageError
+    from agent.api.server import _lock_down_token_file
+
+    with patch.dict(os.environ, {"USERNAME": "testadmin"}), \
+         patch("sys.platform", "win32"):
+
+        # 1. /reset command failure
+        with patch("subprocess.run", return_value=MagicMock(returncode=1, stderr="Access is denied")):
+            with pytest.raises(VerificationSecretStorageError) as exc_reset:
+                _lock_down_key_file("C:\\fake\\key.key")
+            assert "icacls /reset failed" in str(exc_reset.value)
+
+        # 2. /inheritance:r command failure
+        call_count = 0
+        def mock_grant_fail(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return MagicMock(returncode=0, stderr="")
+            return MagicMock(returncode=1, stderr="Failed to grant")
+
+        with patch("subprocess.run", side_effect=mock_grant_fail):
+            with pytest.raises(VerificationSecretStorageError) as exc_grant:
+                _lock_down_key_file("C:\\fake\\key.key")
+            assert "icacls failed to lock down key ACLs" in str(exc_grant.value)
+
+        # 3. Timeout handling during key file lockdown
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["icacls"], timeout=15)):
+            with pytest.raises(VerificationSecretStorageError) as exc_timeout:
+                _lock_down_key_file("C:\\fake\\key.key")
+            assert "icacls command timed out" in str(exc_timeout.value)
+
+        # 4. Timeout handling during token file lockdown
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["icacls"], timeout=15)):
+            with pytest.raises(RuntimeError) as exc_tok_timeout:
+                _lock_down_token_file("C:\\fake\\token.tok")
+            assert "icacls timed out locking down token file" in str(exc_tok_timeout.value)
+
+
+def test_subprocess_timeout_cleanup_reaps_all_children_on_failure():
+    """Validates P2:
+    When a subprocess in a pool times out, the cleanup block reaps/terminates/kills
+    all remaining children, ensuring no orphaned processes are left running."""
+    # Spawn 3 sleeper subprocesses that would sleep for 60 seconds
+    script = "import time; time.sleep(60)"
+    procs = [
+        subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for _ in range(3)
+    ]
+    timed_out = False
+    try:
+        # Simulate timeout on communicate with short timeout
+        for p in procs:
+            p.communicate(timeout=0.2)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                try:
+                    p.terminate()
+                    p.wait(timeout=2)
+                except Exception:
+                    try:
+                        p.kill()
+                        p.wait(timeout=2)
+                    except Exception:
+                        pass
+
+    assert timed_out is True
+    # Verify that EVERY child process is now dead and reaped
+    for p in procs:
+        assert p.poll() is not None
 
 
 def test_malformed_and_truncated_junit_xml():

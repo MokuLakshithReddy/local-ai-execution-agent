@@ -34,27 +34,48 @@ def _lock_down_token_file(filepath: str):
         username = os.environ.get("USERNAME")
         if not username:
             raise RuntimeError("Security Failure: Unable to determine active USERNAME for token ACL configuration.")
-        subprocess.run(["icacls", filepath, "/reset"], capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL, timeout=15)
-        res = subprocess.run(
-            ["icacls", filepath, "/inheritance:r", "/grant:r", f"{username}:(R,W)"],
-            capture_output=True,
-            text=True,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            timeout=15,
-        )
-        if res.returncode != 0:
-            raise RuntimeError(f"Security Failure: icacls failed to lock down token file ACLs ({res.stderr.strip()})")
-        audit_res = subprocess.run(["icacls", filepath], capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL, timeout=15)
-        if audit_res.returncode != 0:
-            raise RuntimeError(f"Security Failure: icacls failed to audit token file ACLs ({audit_res.stderr.strip()})")
         try:
+            reset_res = subprocess.run(
+                ["icacls", filepath, "/reset"],
+                capture_output=True,
+                text=True,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                timeout=15,
+            )
+            if reset_res.returncode != 0:
+                raise RuntimeError(f"Security Failure: icacls failed to reset token file ACLs ({reset_res.stderr.strip()})")
+            res = subprocess.run(
+                ["icacls", filepath, "/inheritance:r", "/grant:r", f"{username}:(R,W)"],
+                capture_output=True,
+                text=True,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                timeout=15,
+            )
+            if res.returncode != 0:
+                raise RuntimeError(f"Security Failure: icacls failed to lock down token file ACLs ({res.stderr.strip()})")
+            audit_res = subprocess.run(
+                ["icacls", filepath],
+                capture_output=True,
+                text=True,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                timeout=15,
+            )
+            if audit_res.returncode != 0:
+                raise RuntimeError(f"Security Failure: icacls failed to audit token file ACLs ({audit_res.stderr.strip()})")
             validate_windows_acl_allowlist(
                 icacls_stdout=audit_res.stdout,
                 filepath=filepath,
                 expected_username=username,
+                allowed_rights={"(R,W)", "(W,R)"},
             )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"Security Failure: icacls timed out locking down token file ACLs: {exc}") from exc
         except Exception as err:
+            if "Security Failure" in str(err):
+                raise
             raise RuntimeError(f"Security Failure: Token file retained unauthorized ACL: {err}") from err
     elif hasattr(os, "chmod"):
         try:

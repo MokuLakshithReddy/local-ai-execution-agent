@@ -74,19 +74,40 @@ def validate_windows_acl_allowlist(
 ) -> list[tuple[str, str]]:
     """
     Rigorously parses icacls output and proves that EVERY access control entry
-    belongs strictly to an authorized principal on the allowlist with authorized permissions.
-    Fails closed if any unauthorized, unexpected, or unknown principal is found,
-    or if permissions exceed allowed rights, or if the expected user is missing.
+    belongs strictly to an authorized principal on the allowlist with exact authorized permissions.
+    Fails closed if:
+    1. Any unauthorized, unexpected, or unknown principal is found (complete identity validation).
+    2. A principal has an unintended/foreign domain qualification (e.g. OTHERDOMAIN\\username).
+    3. Any inherited permissions are present (e.g. (I)).
+    4. Permissions exceed or differ from the strict permitted rights.
+    5. The expected authorized user is missing.
+    6. The icacls output is malformed or unparseable.
     """
     norm_filepath = os.path.normpath(filepath).lower()
     raw_filepath = filepath.lower()
 
+    # Strict permitted rights for sensitive key and token files: strictly Read and Write
     if allowed_rights is None:
-        # Default allowed rights for key and token files: Read and Write
-        allowed_rights = {"(R,W)", "(W,R)", "(R)", "(W)", "(RX)"}
+        allowed_rights = {"(R,W)", "(W,R)"}
+    else:
+        allowed_rights = {r.strip().upper() for r in allowed_rights}
 
     expected_user = expected_username.strip().lower()
-    extra_allowed = {p.strip().lower() for p in allowed_principals} if allowed_principals else set()
+
+    # Build the set of authorized full identities for the expected user
+    authorized_user_identities: set[str] = {expected_user}
+    if "\\" not in expected_user:
+        # If expected_username is an unqualified username, only allow the local machine's
+        # current domain or computer name as a qualification prefix.
+        user_domain = os.environ.get("USERDOMAIN", "").strip().lower()
+        computer_name = os.environ.get("COMPUTERNAME", "").strip().lower()
+        if user_domain:
+            authorized_user_identities.add(f"{user_domain}\\{expected_user}")
+        if computer_name:
+            authorized_user_identities.add(f"{computer_name}\\{expected_user}")
+
+    # Build strict extra allowed principals (must match the complete principal identity)
+    extra_allowed: set[str] = {p.strip().lower() for p in allowed_principals} if allowed_principals else set()
 
     lines = icacls_stdout.strip().splitlines()
     entries: list[tuple[str, str]] = []
@@ -125,24 +146,31 @@ def validate_windows_acl_allowlist(
             f"Security Failure: No valid ACL entries found in icacls output for '{filepath}'"
         )
 
-    # Validate EVERY entry against the strict allowlist
+    # Validate EVERY entry against the strict allowlist and permission policy
     found_expected_user = False
     for principal, perms in entries:
         p_lower = principal.lower()
-        user_component = p_lower.split("\\")[-1] if "\\" in p_lower else p_lower
+        clean_perms = perms.upper().replace(" ", "")
 
-        is_authorized_user = (p_lower == expected_user or user_component == expected_user)
-        is_extra_allowed = (p_lower in extra_allowed or user_component in extra_allowed)
+        # 1. Inherited entries must never be accepted (inheritance was stripped with /inheritance:r)
+        if "(I)" in clean_perms:
+            raise VerificationSecretStorageError(
+                f"Security Failure: Inherited ACL entry '{principal}:{perms}' found for '{filepath}'. Inheritance was not properly stripped."
+            )
+
+        # 2. Complete identity validation: must match authorized user identity or extra allowed principal
+        is_authorized_user = p_lower in authorized_user_identities
+        is_extra_allowed = p_lower in extra_allowed
 
         if not (is_authorized_user or is_extra_allowed):
             raise VerificationSecretStorageError(
-                f"Security Failure: Unauthorized principal '{principal}' (permissions: {perms}) found in ACL for '{filepath}'. Not in allowlist."
+                f"Security Failure: Unauthorized principal '{principal}' (permissions: {perms}) found in ACL for '{filepath}'. Not in strict allowlist."
             )
 
-        clean_perms = perms.upper().replace(" ", "")
+        # 3. Exact permission mask validation: reject unexpected rights (e.g. (RX), (F), (M), (D), etc.)
         if clean_perms not in allowed_rights:
             raise VerificationSecretStorageError(
-                f"Security Failure: Principal '{principal}' has unauthorized permissions '{perms}' for '{filepath}' (allowed: {allowed_rights})."
+                f"Security Failure: Principal '{principal}' has unauthorized permissions '{perms}' for '{filepath}' (strictly allowed: {allowed_rights})."
             )
 
         if is_authorized_user:
@@ -163,8 +191,8 @@ def _lock_down_key_file(filepath: str) -> None:
         1. Resets ACLs (icacls /reset) to eradicate any pre-existing explicit hostile or permissive ACEs.
         2. Strips inheritance and grants (R,W) exclusively to the active USERNAME (icacls /inheritance:r /grant:r).
         3. Audits the resulting ACL: parses all entries and strictly proves that EVERY remaining entry
-           belongs to an authorized principal on the allowlist with allowed permissions (R,W).
-           Fails closed on any unexpected or unauthorized ACE.
+           belongs to the authorized complete identity on the allowlist with strictly allowed permissions (R,W).
+           Fails closed on any unexpected or unauthorized ACE, inherited permissions, command errors, or timeouts.
     - On POSIX: Uses chmod 0o600 (owner read/write only).
     Fails closed if permissions cannot be enforced or verified.
     """
@@ -176,53 +204,65 @@ def _lock_down_key_file(filepath: str) -> None:
                 "Security Failure: Unable to determine active USERNAME for Windows key ACL lockdown."
             )
 
-        # 1. Reset explicit permissions to eliminate hostile pre-existing ACEs
-        reset_res = subprocess.run(
-            ["icacls", filepath, "/reset"],
-            capture_output=True,
-            text=True,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            timeout=15,
-        )
-        if reset_res.returncode != 0:
-            raise VerificationSecretStorageError(
-                f"Security Failure: icacls /reset failed to reset key ACLs: {reset_res.stderr.strip()}"
+        try:
+            # 1. Reset explicit permissions to eliminate hostile pre-existing ACEs
+            reset_res = subprocess.run(
+                ["icacls", filepath, "/reset"],
+                capture_output=True,
+                text=True,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                timeout=15,
             )
+            if reset_res.returncode != 0:
+                raise VerificationSecretStorageError(
+                    f"Security Failure: icacls /reset failed to reset key ACLs: {reset_res.stderr.strip()}"
+                )
 
-        # 2. Strip inherited permissions and grant exclusive (R,W) to active user
-        grant_res = subprocess.run(
-            ["icacls", filepath, "/inheritance:r", "/grant:r", f"{username}:(R,W)"],
-            capture_output=True,
-            text=True,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            timeout=15,
-        )
-        if grant_res.returncode != 0:
-            raise VerificationSecretStorageError(
-                f"Security Failure: icacls failed to lock down key ACLs: {grant_res.stderr.strip()}"
+            # 2. Strip inherited permissions and grant exclusive (R,W) to active user
+            grant_res = subprocess.run(
+                ["icacls", filepath, "/inheritance:r", "/grant:r", f"{username}:(R,W)"],
+                capture_output=True,
+                text=True,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                timeout=15,
             )
+            if grant_res.returncode != 0:
+                raise VerificationSecretStorageError(
+                    f"Security Failure: icacls failed to lock down key ACLs: {grant_res.stderr.strip()}"
+                )
 
-        # 3. Audit resulting ACL to confirm no hostile, unexpected, or unauthorized ACEs remain via strict allowlist
-        audit_res = subprocess.run(
-            ["icacls", filepath],
-            capture_output=True,
-            text=True,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            timeout=15,
-        )
-        if audit_res.returncode != 0:
-            raise VerificationSecretStorageError(
-                f"Security Failure: icacls failed to audit resulting key ACLs: {audit_res.stderr.strip()}"
+            # 3. Audit resulting ACL to confirm no hostile, unexpected, or unauthorized ACEs remain via strict allowlist
+            audit_res = subprocess.run(
+                ["icacls", filepath],
+                capture_output=True,
+                text=True,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                timeout=15,
             )
+            if audit_res.returncode != 0:
+                raise VerificationSecretStorageError(
+                    f"Security Failure: icacls failed to audit resulting key ACLs: {audit_res.stderr.strip()}"
+                )
 
-        validate_windows_acl_allowlist(
-            icacls_stdout=audit_res.stdout,
-            filepath=filepath,
-            expected_username=username,
-        )
+            validate_windows_acl_allowlist(
+                icacls_stdout=audit_res.stdout,
+                filepath=filepath,
+                expected_username=username,
+                allowed_rights={"(R,W)", "(W,R)"},
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise VerificationSecretStorageError(
+                f"Security Failure: icacls command timed out during key ACL lockdown: {exc}"
+            ) from exc
+        except VerificationSecretStorageError:
+            raise
+        except Exception as exc:
+            raise VerificationSecretStorageError(
+                f"Security Failure: Unexpected error during key ACL lockdown: {exc}"
+            ) from exc
     elif hasattr(os, "chmod"):
         try:
             os.chmod(filepath, 0o600)
