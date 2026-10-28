@@ -1,8 +1,9 @@
 """
 Provenance and cryptographic trust boundary for verification execution records.
 Guarantees that test execution records cannot be forged, fabricated, or tampered with.
-Uses canonical JSON serialization (RFC 8785 semantics) and HMAC-SHA256 signatures.
-Provides an OS-backed persistent secret lifecycle with environment override and fallback.
+Uses deterministic canonical JSON serialization with HMAC-SHA256 signatures.
+Provides an OS-backed persistent secret lifecycle with strict permissions,
+atomic concurrency, Windows ACL lockdown, explicit ephemeral mode, and key rotation.
 """
 import hashlib
 import hmac
@@ -17,6 +18,28 @@ from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 _CACHED_SECRET: Optional[bytes] = None
+_IS_EPHEMERAL: bool = False
+
+
+class VerificationSecretError(RuntimeError):
+    """Base exception for verification secret lifecycle errors."""
+    pass
+
+
+class VerificationSecretStorageError(VerificationSecretError):
+    """Raised when persistent verification secret cannot be securely accessed or created."""
+    pass
+
+
+class VerificationSecretTamperedError(VerificationSecretError):
+    """Raised when an existing verification key file is corrupted, truncated, or tampered with."""
+    pass
+
+
+def is_ephemeral_mode() -> bool:
+    """Returns True if the runtime is currently using an ephemeral in-memory signing secret."""
+    global _IS_EPHEMERAL
+    return _IS_EPHEMERAL
 
 
 def get_secret_storage_path(config_dir: Optional[str] = None) -> str:
@@ -25,22 +48,86 @@ def get_secret_storage_path(config_dir: Optional[str] = None) -> str:
     return os.path.join(base_dir, "verification.key")
 
 
-def get_verification_secret(config_dir: Optional[str] = None) -> bytes:
+def _lock_down_key_file(filepath: str) -> None:
+    """
+    Enforces strict user-only permissions:
+    - On Windows: Uses icacls to restrict access strictly to the active user (R,W) and strip inheritance.
+    - On POSIX: Uses chmod 0o600 (owner read/write only).
+    Fails closed if permissions cannot be enforced.
+    """
+    if sys.platform == "win32":
+        import subprocess
+        username = os.environ.get("USERNAME")
+        if not username:
+            raise VerificationSecretStorageError(
+                "Security Failure: Unable to determine active USERNAME for Windows key ACL lockdown."
+            )
+        res = subprocess.run(
+            ["icacls", filepath, "/inheritance:r", "/grant:r", f"{username}:(R,W)"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            raise VerificationSecretStorageError(
+                f"Security Failure: icacls failed to lock down key ACLs: {res.stderr.strip()}"
+            )
+    elif hasattr(os, "chmod"):
+        try:
+            os.chmod(filepath, 0o600)
+        except Exception as e:
+            raise VerificationSecretStorageError(
+                f"Security Failure: Failed to set 0o600 permissions on key file: {e}"
+            ) from e
+
+
+def _validate_and_read_key(key_file: str) -> bytes:
+    """Validates symlink absence, file size, permissions, and reads 32 bytes."""
+    if os.path.islink(key_file):
+        raise VerificationSecretStorageError(f"Symlink attack detected at key file: {key_file}")
+    if not os.path.exists(key_file):
+        raise VerificationSecretStorageError(f"Key file does not exist: {key_file}")
+
+    file_size = os.path.getsize(key_file)
+    if file_size != 32:
+        raise VerificationSecretTamperedError(
+            f"Verification key file '{key_file}' is corrupted or invalid size: {file_size} bytes (expected exactly 32 bytes)."
+        )
+
+    _lock_down_key_file(key_file)
+
+    with open(key_file, "rb") as f:
+        content = f.read()
+
+    if len(content) != 32:
+        raise VerificationSecretTamperedError(f"Failed to read 32 bytes from key file '{key_file}'.")
+
+    return content
+
+
+def get_verification_secret(
+    config_dir: Optional[str] = None,
+    allow_ephemeral: bool = False,
+) -> bytes:
     """
     Retrieves or initializes the 256-bit cryptographic verification secret.
 
-    Secret Lifecycle & Trust Model:
+    Secret Lifecycle & Trust Boundary:
     1. Environment Variable: If 'AGENT_VERIFICATION_SECRET' is defined, its value is derived
        (SHA-256 digested if raw string, or parsed if 64-char hex) and used.
-    2. Persistent Storage: Otherwise, loads or generates a 32-byte secret persisted at
+    2. Persistent Storage: Otherwise, loads or atomically generates a 32-byte secret persisted at
        '~/.config/ai_execution_agent/verification.key'.
        - On POSIX, directory is secured to 0o700, and file is secured to 0o600.
+       - On Windows, ACLs are locked down to current USERNAME with inheritance stripped.
        - Symlinks are rejected to prevent symlink hijack attacks.
-       - Atomic rename avoids partial write races during concurrent initialization.
-    3. Ephemeral Fallback: If disk persistence is blocked, gracefully falls back to an
-       ephemeral process-isolated 32-byte token.
+       - Atomic creation (O_CREAT | O_EXCL) prevents concurrency race conditions.
+    3. Fail-Closed by Default: If disk persistence is unavailable, this function FAILS CLOSED
+       (raises VerificationSecretStorageError) to prevent silent fallback to temporary keys.
+    4. Explicit Ephemeral Mode: Temporary keys are only allowed if allow_ephemeral=True or
+       AGENT_ALLOW_EPHEMERAL_SECRET=1, and all records produced in that mode are explicitly
+       labeled with ephemeral=True.
     """
-    global _CACHED_SECRET
+    global _CACHED_SECRET, _IS_EPHEMERAL
     if _CACHED_SECRET is not None:
         return _CACHED_SECRET
 
@@ -50,10 +137,12 @@ def get_verification_secret(config_dir: Optional[str] = None) -> bytes:
         if len(env_secret) == 64:
             try:
                 _CACHED_SECRET = bytes.fromhex(env_secret)
+                _IS_EPHEMERAL = False
                 return _CACHED_SECRET
             except ValueError:
                 pass
         _CACHED_SECRET = hashlib.sha256(env_secret.encode("utf-8")).digest()
+        _IS_EPHEMERAL = False
         return _CACHED_SECRET
 
     # 2. Check persistent key file
@@ -62,63 +151,111 @@ def get_verification_secret(config_dir: Optional[str] = None) -> bytes:
 
     try:
         if os.path.islink(key_dir):
-            raise RuntimeError(f"Symlink detected at key directory: {key_dir}")
-        if os.path.islink(key_file):
-            raise RuntimeError(f"Symlink detected at key file: {key_file}")
+            raise VerificationSecretStorageError(f"Symlink detected at key directory: {key_dir}")
 
         if os.path.exists(key_file):
-            # Check permissions on POSIX
-            if sys.platform != "win32":
-                file_stat = os.stat(key_file)
-                mode = stat.S_IMODE(file_stat.st_mode)
-                if mode & 0o077 != 0:
-                    # Insecure permissions detected; enforce 0o600
-                    os.chmod(key_file, 0o600)
-            with open(key_file, "rb") as f:
-                content = f.read()
-                if len(content) == 32:
-                    _CACHED_SECRET = content
-                    return _CACHED_SECRET
+            _CACHED_SECRET = _validate_and_read_key(key_file)
+            _IS_EPHEMERAL = False
+            return _CACHED_SECRET
 
-        # Generate new 32-byte secret and persist atomically
+        # Atomic key creation under concurrency
         os.makedirs(key_dir, mode=0o700, exist_ok=True)
         new_secret = secrets.token_bytes(32)
 
-        # Write to temp file first with restrictive mode
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=key_dir, prefix=".vkey_")
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
         try:
-            if sys.platform != "win32":
-                os.chmod(tmp_path, 0o600)
-            with os.fdopen(tmp_fd, "wb") as f:
-                f.write(new_secret)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, key_file)
-        finally:
-            if os.path.exists(tmp_path):
+            fd = os.open(key_file, flags, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(new_secret)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception:
+                pass
+            _lock_down_key_file(key_file)
+            _CACHED_SECRET = new_secret
+            _IS_EPHEMERAL = False
+            return _CACHED_SECRET
+        except FileExistsError:
+            # Another process won the race and created it; read the established key with retry backoff
+            for attempt in range(10):
+                time.sleep(0.02)
                 try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+                    secret = _validate_and_read_key(key_file)
+                    _CACHED_SECRET = secret
+                    _IS_EPHEMERAL = False
+                    return secret
+                except (VerificationSecretTamperedError, OSError):
+                    if attempt == 9:
+                        raise
 
-        _CACHED_SECRET = new_secret
-        return _CACHED_SECRET
-    except Exception:
-        # Fallback to ephemeral process-local secret
+    except Exception as e:
+        # Check if explicit ephemeral mode is permitted
+        if allow_ephemeral or os.environ.get("AGENT_ALLOW_EPHEMERAL_SECRET") == "1":
+            _CACHED_SECRET = secrets.token_bytes(32)
+            _IS_EPHEMERAL = True
+            return _CACHED_SECRET
+
+        # Fail closed: never silently generate temporary key
+        if isinstance(e, VerificationSecretError):
+            raise
+        raise VerificationSecretStorageError(
+            f"Failed to securely access or create persistent verification key at '{key_file}': {str(e)}"
+        ) from e
+
+    # Fallback safety guard
+    if allow_ephemeral or os.environ.get("AGENT_ALLOW_EPHEMERAL_SECRET") == "1":
         _CACHED_SECRET = secrets.token_bytes(32)
+        _IS_EPHEMERAL = True
         return _CACHED_SECRET
+    raise VerificationSecretStorageError(f"Persistent verification key unavailable at '{key_file}'.")
 
 
-def set_verification_secret(secret: Optional[bytes]) -> None:
+def rotate_verification_secret(config_dir: Optional[str] = None) -> bytes:
+    """
+    Atomically rotates the persistent verification secret.
+    Invalidates in-memory cached secrets and writes a new 32-byte secret.
+    All historical records signed with the retired key will no longer verify (enforcing revocation).
+    """
+    global _CACHED_SECRET, _IS_EPHEMERAL
+    key_file = get_secret_storage_path(config_dir)
+    key_dir = os.path.dirname(key_file)
+    os.makedirs(key_dir, mode=0o700, exist_ok=True)
+
+    new_secret = secrets.token_bytes(32)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=key_dir, prefix=".vkey_rot_")
+    try:
+        with os.fdopen(tmp_fd, "wb") as f:
+            f.write(new_secret)
+            f.flush()
+            os.fsync(f.fileno())
+        _lock_down_key_file(tmp_path)
+        os.replace(tmp_path, key_file)
+        _lock_down_key_file(key_file)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    _CACHED_SECRET = new_secret
+    _IS_EPHEMERAL = False
+    return new_secret
+
+
+def set_verification_secret(secret: Optional[bytes], is_ephemeral: bool = False) -> None:
     """Sets or clears the cached in-memory verification secret (for testing or lifecycle isolation)."""
-    global _CACHED_SECRET
+    global _CACHED_SECRET, _IS_EPHEMERAL
     _CACHED_SECRET = secret
+    _IS_EPHEMERAL = is_ephemeral
 
 
 def reset_verification_secret() -> None:
     """Resets the cached verification secret to force re-evaluation from environment or persistent file."""
-    global _CACHED_SECRET
+    global _CACHED_SECRET, _IS_EPHEMERAL
     _CACHED_SECRET = None
+    _IS_EPHEMERAL = False
 
 
 class TrustedExecutionRecord(BaseModel):
@@ -130,6 +267,7 @@ class TrustedExecutionRecord(BaseModel):
     passed: int
     failed: int
     skipped: int = 0
+    ephemeral: bool = False
     passed_nodes: List[str]
     failed_nodes: List[str] = Field(default_factory=list)
     skipped_nodes: List[str] = Field(default_factory=list)
@@ -146,18 +284,20 @@ def _canonical_record_payload(
     passed: int,
     failed: int,
     skipped: int,
+    ephemeral: bool,
     passed_nodes: List[str],
     failed_nodes: List[str],
     skipped_nodes: List[str],
     timestamp: float,
 ) -> bytes:
     """
-    Produces deterministic, canonical JSON serialization of all security-relevant fields.
-    Complies with RFC 8785 semantics: keys alphabetically sorted, compact separators, normalized types.
-    Eliminates delimiter collisions and formatting ambiguities.
+    Produces deterministic canonical JSON serialization of all security-relevant fields.
+    Uses alphabetically sorted keys, compact separators (',', ':'), standardized types,
+    and sorted deduplicated node lists to eliminate delimiter collisions and formatting ambiguities.
     """
     canonical_dict = {
         "command": command.strip(),
+        "ephemeral": bool(ephemeral),
         "exit_code": int(exit_code),
         "failed": int(failed),
         "failed_nodes": sorted(set(n.strip().lower() for n in (failed_nodes or []))),
@@ -182,6 +322,7 @@ def _compute_record_digest(
     passed: int,
     failed: int,
     skipped: int,
+    ephemeral: bool,
     passed_nodes: List[str],
     failed_nodes: List[str],
     skipped_nodes: List[str],
@@ -197,6 +338,7 @@ def _compute_record_digest(
         passed=passed,
         failed=failed,
         skipped=skipped,
+        ephemeral=ephemeral,
         passed_nodes=passed_nodes,
         failed_nodes=failed_nodes,
         skipped_nodes=skipped_nodes,
@@ -218,6 +360,7 @@ def issue_trusted_execution_record(
     failed_nodes: Optional[List[str]] = None,
     skipped: int = 0,
     skipped_nodes: Optional[List[str]] = None,
+    ephemeral: Optional[bool] = None,
     secret: Optional[bytes] = None,
 ) -> TrustedExecutionRecord:
     """
@@ -234,6 +377,8 @@ def issue_trusted_execution_record(
     ts = time.time()
     fn = failed_nodes or []
     sn = skipped_nodes or []
+    is_eph = is_ephemeral_mode() if ephemeral is None else bool(ephemeral)
+
     sig = _compute_record_digest(
         run_id=run_id,
         runner=runner,
@@ -243,6 +388,7 @@ def issue_trusted_execution_record(
         passed=passed,
         failed=failed,
         skipped=skipped,
+        ephemeral=is_eph,
         passed_nodes=passed_nodes,
         failed_nodes=fn,
         skipped_nodes=sn,
@@ -258,6 +404,7 @@ def issue_trusted_execution_record(
         passed=passed,
         failed=failed,
         skipped=skipped,
+        ephemeral=is_eph,
         passed_nodes=passed_nodes,
         failed_nodes=fn,
         skipped_nodes=sn,
@@ -300,6 +447,7 @@ def verify_trusted_execution_record(record: Any, secret: Optional[bytes] = None)
         passed=record.passed,
         failed=record.failed,
         skipped=record.skipped,
+        ephemeral=getattr(record, "ephemeral", False),
         passed_nodes=record.passed_nodes,
         failed_nodes=record.failed_nodes,
         skipped_nodes=record.skipped_nodes,

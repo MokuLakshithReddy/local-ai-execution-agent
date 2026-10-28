@@ -75,10 +75,18 @@ BLOCKED_ESCAPE_COMMANDS = {
 
 def validate_sandbox_command(command: str, workspace_path: str, allow_network: bool = False):
     """
-    Enforces OS-level isolation boundaries:
-    1. Blocks external network calls unless allow_network is True.
-    2. Blocks attempts to reference or access filesystem paths outside the authorized workspace.
-    3. Blocks directory traversal / workspace escape commands.
+    Syntactic pre-execution command policy filter.
+
+    SECURITY BOUNDARY NOTICE:
+    This check acts as an early syntactic policy filter to catch common unsafe command tokens,
+    network utility calls, and explicit path traversal arguments prior to execution.
+    It is NOT an OS-enforced isolation boundary on its own; shell aliases, interpreter code
+    (e.g., `python -c`), dynamic imports, and subshells cannot be reliably bounded by text alone.
+    
+    Hard containment is strictly enforced by the execution runtime:
+    - Container mode (Default): Docker kernel namespaces with `--network=none`, `--read-only`,
+      ephemeral tmpfs, non-root user, and restricted workspace bind mount.
+    - Host mode: Windows Job Objects with memory caps, active process limits, and loopback proxy blackholing.
     """
     cmd_lower = command.lower().strip()
     real_ws = os.path.realpath(workspace_path)

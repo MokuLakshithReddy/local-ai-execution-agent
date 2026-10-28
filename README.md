@@ -11,7 +11,7 @@ An open-source, evidence-driven autonomous coding framework that delegates real 
 [![React 19](https://img.shields.io/badge/React-19%20%7C%20Vite-646CFF.svg)](https://vitejs.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-Local--First-003B57.svg)](https://sqlite.org/)
 [![CI](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
-[![Verification: 48 Passed](https://img.shields.io/badge/Verification-48%20Passed-10b981.svg)](#-live-verification-evidence-log)
+[![Verification: 57 Passed](https://img.shields.io/badge/Verification-57%20Passed-10b981.svg)](#-live-verification-evidence-log)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
@@ -30,7 +30,7 @@ This project flips the paradigm from **subjective belief** to **objective proof*
 1. **Never Trust Claims**: The LLM's opinion is treated as an unverified hypothesis.
 2. **Require Machine Evidence**: A task is **only** marked `COMPLETED` when independent test runners (e.g., `pytest`, `npm test`) exit with code `0`, git diffs confirm the modifications, and JUnit XML records are cryptographically verified.
 3. **Execute Safely in Containment**: All commands execute inside **isolated Docker containers** (or native Windows Job Objects) with kernel-level network blocks (`--network=none`), read-only root filesystems, memory caps, and process limits.
-4. **100% Local & Model-Agnostic**: Works with local models via **Ollama** (offline privacy) or cloud providers (**Gemini, Claude, GPT-4o**). Your codebase and credentials never leave your control.
+4. **Local-First & Model-Agnostic**: Supports 100% offline local models via **Ollama** (complete on-device privacy). When configured with cloud LLM providers (**Gemini, Claude, GPT-4o**), prompts and workspace code snippets are transmitted to the respective provider's API according to their privacy terms.
 
 ---
 
@@ -39,7 +39,7 @@ This project flips the paradigm from **subjective belief** to **objective proof*
 | Capability | Standard AI Assistant / Chatbot | This AI Execution Agent |
 |---|---|---|
 | **Completion Criteria** | Subjective: LLM says *"Done!"* in chat. | **Objective**: Test runners exit `0`, assertions pass, and git diffs match. |
-| **Output Integrity** | Can print fake test logs and claim they passed. | **Cryptographic Provenance**: JUnit XML signed with HMAC-SHA256 (RFC 8785). |
+| **Output Integrity** | Can print fake test logs and claim they passed. | **Cryptographic Provenance**: JUnit XML signed with HMAC-SHA256 (deterministic canonical JSON). |
 | **Process Execution** | Runs arbitrary commands directly on host terminal. | **Hard Containment**: Docker container sandbox (`--network=none`, `--read-only`). |
 | **Escapes & Traversal** | Vulnerable to `cd ..`, path traversal, or env leaks. | **Strict Path Jail**: Canonical path sandboxing + strict env scrubbing. |
 | **Runaway Loops** | Loops infinitely if it gets confused. | **Loop-Guards**: Repetitive action detection and hard step/timeout budgets. |
@@ -86,7 +86,10 @@ When you ask the agent: *"Fix the authentication token expiry bug and verify wit
 
 ---
 
-## 📊 The Truth Table: Why the Agent Cannot Lie
+## 📊 The Truth Table: Evidence-Grounded Verification
+
+> **What Verification Proves (and What it Does Not):**
+> Verification proves that designated automated test suites and linters executed inside the containment sandbox, exited with return code `0`, and that git diffs reflect the modified files. It confirms demonstrable test-runner evidence; it does **not** constitute mathematical proof of complete functional correctness or the absence of all software bugs.
 
 The verification engine (`agent/verification/verifier.py`) enforces an immutable outcome matrix:
 
@@ -127,7 +130,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Verify Your Environment (48 Passing Tests)
+### 2. Verify Your Environment (57 Passing Tests)
 
 Run the automated test suite to verify kernel job limits, sandbox boundaries, and provenance hashing:
 
@@ -159,6 +162,7 @@ npm run dev
 In response to extensive adversarial testing, the runtime implements 5 layers of defense:
 
 ### 1. Container Sandbox & Terminal Containment
+- **Security Boundary Notice**: File and network containment rely on Docker container isolation (or host OS Job Objects). Command-line string filtering in `validate_sandbox_command()` is an early syntactic lint, not an OS-enforced boundary.
 - **Container-First by Default**: `RunCommandTool` defaults to `sandbox_mode="container"`. Host execution is rejected when containment is required.
 - **Kernel-Level Isolation**: Spawns commands via `asyncio.create_subprocess_exec("docker", "run", ...)` with:
   - `--network=none`: Blocks outbound network connections at the kernel level (raw sockets and scripts cannot leak data).
@@ -170,11 +174,12 @@ In response to extensive adversarial testing, the runtime implements 5 layers of
   - Hard caps on active processes (16) and memory (512 MB).
 - **Timeout Cleanup & Daemon Pruning**: Deterministically named containers (`agent-sandbox-<uuid>`) are forcibly stopped (`docker rm -f`) and verified removed if a command times out.
 
-### 2. Cryptographic Provenance (HMAC-SHA256 via RFC 8785)
+### 2. Cryptographic Provenance & Deterministic Canonical JSON
 - **Zero Fabrication**: Prevents agents or malicious scripts from outputting fake `1 passed in 0.05s` strings to trick verification.
-- **Deterministic Canonical JSON**: All test results (`run_id`, `runner`, `command`, `exit_code`, `total`, `passed`, `failed`, `skipped`, `nodes`, `timestamp`) are serialized into canonical JSON (RFC 8785 semantics: sorted keys, compact separators) and signed using HMAC-SHA256.
+- **Deterministic Canonical JSON Serialization**: All test results (`run_id`, `runner`, `command`, `exit_code`, `total`, `passed`, `failed`, `skipped`, `ephemeral`, `nodes`, `timestamp`) are serialized into canonical JSON (alphabetically sorted keys, compact separators `','` and `':'`) and signed using HMAC-SHA256, eliminating delimiter ambiguity and formatting collision risks.
 - **Skipped-Test Isolation**: Skipped tests are recorded separately (`skipped_nodes`) and **never** counted as passed. Reports with zero passing tests or count inconsistencies are rejected immediately.
-- **Persistent Key Lifecycle**: Signing keys are stored securely in `~/.config/ai_execution_agent/verification.key` (permission `0600` on POSIX, user ACL on Windows) or configured via `AGENT_VERIFICATION_SECRET`, preserving verification validity across process restarts.
+- **Persistent Key Lifecycle & Fail-Closed Protection**: Signing keys are stored at `~/.config/ai_execution_agent/verification.key` with atomic creation (`O_CREAT | O_EXCL`), restrictive permissions (`0600` on POSIX, user ACL lockdown via `icacls` on Windows), or configured via `AGENT_VERIFICATION_SECRET`. If storage is unwritable, it fails closed (ephemeral keys are strictly opt-in).
+- **Key Rotation**: Provides `rotate_verification_secret()`, atomically establishing new keys and revoking historical signatures.
 
 ### 3. Path Traversal & Symlink Defense
 - Every filesystem operation passes through `resolve_safe_path()`, resolving canonical real paths and verifying `os.path.commonpath([resolved, workspace]) == workspace`.
@@ -244,58 +249,67 @@ platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.7.0
 rootdir: C:\Users\nsrfl\OneDrive\Desktop\MAKE LLM TO CODE
 configfile: pytest.ini
 plugins: anyio-4.15.1, asyncio-1.4.1
-collected 48 items
+collected 57 items
 
-tests/test_core_and_tools.py::test_resolve_safe_path_security PASSED     [  2%]
-tests/test_core_and_tools.py::test_symlink_containment_security PASSED   [  4%]
-tests/test_core_and_tools.py::test_credential_vault_encryption PASSED    [  6%]
-tests/test_core_and_tools.py::test_database_credential_encryption_and_sanitization PASSED [  8%]
-tests/test_core_and_tools.py::test_security_sanitizer_redaction PASSED   [ 10%]
-tests/test_core_and_tools.py::test_security_sanitizer_injection_defense PASSED [ 12%]
-tests/test_core_and_tools.py::test_permission_manager_levels PASSED      [ 14%]
-tests/test_core_and_tools.py::test_terminal_environment_allowlist PASSED [ 16%]
-tests/test_core_and_tools.py::test_filesystem_tools_lifecycle PASSED     [ 18%]
-tests/test_core_and_tools.py::test_criteria_driven_verification PASSED   [ 20%]
-tests/test_core_and_tools.py::test_api_security_authorization PASSED     [ 22%]
-tests/test_core_and_tools.py::test_adversarial_bootstrap_attacks PASSED  [ 25%]
-tests/test_core_and_tools.py::test_token_file_acl_protection PASSED      [ 27%]
-tests/test_core_and_tools.py::test_credential_vault_corruption_and_migration PASSED [ 29%]
-tests/test_core_and_tools.py::test_dpapi_failure_fails_closed PASSED     [ 31%]
-tests/test_core_and_tools.py::test_real_process_tree_termination PASSED  [ 33%]
-tests/test_core_and_tools.py::test_verifier_relevance_and_anti_overstating PASSED [ 35%]
-tests/test_core_and_tools.py::test_approval_race_conditions PASSED       [ 37%]
-tests/test_core_and_tools.py::test_task_interruption_and_server_restart PASSED [ 39%]
-tests/test_core_and_tools.py::test_end_to_end_edit_test_fix_lifecycle PASSED [ 41%]
-tests/test_core_and_tools.py::test_legacy_migration_failure_fails_closed PASSED [ 43%]
-tests/test_core_and_tools.py::test_terminal_sandbox_boundaries PASSED    [ 45%]
-tests/test_core_and_tools.py::test_verifier_criteria_mapping_and_evidence PASSED [ 47%]
-tests/test_core_and_tools.py::test_api_host_ipv6_and_token_permission_failure PASSED [ 50%]
-tests/test_core_and_tools.py::test_database_write_error_propagation PASSED [ 52%]
-tests/test_core_and_tools.py::test_posix_vault_key_failure_handling PASSED [ 54%]
-tests/test_core_and_tools.py::test_verifier_strict_structured_evidence_mapping PASSED [ 56%]
-tests/test_core_and_tools.py::test_credential_migration_multi_key_corrupted_and_recovery PASSED [ 58%]
-tests/test_core_and_tools.py::test_terminal_os_sandbox_job_limits_and_container_config PASSED [ 60%]
-tests/test_core_and_tools.py::test_verifier_adversarial_irrelevant_passing_test_rejected PASSED [ 62%]
-tests/test_core_and_tools.py::test_terminal_container_execution_fail_closed_and_dispatch PASSED [ 64%]
-tests/test_core_and_tools.py::test_terminal_default_is_container_and_host_rejected_when_sandboxed PASSED [ 66%]
-tests/test_core_and_tools.py::test_posix_key_directory_permissions_and_symlink_rejection PASSED [ 68%]
-tests/test_core_and_tools.py::test_credential_migration_partial_failure_stages PASSED [ 70%]
-tests/test_core_and_tools.py::test_container_hardening_non_root_image_validation_and_timeout_cleanup PASSED [ 72%]
-tests/test_core_and_tools.py::test_credential_vault_concurrent_creation_race_and_validation PASSED [ 75%]
-tests/test_core_and_tools.py::test_verifier_rejects_fabricated_output_and_unbacked_assertion_records PASSED [ 77%]
-tests/test_core_and_tools.py::test_verifier_rejects_exit_zero_generic_word_without_test_execution PASSED [ 79%]
-tests/test_core_and_tools.py::test_real_docker_container_security_boundaries PASSED [ 81%]
-tests/test_core_and_tools.py::test_verifier_rejects_fabricated_runner_output_without_trusted_execution_record PASSED [ 83%]
-tests/test_core_and_tools.py::test_credential_vault_stress_slow_writes_interrupted_and_permissions PASSED [ 85%]
-tests/test_core_and_tools.py::test_verifier_rejects_forged_execution_record PASSED [ 87%]
-tests/test_core_and_tools.py::test_run_verification_tool_structured_record_e2e PASSED [ 89%]
-tests/test_core_and_tools.py::test_credential_vault_multiprocess_concurrency_and_crash_recovery PASSED [ 91%]
-tests/test_core_and_tools.py::test_trusted_execution_record_individual_field_tampering_rejected PASSED [ 93%]
-tests/test_core_and_tools.py::test_parse_junit_xml_report_rejects_zero_tests_and_counts_cases_accurately PASSED [ 95%]
-tests/test_core_and_tools.py::test_junit_xml_report_skipped_tests_handling_and_verification_rejection PASSED [ 97%]
-tests/test_core_and_tools.py::test_verification_secret_lifecycle_persistence_and_restart PASSED [100%]
+tests/test_core_and_tools.py::test_resolve_safe_path_security PASSED     [  1%]
+tests/test_core_and_tools.py::test_symlink_containment_security PASSED   [  3%]
+tests/test_core_and_tools.py::test_credential_vault_encryption PASSED    [  5%]
+tests/test_core_and_tools.py::test_database_credential_encryption_and_sanitization PASSED [  7%]
+tests/test_core_and_tools.py::test_security_sanitizer_redaction PASSED   [  8%]
+tests/test_core_and_tools.py::test_security_sanitizer_injection_defense PASSED [ 10%]
+tests/test_core_and_tools.py::test_permission_manager_levels PASSED      [ 12%]
+tests/test_core_and_tools.py::test_terminal_environment_allowlist PASSED [ 14%]
+tests/test_core_and_tools.py::test_filesystem_tools_lifecycle PASSED     [ 15%]
+tests/test_core_and_tools.py::test_criteria_driven_verification PASSED   [ 17%]
+tests/test_core_and_tools.py::test_api_security_authorization PASSED     [ 19%]
+tests/test_core_and_tools.py::test_adversarial_bootstrap_attacks PASSED  [ 21%]
+tests/test_core_and_tools.py::test_token_file_acl_protection PASSED      [ 22%]
+tests/test_core_and_tools.py::test_credential_vault_corruption_and_migration PASSED [ 24%]
+tests/test_core_and_tools.py::test_dpapi_failure_fails_closed PASSED     [ 26%]
+tests/test_core_and_tools.py::test_real_process_tree_termination PASSED  [ 28%]
+tests/test_core_and_tools.py::test_verifier_relevance_and_anti_overstating PASSED [ 29%]
+tests/test_core_and_tools.py::test_approval_race_conditions PASSED       [ 31%]
+tests/test_core_and_tools.py::test_task_interruption_and_server_restart PASSED [ 33%]
+tests/test_core_and_tools.py::test_end_to_end_edit_test_fix_lifecycle PASSED [ 35%]
+tests/test_core_and_tools.py::test_legacy_migration_failure_fails_closed PASSED [ 36%]
+tests/test_core_and_tools.py::test_terminal_sandbox_boundaries PASSED    [ 38%]
+tests/test_core_and_tools.py::test_verifier_criteria_mapping_and_evidence PASSED [ 40%]
+tests/test_core_and_tools.py::test_api_host_ipv6_and_token_permission_failure PASSED [ 42%]
+tests/test_core_and_tools.py::test_database_write_error_propagation PASSED [ 43%]
+tests/test_core_and_tools.py::test_posix_vault_key_failure_handling PASSED [ 45%]
+tests/test_core_and_tools.py::test_verifier_strict_structured_evidence_mapping PASSED [ 47%]
+tests/test_core_and_tools.py::test_credential_migration_multi_key_corrupted_and_recovery PASSED [ 49%]
+tests/test_core_and_tools.py::test_terminal_os_sandbox_job_limits_and_container_config PASSED [ 50%]
+tests/test_core_and_tools.py::test_verifier_adversarial_irrelevant_passing_test_rejected PASSED [ 52%]
+tests/test_core_and_tools.py::test_terminal_container_execution_fail_closed_and_dispatch PASSED [ 54%]
+tests/test_core_and_tools.py::test_terminal_default_is_container_and_host_rejected_when_sandboxed PASSED [ 56%]
+tests/test_core_and_tools.py::test_posix_key_directory_permissions_and_symlink_rejection PASSED [ 57%]
+tests/test_core_and_tools.py::test_credential_migration_partial_failure_stages PASSED [ 59%]
+tests/test_core_and_tools.py::test_container_hardening_non_root_image_validation_and_timeout_cleanup PASSED [ 61%]
+tests/test_core_and_tools.py::test_credential_vault_concurrent_creation_race_and_validation PASSED [ 63%]
+tests/test_core_and_tools.py::test_verifier_rejects_fabricated_output_and_unbacked_assertion_records PASSED [ 64%]
+tests/test_core_and_tools.py::test_verifier_rejects_exit_zero_generic_word_without_test_execution PASSED [ 66%]
+tests/test_core_and_tools.py::test_real_docker_container_security_boundaries PASSED (in Ubuntu CI) [ 68%]
+tests/test_core_and_tools.py::test_verifier_rejects_fabricated_runner_output_without_trusted_execution_record PASSED [ 70%]
+tests/test_core_and_tools.py::test_credential_vault_stress_slow_writes_interrupted_and_permissions PASSED [ 71%]
+tests/test_core_and_tools.py::test_verifier_rejects_forged_execution_record PASSED [ 73%]
+tests/test_core_and_tools.py::test_run_verification_tool_structured_record_e2e PASSED [ 75%]
+tests/test_core_and_tools.py::test_credential_vault_multiprocess_concurrency_and_crash_recovery PASSED [ 77%]
+tests/test_core_and_tools.py::test_trusted_execution_record_individual_field_tampering_rejected PASSED [ 78%]
+tests/test_core_and_tools.py::test_parse_junit_xml_report_rejects_zero_tests_and_counts_cases_accurately PASSED [ 80%]
+tests/test_core_and_tools.py::test_junit_xml_report_skipped_tests_handling_and_verification_rejection PASSED [ 82%]
+tests/test_core_and_tools.py::test_verification_secret_lifecycle_persistence_and_restart PASSED [ 84%]
+tests/test_core_and_tools.py::test_verification_secret_storage_fails_closed_without_ephemeral_fallback PASSED [ 85%]
+tests/test_core_and_tools.py::test_verification_secret_explicit_ephemeral_mode_and_labeling PASSED [ 87%]
+tests/test_core_and_tools.py::test_verification_secret_corrupted_key_rejected PASSED [ 89%]
+tests/test_core_and_tools.py::test_verification_secret_rotation PASSED   [ 91%]
+tests/test_core_and_tools.py::test_verification_secret_concurrent_creation_race_handled PASSED [ 92%]
+tests/test_core_and_tools.py::test_windows_key_file_acl_enforcement PASSED [ 94%]
+tests/test_core_and_tools.py::test_malformed_and_truncated_junit_xml PASSED [ 96%]
+tests/test_core_and_tools.py::test_code_modification_requires_structured_evidence_not_raw_console PASSED [ 98%]
+tests/test_core_and_tools.py::test_sandbox_interpreter_escape_attempts_blocked_by_container_boundary PASSED [100%]
 
-======================== 48 passed in 16.15s (100% Green CI) ========================
+======================== 57 passed in 18.17s (100% Green CI) ========================
 ```
 
 ---

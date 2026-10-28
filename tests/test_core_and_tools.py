@@ -2250,12 +2250,17 @@ def test_trusted_execution_record_individual_field_tampering_rejected():
     t.signature = "a" * 64
     assert verify_trusted_execution_record(t) is False
 
-    # 14. Inconsistent counts (passed + failed + skipped != total)
+    # 14. Modify ephemeral flag
+    t = original.model_copy()
+    t.ephemeral = not original.ephemeral
+    assert verify_trusted_execution_record(t) is False
+
+    # 15. Inconsistent counts (passed + failed + skipped != total)
     t = original.model_copy()
     t.total = 10
     assert verify_trusted_execution_record(t) is False
 
-    # 15. Zero testcases
+    # 16. Zero testcases
     t = original.model_copy()
     t.total = 0
     t.passed = 0
@@ -2531,6 +2536,271 @@ def test_verification_secret_lifecycle_persistence_and_restart():
         finally:
             del os.environ["AGENT_VERIFICATION_SECRET"]
             reset_verification_secret()
+
+
+def test_verification_secret_storage_fails_closed_without_ephemeral_fallback():
+    """Validates Issue 1:
+    If persistent key storage cannot be accessed or created, get_verification_secret
+    fails closed by raising VerificationSecretStorageError. It NEVER silently falls back
+    to an ephemeral key unless explicitly permitted."""
+    from agent.security.provenance import (
+        get_verification_secret,
+        reset_verification_secret,
+        VerificationSecretStorageError,
+    )
+    from unittest.mock import patch
+
+    reset_verification_secret()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Simulate OS filesystem error during key creation
+        with patch("os.open", side_effect=PermissionError("Permission denied")):
+            with pytest.raises(VerificationSecretStorageError, match="Failed to securely access or create"):
+                get_verification_secret(config_dir=temp_dir, allow_ephemeral=False)
+
+
+def test_verification_secret_explicit_ephemeral_mode_and_labeling():
+    """Validates Issue 1 & 5:
+    1. Ephemeral keys are allowed ONLY when explicitly opted into (allow_ephemeral=True or env var).
+    2. Records issued in ephemeral mode are stamped with ephemeral=True.
+    3. Tampering with the ephemeral flag invalidates the cryptographic signature."""
+    from agent.security.provenance import (
+        get_verification_secret,
+        reset_verification_secret,
+        is_ephemeral_mode,
+        issue_trusted_execution_record,
+        verify_trusted_execution_record,
+    )
+    from unittest.mock import patch
+
+    reset_verification_secret()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with patch("os.open", side_effect=PermissionError("Permission denied")):
+            # Explicit allow_ephemeral=True
+            secret = get_verification_secret(config_dir=temp_dir, allow_ephemeral=True)
+            assert len(secret) == 32
+            assert is_ephemeral_mode() is True
+
+            record = issue_trusted_execution_record(
+                run_id="run_eph",
+                runner="pytest",
+                command="pytest",
+                exit_code=0,
+                total=1,
+                passed=1,
+                failed=0,
+                passed_nodes=["test_a"],
+            )
+            assert record.ephemeral is True
+            assert verify_trusted_execution_record(record) is True
+
+            # Tampering with ephemeral flag fails verification
+            tampered = record.model_copy()
+            tampered.ephemeral = False
+            assert verify_trusted_execution_record(tampered) is False
+    reset_verification_secret()
+
+
+def test_verification_secret_corrupted_key_rejected():
+    """Validates Issue 5:
+    An existing key file with invalid length (0 bytes or truncated) is rejected with VerificationSecretTamperedError."""
+    from agent.security.provenance import (
+        get_verification_secret,
+        reset_verification_secret,
+        get_secret_storage_path,
+        VerificationSecretTamperedError,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        reset_verification_secret()
+        key_file = get_secret_storage_path(config_dir=temp_dir)
+        os.makedirs(os.path.dirname(key_file), exist_ok=True)
+
+        # Write corrupted 10-byte key
+        with open(key_file, "wb") as f:
+            f.write(b"too_short!")
+
+        with pytest.raises(VerificationSecretTamperedError, match="corrupted or invalid size"):
+            get_verification_secret(config_dir=temp_dir)
+    reset_verification_secret()
+
+
+def test_verification_secret_rotation():
+    """Validates Issue 5:
+    Rotating the verification secret updates the persistent file atomically.
+    All records signed with the previous key are invalidated and fail verification."""
+    from agent.security.provenance import (
+        get_verification_secret,
+        reset_verification_secret,
+        rotate_verification_secret,
+        issue_trusted_execution_record,
+        verify_trusted_execution_record,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        reset_verification_secret()
+        old_secret = get_verification_secret(config_dir=temp_dir)
+
+        # Issue record with original secret
+        rec = issue_trusted_execution_record(
+            run_id="run_before_rotation",
+            runner="pytest",
+            command="pytest",
+            exit_code=0,
+            total=1,
+            passed=1,
+            failed=0,
+            passed_nodes=["test_1"],
+        )
+        assert verify_trusted_execution_record(rec) is True
+
+        # Rotate key
+        new_secret = rotate_verification_secret(config_dir=temp_dir)
+        assert new_secret != old_secret
+
+        # Old record must now fail verification
+        assert verify_trusted_execution_record(rec) is False
+    reset_verification_secret()
+
+
+def test_verification_secret_concurrent_creation_race_handled():
+    """Validates Issue 5:
+    Simulates a race condition where multiple processes attempt to create the key file.
+    When os.open encounters FileExistsError, it safely reads the key created by the winner."""
+    from agent.security.provenance import (
+        get_verification_secret,
+        reset_verification_secret,
+        get_secret_storage_path,
+    )
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        reset_verification_secret()
+        key_file = get_secret_storage_path(config_dir=temp_dir)
+        os.makedirs(os.path.dirname(key_file), exist_ok=True)
+
+        # Pre-seed valid key that "another process won the race and created"
+        seeded_key = b"B" * 32
+        with open(key_file, "wb") as f:
+            f.write(seeded_key)
+
+        # Simulate FileExistsError on atomic open
+        with patch("os.open", side_effect=FileExistsError("File already exists")):
+            secret = get_verification_secret(config_dir=temp_dir)
+            assert secret == seeded_key
+    reset_verification_secret()
+
+
+def test_windows_key_file_acl_enforcement():
+    """Validates Issue 5:
+    On Windows, _lock_down_key_file invokes icacls to enforce user-only ACLs without errors."""
+    from agent.security.provenance import _lock_down_key_file
+
+    with tempfile.NamedTemporaryFile(delete=False) as tf:
+        tf.write(b"X" * 32)
+        tmp_name = tf.name
+
+    try:
+        # Should succeed without raising VerificationSecretStorageError
+        _lock_down_key_file(tmp_name)
+    finally:
+        if os.path.exists(tmp_name):
+            try:
+                os.remove(tmp_name)
+            except Exception:
+                pass
+
+
+def test_malformed_and_truncated_junit_xml():
+    """Validates Issue 8:
+    Malformed XML, unclosed tags, or truncated XML files safely return None from parse_junit_xml_report."""
+    from agent.tools.verification import parse_junit_xml_report
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        bad_xml = os.path.join(temp_dir, "bad.xml")
+        with open(bad_xml, "w") as f:
+            f.write("<testsuites><testsuite><testcase name='unclosed'")
+        assert parse_junit_xml_report(bad_xml) is None
+
+        empty_xml = os.path.join(temp_dir, "empty.xml")
+        with open(empty_xml, "w") as f:
+            f.write("")
+        assert parse_junit_xml_report(empty_xml) is None
+
+
+def test_code_modification_requires_structured_evidence_not_raw_console():
+    """Validates Issue 3:
+    When require_structured_evidence=True, raw console output matching a test node without a
+    cryptographically signed trusted_execution_record is marked UNVERIFIED_UNSTRUCTURED_EVIDENCE
+    and fails acceptance criteria."""
+    from agent.verification.verifier import VerificationEngine
+    from agent.core.models import VerificationCheck, TaskStatus, TaskType
+
+    engine = VerificationEngine()
+    check = VerificationCheck(
+        check_name="Console Only Check",
+        check_type="test",
+        command="pytest tests/test_auth.py",
+        success=True,
+        exit_code=0,
+        output="tests/test_auth.py::test_login PASSED\n1 passed in 0.05s",
+        evidence_summary="1 passed",
+        # NO trusted_execution_record!
+        trusted_execution_record=None,
+    )
+    engine.record_check(check)
+
+    criteria = ["Secure login endpoint"]
+    bindings = {"Secure login endpoint": "tests/test_auth.py::test_login"}
+
+    # Evaluate with require_structured_evidence=True
+    report = engine.evaluate_completion(
+        task_id="t_structured_req",
+        goal="Harden auth security",
+        actions_taken=["Edited auth.py"],
+        modified_files=["agent/api/auth.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+        criterion_bindings=bindings,
+        require_structured_evidence=True,
+    )
+
+    assert report.acceptance_criteria_satisfied is False
+    assert report.status == TaskStatus.PARTIALLY_COMPLETED
+    ev = report.criteria_evidence[0]
+    assert ev.demonstrated is False
+    assert ev.verification_tier == "UNVERIFIED_UNSTRUCTURED_EVIDENCE"
+    assert "lacks cryptographically signed structured runner evidence" in ev.test_node_or_assertion
+
+
+def test_sandbox_interpreter_escape_attempts_blocked_by_container_boundary():
+    """Validates Issue 4 & 8:
+    Demonstrates that while an interpreter script (python -c) can execute arbitrary internal code
+    that bypasses text keyword matching, the container execution builder centrally enforces
+    --network=none, --read-only, and memory limits, ensuring the genuine boundary is at the container level."""
+    from agent.tools.terminal import build_container_command
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # A command that attempts raw network socket connection and filesystem write via python -c
+        tricky_cmd = "python -c \"import socket, os; s=socket.socket(); open('/root/escape.txt', 'w')\""
+
+        # The container command builder centrally constructs Docker arguments
+        docker_args = build_container_command(
+            command=tricky_cmd,
+            workspace_path=temp_dir,
+            allow_network=False,
+        )
+
+        assert docker_args[0] == "docker"
+        assert docker_args[1] == "run"
+        # Network is blocked at the kernel network namespace level
+        assert "--network=none" in docker_args
+        # Filesystem write outside workspace is blocked by read-only rootfs
+        assert "--read-only" in docker_args
+        # Non-root user is enforced
+        assert any(arg.startswith("--user") for arg in docker_args)
+        # Workspace is the only read-write bind mount
+        assert f"-v{temp_dir}:/workspace:rw" in docker_args or f"-v {temp_dir}:/workspace:rw" in " ".join(docker_args)
+
 
 
 

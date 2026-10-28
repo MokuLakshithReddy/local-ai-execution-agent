@@ -226,6 +226,7 @@ class VerificationEngine:
         unresolved_notes: Optional[List[str]] = None,
         acceptance_criteria: Optional[List[str]] = None,
         criterion_bindings: Optional[Dict[str, str]] = None,
+        require_structured_evidence: bool = False,
     ) -> TaskReport:
         """
         Synthesizes observed evidence into a structured completion report.
@@ -337,9 +338,15 @@ class VerificationEngine:
 
                         if node_matched:
                             matching_check = check
-                            matched_proof = f"Executed test node '{target_test}' passed with exit code 0"
-                            matched_artifact = check.evidence_artifact or (check.command or check.check_name)
-                            verification_tier = "VERIFIED_TARGETED_TEST"
+                            has_structured = bool(check.trusted_execution_record and verify_trusted_execution_record(check.trusted_execution_record))
+                            if require_structured_evidence and not has_structured:
+                                matched_proof = f"Test node '{target_test}' matched console output, but lacks cryptographically signed structured runner evidence (trusted_execution_record)."
+                                matched_artifact = None
+                                verification_tier = "UNVERIFIED_UNSTRUCTURED_EVIDENCE"
+                            else:
+                                matched_proof = f"Executed test node '{target_test}' passed with exit code 0"
+                                matched_artifact = check.evidence_artifact or (check.command or check.check_name)
+                                verification_tier = "VERIFIED_TARGETED_TEST"
                             break
 
                 # Check 2: Structured verification assertion on check model
@@ -382,11 +389,12 @@ class VerificationEngine:
                 # If no explicit binding or structured assertion, retain UNVERIFIED.
                 # Word-overlap or coincidental substring matching in test names is rejected.
                 if matching_check:
+                    is_demonstrated = (verification_tier in ("VERIFIED_STRUCTURED_TEST", "VERIFIED_TARGETED_TEST", "VERIFIED_ASSERTION"))
                     criteria_evidence.append(
                         CriterionEvidence(
                             criterion=criterion,
                             requirement=f"Evidence verified via {matching_check.check_name}",
-                            demonstrated=True,
+                            demonstrated=is_demonstrated,
                             evidence_type="assertion_verified" if verification_tier == "VERIFIED_ASSERTION" else "test_execution",
                             evidence_summary=matching_check.evidence_summary,
                             linked_check=matching_check.command or matching_check.check_name,
@@ -396,6 +404,10 @@ class VerificationEngine:
                             verification_tier=verification_tier,
                         )
                     )
+                    if not is_demonstrated:
+                        skipped_or_failed.append(
+                            f"Unmet Acceptance Criterion: '{criterion}' requires structured runner evidence, but only unstructured console output was available."
+                        )
                 else:
                     best_general = relevant_passed_checks[0] if relevant_passed_checks else None
                     criteria_evidence.append(
