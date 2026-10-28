@@ -496,6 +496,29 @@ class RunCommandTool(BaseTool):
                 execution_time_ms=(time.time() - t0) * 1000,
             )
 
+        # Gate unisolated host mode behind explicit trusted configuration
+        if sandbox_mode == "host" or not require_sandbox:
+            if os.environ.get("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION") != "1":
+                return ActionResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    success=False,
+                    output="",
+                    error=(
+                        "Security Failure: Host execution without sandboxing is strictly disabled. "
+                        "To permit unisolated host process execution, set environment variable "
+                        "AGENT_ALLOW_UNISOLATED_HOST_EXECUTION=1 in trusted environments."
+                    ),
+                    artifacts={
+                        "sandbox_mode": "host",
+                        "sandbox_violation": True,
+                        "require_sandbox": require_sandbox,
+                        "isolated": False,
+                        "security_warning": "UNISOLATED_HOST_EXECUTION_BLOCKED",
+                    },
+                    execution_time_ms=(time.time() - t0) * 1000,
+                )
+
         # 2. Container Sandbox Execution Mode (Default)
         if sandbox_mode == "container":
             import shutil
@@ -632,6 +655,11 @@ class RunCommandTool(BaseTool):
                 )
 
         # 3. Host OS Process Execution Mode (Explicit require_sandbox=False)
+        import logging
+        logging.getLogger("agent.security").warning(
+            "SECURITY WARNING: Executing unisolated command on host system (AGENT_ALLOW_UNISOLATED_HOST_EXECUTION=1). Command: %s",
+            command,
+        )
         try:
             job_sandbox = WindowsJobSandbox(
                 max_active_processes=16,
@@ -715,6 +743,7 @@ class RunCommandTool(BaseTool):
                     "sandbox_mode": "host",
                     "isolated": False,
                     "require_sandbox": False,
+                    "security_warning": "UNISOLATED_HOST_EXECUTION",
                 },
                 execution_time_ms=(time.time() - t0) * 1000,
             )

@@ -226,7 +226,7 @@ class VerificationEngine:
         unresolved_notes: Optional[List[str]] = None,
         acceptance_criteria: Optional[List[str]] = None,
         criterion_bindings: Optional[Dict[str, str]] = None,
-        require_structured_evidence: bool = False,
+        require_structured_evidence: Optional[bool] = None,
     ) -> TaskReport:
         """
         Synthesizes observed evidence into a structured completion report.
@@ -235,6 +235,9 @@ class VerificationEngine:
         Rejects keyword overlap, coincidental word-matching, or fabricated output strings.
         Guarantees that CANCELLED, BLOCKED, or FAILED tasks never report false success.
         """
+        if require_structured_evidence is None:
+            require_structured_evidence = (task_type == TaskType.CODE_MODIFICATION)
+
         # Determine the latest outcome for each verification command/check
         latest_checks = {}
         for c in self.recorded_checks:
@@ -451,16 +454,34 @@ class VerificationEngine:
             ]
             if matching_checks:
                 best = matching_checks[0]
-                criteria_evidence.append(
-                    CriterionEvidence(
-                        criterion=f"Goal requirement: {criterion_name}",
-                        requirement=f"Execute {criterion_name} suite with exit code 0",
-                        demonstrated=True,
-                        evidence_type=ev_type,
-                        evidence_summary=best.evidence_summary,
-                        linked_check=best.command or best.check_name,
+                has_structured = bool(best.trusted_execution_record and verify_trusted_execution_record(best.trusted_execution_record))
+                if require_structured_evidence and ev_type == "test_execution" and not has_structured:
+                    criteria_evidence.append(
+                        CriterionEvidence(
+                            criterion=f"Goal requirement: {criterion_name}",
+                            requirement=f"Execute {criterion_name} suite with structured runner evidence",
+                            demonstrated=False,
+                            evidence_type="unstructured_evidence_rejected",
+                            evidence_summary=f"Check '{best.check_name}' executed, but lacks cryptographically signed structured runner evidence (trusted_execution_record).",
+                            linked_check=best.command or best.check_name,
+                            verification_tier="UNVERIFIED_UNSTRUCTURED_EVIDENCE",
+                        )
                     )
-                )
+                    skipped_or_failed.append(
+                        f"Required criterion '{criterion_name}' requires structured runner evidence, but only unstructured console output was available."
+                    )
+                else:
+                    criteria_evidence.append(
+                        CriterionEvidence(
+                            criterion=f"Goal requirement: {criterion_name}",
+                            requirement=f"Execute {criterion_name} suite with exit code 0",
+                            demonstrated=True,
+                            evidence_type=ev_type,
+                            evidence_summary=best.evidence_summary,
+                            linked_check=best.command or best.check_name,
+                            verification_tier="VERIFIED_STRUCTURED_TEST" if has_structured else "VERIFIED_TARGETED_TEST",
+                        )
+                    )
             else:
                 criteria_evidence.append(
                     CriterionEvidence(
@@ -520,6 +541,16 @@ class VerificationEngine:
                     risks.append(
                         "Irrelevant Verification: Executed checks did not demonstrate relevance to the modified files or task acceptance criteria (trivial/dummy command rejected)."
                     )
+            elif require_structured_evidence and any(
+                ((c.check_type == "test") or any(runner in (c.command or "").lower() for runner in ("pytest", "unittest", "vitest", "jest")))
+                and not bool(c.trusted_execution_record and verify_trusted_execution_record(c.trusted_execution_record))
+                for c in relevant_passed_checks
+            ):
+                final_status = TaskStatus.PARTIALLY_COMPLETED
+                criteria_satisfied = False
+                risks.append(
+                    "Unstructured Test Evidence Rejected: Verification tests lacked cryptographically signed structured runner evidence (trusted_execution_record)."
+                )
             elif any_undemonstrated or skipped_or_failed:
                 final_status = TaskStatus.PARTIALLY_COMPLETED
                 criteria_satisfied = False

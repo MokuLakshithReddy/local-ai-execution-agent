@@ -390,6 +390,9 @@ class ExecutionEngine:
             task_current_status=task.status,
             git_diff_summary=diff_summary,
             unresolved_notes=[task.error] if task.error else [],
+            acceptance_criteria=task.acceptance_criteria,
+            criterion_bindings=task.criterion_bindings,
+            require_structured_evidence=(task_type == TaskType.CODE_MODIFICATION),
         )
 
         task.final_report = final_report

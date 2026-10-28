@@ -171,6 +171,7 @@ async def test_terminal_environment_allowlist():
     """Validates that sensitive host environment variables are excluded from child execution."""
     os.environ["OPENAI_API_KEY"] = "sk-super-secret-host-key"
     os.environ["CUSTOM_HOST_SECRET"] = "host_secret_value"
+    os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
 
     with tempfile.TemporaryDirectory() as temp_dir:
         tool = RunCommandTool()
@@ -240,6 +241,16 @@ def test_criteria_driven_verification():
     assert report2.acceptance_criteria_satisfied is False
 
     # Case 3: Code modification with modified files AND passing tests -> COMPLETED
+    auth_record = issue_trusted_execution_record(
+        run_id="run_auth_case3",
+        runner="pytest",
+        command="pytest tests/test_login.py",
+        exit_code=0,
+        total=3,
+        passed=3,
+        failed=0,
+        passed_nodes=["tests/test_login.py", "login"],
+    )
     ve.record_check(
         VerificationCheck(
             check_name="Auth Tests",
@@ -249,6 +260,7 @@ def test_criteria_driven_verification():
             exit_code=0,
             output="3 passed",
             evidence_summary="Auth Tests exited with code 0.",
+            trusted_execution_record=auth_record,
         )
     )
     report3 = ve.evaluate_completion(
@@ -520,6 +532,16 @@ def test_verifier_relevance_and_anti_overstating():
 
     # 3. Explicitly requested criteria (e.g. linting) skipped -> PARTIALLY_COMPLETED
     ve3 = VerificationEngine()
+    checkout_record = issue_trusted_execution_record(
+        run_id="run_checkout_legit",
+        runner="pytest",
+        command="pytest tests/test_checkout.py",
+        exit_code=0,
+        total=5,
+        passed=5,
+        failed=0,
+        passed_nodes=["tests/test_checkout.py", "checkout"],
+    )
     relevant_test = VerificationCheck(
         check_name="Checkout Tests",
         check_type="test",
@@ -528,6 +550,7 @@ def test_verifier_relevance_and_anti_overstating():
         exit_code=0,
         output="5 passed",
         evidence_summary="Checkout tests passed.",
+        trusted_execution_record=checkout_record,
     )
     ve3.record_check(relevant_test)
     # Goal explicitly requested linting as well
@@ -624,6 +647,7 @@ async def test_task_interruption_and_server_restart():
 @pytest.mark.asyncio
 async def test_end_to_end_edit_test_fix_lifecycle():
     """Validates complete end-to-end edit -> test -> fail -> patch -> pass lifecycle."""
+    os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
     with tempfile.TemporaryDirectory() as ws_dir:
         write_tool = WriteFileTool()
         patch_tool = PatchFileTool()
@@ -690,6 +714,7 @@ async def test_end_to_end_edit_test_fix_lifecycle():
             actions_taken=["Wrote calc.py", "Tested (failed)", "Patched calc.py", "Tested (passed)"],
             modified_files=["calc.py"],
             task_type=TaskType.CODE_MODIFICATION,
+            require_structured_evidence=False,
         )
         assert report.status == TaskStatus.COMPLETED
         assert report.acceptance_criteria_satisfied is True
@@ -800,6 +825,7 @@ def test_verifier_criteria_mapping_and_evidence():
         modified_files=["agent/persistence/db.py", "agent/api/server.py"],
         task_type=TaskType.CODE_MODIFICATION,
         acceptance_criteria=criteria,
+        require_structured_evidence=False,
     )
 
     # Even though all recorded checks passed, requirement 1 was not demonstrated
@@ -835,6 +861,7 @@ def test_verifier_criteria_mapping_and_evidence():
         modified_files=["agent/persistence/db.py", "agent/api/server.py"],
         task_type=TaskType.CODE_MODIFICATION,
         acceptance_criteria=criteria,
+        require_structured_evidence=False,
     )
     assert report_complete.status == TaskStatus.COMPLETED
     assert report_complete.acceptance_criteria_satisfied is True
@@ -999,6 +1026,7 @@ def test_verifier_strict_structured_evidence_mapping():
         modified_files=["agent/persistence/db.py", "agent/api/server.py"],
         task_type=TaskType.CODE_MODIFICATION,
         acceptance_criteria=criteria,
+        require_structured_evidence=False,
     )
 
     # General passing check MUST NOT satisfy specific criteria
@@ -1028,6 +1056,7 @@ def test_verifier_strict_structured_evidence_mapping():
         modified_files=["agent/persistence/db.py", "agent/api/server.py"],
         task_type=TaskType.CODE_MODIFICATION,
         acceptance_criteria=criteria,
+        require_structured_evidence=False,
     )
     # API auth is demonstrated via VERIFIED_TARGETED_TEST, while migration is still UNVERIFIED
     ce_auth = next(ce for ce in report2.criteria_evidence if "401" in ce.criterion)
@@ -1161,6 +1190,7 @@ def test_verifier_adversarial_irrelevant_passing_test_rejected():
         modified_files=["agent/api/server.py"],
         task_type=TaskType.CODE_MODIFICATION,
         acceptance_criteria=criteria,
+        require_structured_evidence=False,
     )
 
     # Must remain UNVERIFIED because there is no explicit binding to this criterion
@@ -1199,6 +1229,7 @@ def test_verifier_adversarial_irrelevant_passing_test_rejected():
         modified_files=["agent/api/server.py"],
         task_type=TaskType.CODE_MODIFICATION,
         acceptance_criteria=criteria,
+        require_structured_evidence=False,
     )
     assert report2.status == TaskStatus.COMPLETED
     assert report2.acceptance_criteria_satisfied is True
@@ -1293,18 +1324,36 @@ async def test_terminal_default_is_container_and_host_rejected_when_sandboxed():
         assert "require_sandbox=True requires an OS-enforced container sandbox" in host_reject_res.error
         assert host_reject_res.artifacts.get("isolated") is False
 
-        # 3. Host mode with require_sandbox=False runs but records isolated=False
-        host_perm_res = await tool.execute(
+        # 3a. Host mode with require_sandbox=False WITHOUT trusted env flag is strictly REJECTED
+        os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
+        host_untrusted_res = await tool.execute(
             temp_dir,
             command=f'"{sys.executable}" -c "print(\'HOST_OK\')"',
             sandbox_mode="host",
             require_sandbox=False,
         )
-        assert host_perm_res.success is True
-        assert "HOST_OK" in host_perm_res.output
-        assert host_perm_res.artifacts.get("sandbox_mode") == "host"
-        assert host_perm_res.artifacts.get("isolated") is False
-        assert host_perm_res.artifacts.get("require_sandbox") is False
+        assert host_untrusted_res.success is False
+        assert "Host execution without sandboxing is strictly disabled" in host_untrusted_res.error
+        assert host_untrusted_res.artifacts.get("security_warning") == "UNISOLATED_HOST_EXECUTION_BLOCKED"
+        assert host_untrusted_res.artifacts.get("sandbox_violation") is True
+
+        # 3b. Host mode with require_sandbox=False WITH trusted env flag runs but records isolated=False and security_warning
+        os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
+        try:
+            host_perm_res = await tool.execute(
+                temp_dir,
+                command=f'"{sys.executable}" -c "print(\'HOST_OK\')"',
+                sandbox_mode="host",
+                require_sandbox=False,
+            )
+            assert host_perm_res.success is True
+            assert "HOST_OK" in host_perm_res.output
+            assert host_perm_res.artifacts.get("sandbox_mode") == "host"
+            assert host_perm_res.artifacts.get("isolated") is False
+            assert host_perm_res.artifacts.get("require_sandbox") is False
+            assert host_perm_res.artifacts.get("security_warning") == "UNISOLATED_HOST_EXECUTION"
+        finally:
+            os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
 
         # 4. WindowsJobSandbox on non-Windows platforms fails closed when strict, and returns False (never True)
         with patch("sys.platform", "linux"):
@@ -1632,6 +1681,7 @@ def test_verifier_rejects_fabricated_output_and_unbacked_assertion_records():
         modified_files=["agent/api/server.py"],
         task_type=TaskType.CODE_MODIFICATION,
         acceptance_criteria=criteria,
+        require_structured_evidence=False,
     )
     assert rep1.status == TaskStatus.PARTIALLY_COMPLETED
     assert rep1.acceptance_criteria_satisfied is False
@@ -1666,6 +1716,7 @@ def test_verifier_rejects_fabricated_output_and_unbacked_assertion_records():
         modified_files=["agent/api/server.py"],
         task_type=TaskType.CODE_MODIFICATION,
         acceptance_criteria=criteria,
+        require_structured_evidence=False,
     )
     # Must be rejected because test_auth_security was NOT an executed test node in output
     assert rep2.status == TaskStatus.PARTIALLY_COMPLETED
@@ -1701,6 +1752,7 @@ def test_verifier_rejects_fabricated_output_and_unbacked_assertion_records():
         modified_files=["agent/api/server.py"],
         task_type=TaskType.CODE_MODIFICATION,
         acceptance_criteria=criteria,
+        require_structured_evidence=False,
     )
     assert rep3.status == TaskStatus.COMPLETED
     assert rep3.acceptance_criteria_satisfied is True
@@ -1734,6 +1786,7 @@ def test_verifier_rejects_exit_zero_generic_word_without_test_execution():
         modified_files=["agent/api/server.py"],
         task_type=TaskType.CODE_MODIFICATION,
         acceptance_criteria=criteria,
+        require_structured_evidence=False,
     )
 
     # Must remain strictly UNVERIFIED because no test runner node was parsed/executed
@@ -1784,6 +1837,16 @@ async def test_real_docker_container_security_boundaries():
         )
         assert esc_res.success is False
         assert "Read-only file system" in esc_res.output or "Read-only file system" in str(esc_res.error) or "OSError" in str(esc_res.error) or "Permission denied" in esc_res.output
+
+        # Also verify write denial to /root/escape.txt
+        esc_res2 = await tool.execute(
+            call_id="c_real_fs_root",
+            workspace_path=temp_dir,
+            command='python3 -c "open(\'/root/escape.txt\', \'w\').write(\'test\')"',
+            sandbox_mode="container",
+        )
+        assert esc_res2.success is False
+        assert "Read-only file system" in esc_res2.output or "Read-only file system" in str(esc_res2.error) or "OSError" in str(esc_res2.error) or "Permission denied" in esc_res2.output
 
         # Verify writing inside workspace is permitted
         ws_res = await tool.execute(
@@ -1868,6 +1931,7 @@ def test_verifier_rejects_fabricated_runner_output_without_trusted_execution_rec
         modified_files=["agent/api/server.py"],
         task_type=TaskType.CODE_MODIFICATION,
         acceptance_criteria=criteria,
+        require_structured_evidence=False,
     )
 
     # Must remain UNVERIFIED and PARTIALLY_COMPLETED
@@ -2004,6 +2068,7 @@ def test_verifier_rejects_forged_execution_record():
         modified_files=["agent/api/auth.py"],
         task_type=TaskType.CODE_MODIFICATION,
         acceptance_criteria=criteria,
+        require_structured_evidence=False,
     )
     assert rep1.status == TaskStatus.PARTIALLY_COMPLETED
     assert rep1.acceptance_criteria_satisfied is False
@@ -2048,7 +2113,7 @@ def test_verifier_rejects_forged_execution_record():
     assert rep2.status == TaskStatus.COMPLETED
     assert rep2.acceptance_criteria_satisfied is True
     assert rep2.criteria_evidence[0].demonstrated is True
-    assert rep2.criteria_evidence[0].verification_tier == "VERIFIED_TARGETED_TEST"
+    assert rep2.criteria_evidence[0].verification_tier in ("VERIFIED_STRUCTURED_TEST", "VERIFIED_TARGETED_TEST")
 
 
 @pytest.mark.asyncio
@@ -2060,6 +2125,7 @@ async def test_run_verification_tool_structured_record_e2e():
     from agent.tools.verification import RunVerificationCheckTool
 
     tool = RunVerificationCheckTool()
+    os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
         # Create a sample test file inside the workspace
@@ -2802,6 +2868,290 @@ def test_sandbox_interpreter_escape_attempts_blocked_by_container_boundary():
         real_ws = os.path.realpath(temp_dir)
         assert "-v" in docker_args
         assert any(arg.endswith(":/workspace:rw") and (real_ws.lower() in arg.lower() or os.path.basename(temp_dir).lower() in arg.lower()) for arg in docker_args)
+
+
+@pytest.mark.asyncio
+async def test_execution_engine_e2e_enforces_structured_evidence_for_code_modifications():
+    """Validates Issue 1:
+    The ExecutionEngine E2E workflow enforces structured evidence by default for CODE_MODIFICATION tasks.
+    If a verification check passes with console output but without a cryptographically signed
+    TrustedExecutionRecord, the task status is PARTIALLY_COMPLETED and acceptance_criteria_satisfied is False.
+    Once a genuine TrustedExecutionRecord is supplied, the engine completes the task successfully."""
+    from agent.core.engine import ExecutionEngine
+    from agent.core.models import Task, TaskType, TaskStatus
+    from agent.persistence.db import Database
+    from agent.tools.registry import ToolRegistry
+    from agent.tools.base import BaseTool
+    from agent.core.models import ActionResult
+    from agent.security.provenance import issue_trusted_execution_record
+    from unittest.mock import patch, MagicMock, AsyncMock
+    from agent.providers.base import ProviderResponse, LLMToolCall
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db = Database(db_path=os.path.join(temp_dir, "test.db"))
+        await db.init()
+
+        # Task 1: Runs code modification with unverified / unstructured test output
+        task1 = Task(
+            id="task_e2e_unstructured",
+            goal="Implement auth tokens in auth.py",
+            workspace_path=temp_dir,
+            model_provider="openai",
+            model_name="gpt-4o",
+            task_type=TaskType.CODE_MODIFICATION,
+            acceptance_criteria=["Token verification endpoint"],
+            criterion_bindings={"Token verification endpoint": "tests/test_auth.py::test_tokens"},
+        )
+
+        mock_adapter1 = MagicMock()
+        mock_adapter1.chat_completion = AsyncMock(side_effect=[
+            ProviderResponse(
+                content="Writing file and running test",
+                tool_calls=[
+                    LLMToolCall(id="tc1", name="write_file", arguments={"file_path": "auth.py", "content": "def tokens(): return True"}),
+                    LLMToolCall(id="tc2", name="run_verification", arguments={"check_name": "Pytest Auth", "command": "pytest tests/test_auth.py"}),
+                ]
+            ),
+            ProviderResponse(content="Finished task", tool_calls=[]),
+        ])
+
+        # Custom mock tool to simulate a verification command that prints passed without structured evidence
+        class MockUnstructuredVerificationTool(BaseTool):
+            name = "run_verification"
+            description = "Mock verification tool"
+            permission_level = PermissionLevel.READ_ONLY
+            def get_parameters_schema(self):
+                return {"type": "object"}
+            async def execute(self, workspace_path: str, **kwargs):
+                return ActionResult(
+                    call_id=kwargs.get("call_id", "tc"),
+                    tool_name=self.name,
+                    success=True,
+                    output="tests/test_auth.py::test_tokens PASSED\n1 passed in 0.05s",
+                    artifacts={
+                        "passed": True,
+                        "exit_code": 0,
+                        "check_name": kwargs.get("check_name", "Auth Test"),
+                        "command": kwargs.get("command", "pytest tests/test_auth.py"),
+                        "trusted_execution_record": None,  # Lacks structured evidence
+                    }
+                )
+
+        registry_unstructured = ToolRegistry()
+        registry_unstructured.register(MockUnstructuredVerificationTool())
+
+        with patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter1):
+            engine1 = ExecutionEngine(db=db, tool_registry=registry_unstructured)
+            completed_task1 = await engine1.run_task(task1, api_key="sk-test-key")
+
+        # Must fail completion and criteria satisfaction due to lack of structured evidence
+        assert completed_task1.status == TaskStatus.PARTIALLY_COMPLETED
+        assert completed_task1.final_report.acceptance_criteria_satisfied is False
+        assert any(ce.verification_tier == "UNVERIFIED_UNSTRUCTURED_EVIDENCE" for ce in completed_task1.final_report.criteria_evidence)
+
+        # Task 2: Runs code modification with authentic cryptographically signed TrustedExecutionRecord
+        task2 = Task(
+            id="task_e2e_structured",
+            goal="Implement auth tokens in auth.py",
+            workspace_path=temp_dir,
+            model_provider="openai",
+            model_name="gpt-4o",
+            task_type=TaskType.CODE_MODIFICATION,
+            acceptance_criteria=["Token verification endpoint"],
+            criterion_bindings={"Token verification endpoint": "tests/test_auth.py::test_tokens"},
+        )
+
+        genuine_record = issue_trusted_execution_record(
+            run_id="run_auth_e2e_genuine",
+            runner="pytest",
+            command="pytest tests/test_auth.py",
+            exit_code=0,
+            total=1,
+            passed=1,
+            failed=0,
+            passed_nodes=["tests/test_auth.py::test_tokens", "test_tokens"],
+        )
+
+        class MockStructuredVerificationTool(BaseTool):
+            name = "run_verification"
+            description = "Mock structured verification tool"
+            permission_level = PermissionLevel.READ_ONLY
+            def get_parameters_schema(self):
+                return {"type": "object"}
+            async def execute(self, workspace_path: str, **kwargs):
+                return ActionResult(
+                    call_id=kwargs.get("call_id", "tc"),
+                    tool_name=self.name,
+                    success=True,
+                    output="tests/test_auth.py::test_tokens PASSED\n1 passed in 0.05s",
+                    artifacts={
+                        "passed": True,
+                        "exit_code": 0,
+                        "check_name": kwargs.get("check_name", "Auth Test"),
+                        "command": kwargs.get("command", "pytest tests/test_auth.py"),
+                        "trusted_execution_record": genuine_record.model_dump(),  # Genuine signed evidence
+                    }
+                )
+
+        registry_structured = ToolRegistry()
+        registry_structured.register(MockStructuredVerificationTool())
+
+        mock_adapter2 = MagicMock()
+        mock_adapter2.chat_completion = AsyncMock(side_effect=[
+            ProviderResponse(
+                content="Writing file and running genuine test",
+                tool_calls=[
+                    LLMToolCall(id="tc3", name="write_file", arguments={"file_path": "auth.py", "content": "def tokens(): return True"}),
+                    LLMToolCall(id="tc4", name="run_verification", arguments={"check_name": "Pytest Auth", "command": "pytest tests/test_auth.py"}),
+                ]
+            ),
+            ProviderResponse(content="Finished task", tool_calls=[]),
+        ])
+
+        with patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter2):
+            engine2 = ExecutionEngine(db=db, tool_registry=registry_structured)
+            completed_task2 = await engine2.run_task(task2, api_key="sk-test-key")
+
+        # Successfully verified and completed!
+        assert completed_task2.status == TaskStatus.COMPLETED
+        assert completed_task2.final_report.acceptance_criteria_satisfied is True
+        assert any(ce.demonstrated is True for ce in completed_task2.final_report.criteria_evidence)
+
+
+def test_verification_secret_write_failure_raises_immediately():
+    """Validates Issue 2:
+    In get_verification_secret(), if writing or flushing to the key file fails (e.g. disk/IO error),
+    VerificationSecretStorageError is raised immediately, no corrupted file remains, and no in-memory
+    key is silently returned."""
+    from unittest.mock import patch
+    from agent.security.provenance import (
+        get_verification_secret,
+        reset_verification_secret,
+        VerificationSecretStorageError,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        reset_verification_secret(temp_dir)
+        key_dir = os.path.join(temp_dir, "keys")
+
+        with patch("os.fsync", side_effect=IOError("Simulated disk write failure on fsync")):
+            with pytest.raises(VerificationSecretStorageError, match="Failed to write verification secret"):
+                get_verification_secret(config_dir=key_dir, allow_ephemeral=False)
+
+        # Confirm no corrupted key file remains
+        key_file = os.path.join(key_dir, "verification.key")
+        assert not os.path.exists(key_file)
+
+
+@pytest.mark.asyncio
+async def test_unisolated_host_mode_gated_by_env_var():
+    """Validates Issue 3:
+    Unhosted/unisolated execution (sandbox_mode='host' or require_sandbox=False) is strictly gated
+    behind AGENT_ALLOW_UNISOLATED_HOST_EXECUTION=1. Silent downgrades are rejected with
+    sandbox_violation=True and security_warning='UNISOLATED_HOST_EXECUTION_BLOCKED'.
+    When explicitly permitted, security_warning='UNISOLATED_HOST_EXECUTION' is recorded."""
+    from agent.tools.terminal import RunCommandTool
+
+    tool = RunCommandTool()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Case 1: Unset env var -> rejected
+        os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
+        res_blocked = await tool.execute(
+            temp_dir,
+            command=f'"{sys.executable}" -c "print(\'HOST\')"',
+            sandbox_mode="host",
+            require_sandbox=False,
+        )
+        assert res_blocked.success is False
+        assert "Host execution without sandboxing is strictly disabled" in res_blocked.error
+        assert res_blocked.artifacts.get("security_warning") == "UNISOLATED_HOST_EXECUTION_BLOCKED"
+        assert res_blocked.artifacts.get("sandbox_violation") is True
+        assert res_blocked.artifacts.get("isolated") is False
+
+        # Case 2: Env var set to '0' -> still rejected
+        os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "0"
+        res_blocked_zero = await tool.execute(
+            temp_dir,
+            command=f'"{sys.executable}" -c "print(\'HOST\')"',
+            sandbox_mode="host",
+            require_sandbox=False,
+        )
+        assert res_blocked_zero.success is False
+        assert "Host execution without sandboxing is strictly disabled" in res_blocked_zero.error
+
+        # Case 3: Env var set to '1' -> permitted with audit warning
+        os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
+        try:
+            res_allowed = await tool.execute(
+                temp_dir,
+                command=f'"{sys.executable}" -c "print(\'HOST\')"',
+                sandbox_mode="host",
+                require_sandbox=False,
+            )
+            assert res_allowed.success is True
+            assert "HOST" in res_allowed.output
+            assert res_allowed.artifacts.get("security_warning") == "UNISOLATED_HOST_EXECUTION"
+            assert res_allowed.artifacts.get("isolated") is False
+        finally:
+            os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
+
+
+def test_verification_secret_multi_config_dir_scoping():
+    """Validates Issue 4:
+    Verification secrets and caches are scoped per canonical config directory.
+    Accessing dir_a and dir_b maintains independent secrets, and rotating in dir_a
+    does not affect the persistent secret or cache of dir_b."""
+    from agent.security.provenance import (
+        get_verification_secret,
+        rotate_verification_secret,
+        reset_verification_secret,
+        issue_trusted_execution_record,
+        verify_trusted_execution_record,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        dir_a = os.path.join(temp_dir, "config_a")
+        dir_b = os.path.join(temp_dir, "config_b")
+        reset_verification_secret()
+
+        # Generate secrets for both directories
+        secret_a1 = get_verification_secret(config_dir=dir_a)
+        secret_b1 = get_verification_secret(config_dir=dir_b)
+
+        assert len(secret_a1) == 32
+        assert len(secret_b1) == 32
+        assert secret_a1 != secret_b1
+
+        # Re-fetching returns cached secrets per directory
+        assert get_verification_secret(config_dir=dir_a) == secret_a1
+        assert get_verification_secret(config_dir=dir_b) == secret_b1
+
+        # Issue record using secret_a
+        rec_a = issue_trusted_execution_record(
+            run_id="run_a",
+            runner="pytest",
+            command="pytest tests/",
+            exit_code=0,
+            total=1,
+            passed=1,
+            failed=0,
+            passed_nodes=["test_a"],
+            secret=secret_a1,
+        )
+        assert verify_trusted_execution_record(rec_a, secret=secret_a1) is True
+        assert verify_trusted_execution_record(rec_a, secret=secret_b1) is False
+
+        # Rotate secret in dir_a
+        secret_a2 = rotate_verification_secret(config_dir=dir_a)
+        assert secret_a2 != secret_a1
+        assert get_verification_secret(config_dir=dir_a) == secret_a2
+
+        # dir_b secret is unaffected by dir_a rotation
+        assert get_verification_secret(config_dir=dir_b) == secret_b1
+
+        # Old record issued under secret_a1 no longer verifies under rotated secret_a2
+        assert verify_trusted_execution_record(rec_a, secret=secret_a2) is False
+
 
 
 

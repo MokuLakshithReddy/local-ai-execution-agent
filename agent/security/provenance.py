@@ -17,6 +17,9 @@ import time
 from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
+_CACHED_SECRETS: Dict[str, bytes] = {}
+_IS_EPHEMERAL_MAP: Dict[str, bool] = {}
+_ACTIVE_CONFIG_DIR: Optional[str] = None
 _CACHED_SECRET: Optional[bytes] = None
 _IS_EPHEMERAL: bool = False
 
@@ -36,9 +39,17 @@ class VerificationSecretTamperedError(VerificationSecretError):
     pass
 
 
-def is_ephemeral_mode() -> bool:
+def _get_canonical_config_key(config_dir: Optional[str] = None) -> str:
+    path = config_dir or os.path.expanduser("~/.config/ai_execution_agent")
+    return os.path.realpath(os.path.abspath(path))
+
+
+def is_ephemeral_mode(config_dir: Optional[str] = None) -> bool:
     """Returns True if the runtime is currently using an ephemeral in-memory signing secret."""
     global _IS_EPHEMERAL
+    if config_dir:
+        canonical_key = _get_canonical_config_key(config_dir)
+        return _IS_EPHEMERAL_MAP.get(canonical_key, _IS_EPHEMERAL)
     return _IS_EPHEMERAL
 
 
@@ -126,27 +137,43 @@ def get_verification_secret(
     4. Explicit Ephemeral Mode: Temporary keys are only allowed if allow_ephemeral=True or
        AGENT_ALLOW_EPHEMERAL_SECRET=1, and all records produced in that mode are explicitly
        labeled with ephemeral=True.
+    5. Config Directory Scoping: Secrets are scoped and cached per canonical config directory.
     """
-    global _CACHED_SECRET, _IS_EPHEMERAL
-    if _CACHED_SECRET is not None:
-        return _CACHED_SECRET
+    global _CACHED_SECRET, _IS_EPHEMERAL, _ACTIVE_CONFIG_DIR
+    target_dir = config_dir if config_dir is not None else _ACTIVE_CONFIG_DIR
+    canonical_key = _get_canonical_config_key(target_dir)
+    if config_dir is not None:
+        _ACTIVE_CONFIG_DIR = config_dir
 
     # 1. Check environment variable override
     env_secret = os.environ.get("AGENT_VERIFICATION_SECRET")
     if env_secret:
         if len(env_secret) == 64:
             try:
-                _CACHED_SECRET = bytes.fromhex(env_secret)
+                secret = bytes.fromhex(env_secret)
+                _CACHED_SECRETS[canonical_key] = secret
+                _IS_EPHEMERAL_MAP[canonical_key] = False
+                _CACHED_SECRET = secret
                 _IS_EPHEMERAL = False
-                return _CACHED_SECRET
+                return secret
             except ValueError:
                 pass
-        _CACHED_SECRET = hashlib.sha256(env_secret.encode("utf-8")).digest()
+        secret = hashlib.sha256(env_secret.encode("utf-8")).digest()
+        _CACHED_SECRETS[canonical_key] = secret
+        _IS_EPHEMERAL_MAP[canonical_key] = False
+        _CACHED_SECRET = secret
         _IS_EPHEMERAL = False
-        return _CACHED_SECRET
+        return secret
 
-    # 2. Check persistent key file
-    key_file = get_secret_storage_path(config_dir)
+    # 2. Check cached secret for this canonical configuration directory
+    if canonical_key in _CACHED_SECRETS:
+        secret = _CACHED_SECRETS[canonical_key]
+        _CACHED_SECRET = secret
+        _IS_EPHEMERAL = _IS_EPHEMERAL_MAP.get(canonical_key, False)
+        return secret
+
+    # 3. Check persistent key file
+    key_file = get_secret_storage_path(target_dir)
     key_dir = os.path.dirname(key_file)
 
     try:
@@ -154,9 +181,12 @@ def get_verification_secret(
             raise VerificationSecretStorageError(f"Symlink detected at key directory: {key_dir}")
 
         if os.path.exists(key_file):
-            _CACHED_SECRET = _validate_and_read_key(key_file)
+            secret = _validate_and_read_key(key_file)
+            _CACHED_SECRETS[canonical_key] = secret
+            _IS_EPHEMERAL_MAP[canonical_key] = False
+            _CACHED_SECRET = secret
             _IS_EPHEMERAL = False
-            return _CACHED_SECRET
+            return secret
 
         # Atomic key creation under concurrency
         os.makedirs(key_dir, mode=0o700, exist_ok=True)
@@ -170,18 +200,54 @@ def get_verification_secret(
                     f.write(new_secret)
                     f.flush()
                     os.fsync(f.fileno())
-            except Exception:
-                pass
+            except Exception as write_err:
+                if os.path.exists(key_file):
+                    try:
+                        os.remove(key_file)
+                    except Exception:
+                        pass
+                raise VerificationSecretStorageError(
+                    f"Failed to write verification secret to '{key_file}': {write_err}"
+                ) from write_err
+
+            # Validate that the file was written completely and matches exactly 32 bytes
+            if not os.path.exists(key_file) or os.path.getsize(key_file) != 32:
+                if os.path.exists(key_file):
+                    try:
+                        os.remove(key_file)
+                    except Exception:
+                        pass
+                raise VerificationSecretStorageError(
+                    f"Verification key file '{key_file}' creation verification failed (invalid size)."
+                )
+
+            with open(key_file, "rb") as f:
+                persisted = f.read()
+            if persisted != new_secret:
+                if os.path.exists(key_file):
+                    try:
+                        os.remove(key_file)
+                    except Exception:
+                        pass
+                raise VerificationSecretStorageError(
+                    f"Persisted verification key at '{key_file}' does not match written secret."
+                )
+
             _lock_down_key_file(key_file)
+            _CACHED_SECRETS[canonical_key] = new_secret
+            _IS_EPHEMERAL_MAP[canonical_key] = False
             _CACHED_SECRET = new_secret
             _IS_EPHEMERAL = False
-            return _CACHED_SECRET
+            return new_secret
+
         except FileExistsError:
             # Another process won the race and created it; read the established key with retry backoff
             for attempt in range(10):
                 time.sleep(0.02)
                 try:
                     secret = _validate_and_read_key(key_file)
+                    _CACHED_SECRETS[canonical_key] = secret
+                    _IS_EPHEMERAL_MAP[canonical_key] = False
                     _CACHED_SECRET = secret
                     _IS_EPHEMERAL = False
                     return secret
@@ -192,9 +258,12 @@ def get_verification_secret(
     except Exception as e:
         # Check if explicit ephemeral mode is permitted
         if allow_ephemeral or os.environ.get("AGENT_ALLOW_EPHEMERAL_SECRET") == "1":
-            _CACHED_SECRET = secrets.token_bytes(32)
+            ephemeral_secret = secrets.token_bytes(32)
+            _CACHED_SECRETS[canonical_key] = ephemeral_secret
+            _IS_EPHEMERAL_MAP[canonical_key] = True
+            _CACHED_SECRET = ephemeral_secret
             _IS_EPHEMERAL = True
-            return _CACHED_SECRET
+            return ephemeral_secret
 
         # Fail closed: never silently generate temporary key
         if isinstance(e, VerificationSecretError):
@@ -205,20 +274,26 @@ def get_verification_secret(
 
     # Fallback safety guard
     if allow_ephemeral or os.environ.get("AGENT_ALLOW_EPHEMERAL_SECRET") == "1":
-        _CACHED_SECRET = secrets.token_bytes(32)
+        ephemeral_secret = secrets.token_bytes(32)
+        _CACHED_SECRETS[canonical_key] = ephemeral_secret
+        _IS_EPHEMERAL_MAP[canonical_key] = True
+        _CACHED_SECRET = ephemeral_secret
         _IS_EPHEMERAL = True
-        return _CACHED_SECRET
+        return ephemeral_secret
+
     raise VerificationSecretStorageError(f"Persistent verification key unavailable at '{key_file}'.")
 
 
 def rotate_verification_secret(config_dir: Optional[str] = None) -> bytes:
     """
     Atomically rotates the persistent verification secret.
-    Invalidates in-memory cached secrets and writes a new 32-byte secret.
+    Invalidates in-memory cached secrets for this configuration directory and writes a new 32-byte secret.
     All historical records signed with the retired key will no longer verify (enforcing revocation).
     """
-    global _CACHED_SECRET, _IS_EPHEMERAL
-    key_file = get_secret_storage_path(config_dir)
+    global _CACHED_SECRET, _IS_EPHEMERAL, _ACTIVE_CONFIG_DIR
+    target_dir = config_dir if config_dir is not None else _ACTIVE_CONFIG_DIR
+    canonical_key = _get_canonical_config_key(target_dir)
+    key_file = get_secret_storage_path(target_dir)
     key_dir = os.path.dirname(key_file)
     os.makedirs(key_dir, mode=0o700, exist_ok=True)
 
@@ -239,21 +314,47 @@ def rotate_verification_secret(config_dir: Optional[str] = None) -> bytes:
             except Exception:
                 pass
 
+    _CACHED_SECRETS[canonical_key] = new_secret
+    _IS_EPHEMERAL_MAP[canonical_key] = False
     _CACHED_SECRET = new_secret
     _IS_EPHEMERAL = False
+    _ACTIVE_CONFIG_DIR = target_dir
     return new_secret
 
 
-def set_verification_secret(secret: Optional[bytes], is_ephemeral: bool = False) -> None:
+def set_verification_secret(
+    secret: Optional[bytes],
+    is_ephemeral: bool = False,
+    config_dir: Optional[str] = None,
+) -> None:
     """Sets or clears the cached in-memory verification secret (for testing or lifecycle isolation)."""
-    global _CACHED_SECRET, _IS_EPHEMERAL
-    _CACHED_SECRET = secret
-    _IS_EPHEMERAL = is_ephemeral
+    global _CACHED_SECRET, _IS_EPHEMERAL, _ACTIVE_CONFIG_DIR
+    target_dir = config_dir if config_dir is not None else _ACTIVE_CONFIG_DIR
+    canonical_key = _get_canonical_config_key(target_dir)
+    if secret is None:
+        reset_verification_secret(config_dir)
+    else:
+        _CACHED_SECRETS[canonical_key] = secret
+        _IS_EPHEMERAL_MAP[canonical_key] = is_ephemeral
+        _CACHED_SECRET = secret
+        _IS_EPHEMERAL = is_ephemeral
+        if config_dir is not None:
+            _ACTIVE_CONFIG_DIR = config_dir
 
 
-def reset_verification_secret() -> None:
+def reset_verification_secret(config_dir: Optional[str] = None) -> None:
     """Resets the cached verification secret to force re-evaluation from environment or persistent file."""
-    global _CACHED_SECRET, _IS_EPHEMERAL
+    global _CACHED_SECRET, _IS_EPHEMERAL, _ACTIVE_CONFIG_DIR
+    if config_dir is not None:
+        canonical_key = _get_canonical_config_key(config_dir)
+        _CACHED_SECRETS.pop(canonical_key, None)
+        _IS_EPHEMERAL_MAP.pop(canonical_key, None)
+        if _ACTIVE_CONFIG_DIR == config_dir:
+            _ACTIVE_CONFIG_DIR = None
+    else:
+        _CACHED_SECRETS.clear()
+        _IS_EPHEMERAL_MAP.clear()
+        _ACTIVE_CONFIG_DIR = None
     _CACHED_SECRET = None
     _IS_EPHEMERAL = False
 
