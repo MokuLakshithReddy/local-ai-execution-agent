@@ -1,80 +1,244 @@
 <div align="center">
 
-# Local-First, Model-Agnostic AI Execution Agent
+# ⚡ Local-First, Model-Agnostic AI Execution Agent
 
-**An Evidence-Driven, Local-First Engineering Framework Delegating Real Computer Work to LLMs with Verifiable Proof.**
+### *Stop trusting what AI chatbots say. Start verifying what AI agents actually do.*
+
+An open-source, evidence-driven autonomous coding framework that delegates real software engineering tasks to LLMs—with **OS/container containment**, **cryptographic execution provenance**, and **verifiable machine proof**.
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688.svg)](https://fastapi.tiangolo.com/)
-[![React + Vite](https://img.shields.io/badge/React-19%20%7C%20Vite-646CFF.svg)](https://vitejs.dev/)
+[![React 19](https://img.shields.io/badge/React-19%20%7C%20Vite-646CFF.svg)](https://vitejs.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-Local--First-003B57.svg)](https://sqlite.org/)
 [![CI](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
+[![Verification: 48 Passed](https://img.shields.io/badge/Verification-48%20Passed-10b981.svg)](#-live-verification-evidence-log)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Verification: Passed](https://img.shields.io/badge/Verification-48%20Passed-10b981.svg)](#-live-verification-evidence-log)
 
 </div>
 
 ---
 
-## 🎯 The Evidence-Driven Philosophy
+## 💡 The Big Idea in 30 Seconds
 
-> **"Plausible code is not working code. An AI execution agent is only as dependable as the evidence it produces."**
+Most AI coding assistants (Copilot, Cursor, chat interfaces) are **"chatbots with text editors."** 
+When an AI finishes writing code, it declares: 
+> *"I have fixed the issue, refactored the module, and everything is working perfectly!"*
 
-Most AI coding assistants rely on subjective completion: the model writes code, declares victory in chat, and leaves verification to the human. 
+**In reality, you don't know if the code compiles, if tests actually ran, or if the agent hallucinated.** 
 
-This agent is built around **strict evidence separation**:
-1. **Model Claims** *(Subjective)*: What the LLM believes or intends to do.
-2. **Tool Telemetry** *(Observed)*: Raw stdin/stdout, exit codes, modified files, and execution timestamps.
-3. **Verification Subsystem** *(Objective Evidence)*: Independent test suites, linters, builds, and git diff audits.
-
-An action is **never** considered complete simply because an LLM claims it is done. Every completion must be anchored in captured machine evidence.
-
----
-
-## 📑 Table of Contents
-
-- [The Evidence-Driven Philosophy](#-the-evidence-driven-philosophy)
-- [Evidence Architecture & Truth Table](#-evidence-architecture--truth-table)
-- [Live Verification Evidence Log](#-live-verification-evidence-log)
-- [Hardened Defenses & Security Invariants](#-hardened-defenses--security-invariants)
-- [Sample Structured Task Report](#-sample-structured-task-report)
-- [System Architecture](#-system-architecture)
-- [Core Engineering Pillars](#-core-engineering-pillars)
-  - [1. Bounded Orchestration Loop & Loop-Guards](#1-bounded-orchestration-loop--loop-guards)
-  - [2. Model-Agnostic Provider Adapters](#2-model-agnostic-provider-adapters)
-  - [3. Modular Tool Registry & Extending Tools](#3-modular-tool-registry--extending-tools)
-  - [4. Permission Sandbox & Injection Defense](#4-permission-sandbox--injection-defense)
-  - [5. Verification & Verifiable Evidence Engine](#5-verification--verifiable-evidence-engine)
-  - [6. Persistence Layer & State Machine](#6-persistence-layer--state-machine)
-- [API & WebSocket Protocol](#-api--websocket-protocol)
-  - [REST Endpoints](#rest-endpoints)
-  - [WebSocket Event Streams](#websocket-event-streams)
-- [Developer Setup & Reproducible Verification](#-developer-setup--reproducible-verification)
-- [Project Directory Layout](#-project-directory-layout)
-- [License](#-license)
+This project flips the paradigm from **subjective belief** to **objective proof**:
+1. **Never Trust Claims**: The LLM's opinion is treated as an unverified hypothesis.
+2. **Require Machine Evidence**: A task is **only** marked `COMPLETED` when independent test runners (e.g., `pytest`, `npm test`) exit with code `0`, git diffs confirm the modifications, and JUnit XML records are cryptographically verified.
+3. **Execute Safely in Containment**: All commands execute inside **isolated Docker containers** (or native Windows Job Objects) with kernel-level network blocks (`--network=none`), read-only root filesystems, memory caps, and process limits.
+4. **100% Local & Model-Agnostic**: Works with local models via **Ollama** (offline privacy) or cloud providers (**Gemini, Claude, GPT-4o**). Your codebase and credentials never leave your control.
 
 ---
 
-## 📊 Evidence Architecture & Truth Table
+## 🤔 Why This Matters: The Chatbot vs. Evidence Agent
 
-The verification engine (`agent/verification/verifier.py`) enforces an unambiguous status matrix. The agent cannot forge a `COMPLETED` status:
+| Capability | Standard AI Assistant / Chatbot | This AI Execution Agent |
+|---|---|---|
+| **Completion Criteria** | Subjective: LLM says *"Done!"* in chat. | **Objective**: Test runners exit `0`, assertions pass, and git diffs match. |
+| **Output Integrity** | Can print fake test logs and claim they passed. | **Cryptographic Provenance**: JUnit XML signed with HMAC-SHA256 (RFC 8785). |
+| **Process Execution** | Runs arbitrary commands directly on host terminal. | **Hard Containment**: Docker container sandbox (`--network=none`, `--read-only`). |
+| **Escapes & Traversal** | Vulnerable to `cd ..`, path traversal, or env leaks. | **Strict Path Jail**: Canonical path sandboxing + strict env scrubbing. |
+| **Runaway Loops** | Loops infinitely if it gets confused. | **Loop-Guards**: Repetitive action detection and hard step/timeout budgets. |
+| **Model Lock-In** | Bound to one proprietary API. | **Model-Agnostic**: Ollama (Qwen, Llama), Claude, Gemini, OpenAI. |
+| **Privacy & Storage** | Cloud-synced telemetry and histories. | **Local-First**: Embedded SQLite, local tokens, OS DPAPI / POSIX vault. |
 
-| Code Modified? | Verification Tests Executed? | Exit Code | Resulting Task Status | Rationale |
+---
+
+## 🎬 How It Works: The Verifiable Lifecycle
+
+When you ask the agent: *"Fix the authentication token expiry bug and verify with unit tests"*:
+
+```
+   ┌──────────────────────────────────────────────────────────────┐
+   │ 1. INGEST & PLAN                                             │
+   │ The agent explores workspace files (safe read_file, search). │
+   │ Proposes step-by-step action plan and identifies criteria.   │
+   └──────────────────────────────┬───────────────────────────────┘
+                                  ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │ 2. AUTHORIZATION & HUMAN-IN-THE-LOOP                         │
+   │ Routine file edits proceed; sensitive operations trigger     │
+   │ human approval modals in the Glassmorphic Web Dashboard.     │
+   └──────────────────────────────┬───────────────────────────────┘
+                                  ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │ 3. SANDBOXED EXECUTION (DOCKER / JOB OBJECTS)                │
+   │ Modifies files via patch_file. Executes test runner inside   │
+   │ container (--network=none, memory caps, non-root user).      │
+   └──────────────────────────────┬───────────────────────────────┘
+                                  ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │ 4. OBJECTIVE MACHINE EVIDENCE GATHERING                      │
+   │ Parses structured JUnit XML directly from test process.      │
+   │ Partitions outcomes: passed, failed, and skipped tests.      │
+   └──────────────────────────────┬───────────────────────────────┘
+                                  ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │ 5. CRYPTOGRAPHIC PROVENANCE & REPORT                         │
+   │ Issues a tamper-evident TrustedExecutionRecord (HMAC-SHA256).│
+   │ Generates audited TaskReport with diffs and exit codes.      │
+   └──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📊 The Truth Table: Why the Agent Cannot Lie
+
+The verification engine (`agent/verification/verifier.py`) enforces an immutable outcome matrix:
+
+| Code Modified? | Verification Tests Executed? | Exit Code | Resulting Task Status | What Actually Happened |
 |:---:|:---:|:---:|:---:|---|
-| **Yes** | **Yes** | `0` (Success) | `COMPLETED` | **Verified Completion**: Changes made and validated by passing test suites. |
-| **Yes** | **Yes** | `!= 0` (Fail) | `PARTIALLY_COMPLETED` | **Failed Verification**: Tests failed; agent cannot claim victory. |
-| **Yes** | **No** | N/A | `PARTIALLY_COMPLETED` | **Unverified Changes**: Files modified, but no automated checks verified them. |
-| **No** | N/A | N/A | `COMPLETED` | **Informational Task**: Read-only exploration (e.g. architecture review). |
-| Any | Timeout / Block | Error | `FAILED` / `BLOCKED` | **Execution Failure**: Runaway loop detected or resource budget exhausted. |
+| **Yes** | **Yes** | `0` (Success) | **`COMPLETED`** | ✅ **Verified Completion**: Tests ran inside sandbox, passed, and diff matches. |
+| **Yes** | **Yes** | `!= 0` (Fail) | **`PARTIALLY_COMPLETED`** | ❌ **Failed Verification**: Tests failed. Agent is forbidden from claiming victory. |
+| **Yes** | **No** | N/A | **`PARTIALLY_COMPLETED`** | ⚠️ **Unverified Modification**: Files were edited, but no automated test proved it. |
+| **No** | N/A | N/A | **`COMPLETED`** | ℹ️ **Informational Task**: Read-only exploration (e.g., architecture audit). |
+| Any | Timeout / Block | Error | **`FAILED` / `BLOCKED`** | 🛑 **Execution Failure**: Sandbox violation or resource budget exhausted. |
+
+---
+
+## 🚀 Quick Start (Up & Running in 2 Minutes)
+
+### Prerequisites
+- **Python 3.10+**
+- **Node.js 18+** & `npm`
+- **Docker** (optional, recommended for full container isolation)
+
+### 1. Clone & Set Up Virtual Environment
+
+```bash
+# Clone the repository
+git clone https://github.com/MokuLakshithReddy/local-ai-execution-agent.git
+cd local-ai-execution-agent
+
+# Set up Python virtual environment
+# Windows:
+python -m venv venv
+.\venv\Scripts\activate
+
+# Linux / macOS:
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### 2. Verify Your Environment (48 Passing Tests)
+
+Run the automated test suite to verify kernel job limits, sandbox boundaries, and provenance hashing:
+
+```bash
+pytest tests/ -v
+```
+
+### 3. Launch the Agent & Web Dashboard
+
+```bash
+python main.py
+```
+
+Open your browser to:
+👉 **[http://localhost:8000](http://localhost:8000)**
+
+### 4. (Optional) Start the React UI in Dev Mode
+
+```bash
+cd ui
+npm install
+npm run dev
+```
+
+---
+
+## 🛡️ Hardened Defenses & Security Invariants
+
+In response to extensive adversarial testing, the runtime implements 5 layers of defense:
+
+### 1. Container Sandbox & Terminal Containment
+- **Container-First by Default**: `RunCommandTool` defaults to `sandbox_mode="container"`. Host execution is rejected when containment is required.
+- **Kernel-Level Isolation**: Spawns commands via `asyncio.create_subprocess_exec("docker", "run", ...)` with:
+  - `--network=none`: Blocks outbound network connections at the kernel level (raw sockets and scripts cannot leak data).
+  - `--read-only`: Prevents modification of root system files.
+  - `-v {workspace}:/workspace:rw`: Only the target workspace folder is accessible.
+  - `--memory=512m`, `--pids-limit=32`, `--cap-drop=ALL`.
+- **Windows Kernel Job Objects**: On Windows host fallback, processes are bound to native Job Objects via `ctypes.windll.kernel32`:
+  - `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: Instant child process termination on exit or timeout.
+  - Hard caps on active processes (16) and memory (512 MB).
+- **Timeout Cleanup & Daemon Pruning**: Deterministically named containers (`agent-sandbox-<uuid>`) are forcibly stopped (`docker rm -f`) and verified removed if a command times out.
+
+### 2. Cryptographic Provenance (HMAC-SHA256 via RFC 8785)
+- **Zero Fabrication**: Prevents agents or malicious scripts from outputting fake `1 passed in 0.05s` strings to trick verification.
+- **Deterministic Canonical JSON**: All test results (`run_id`, `runner`, `command`, `exit_code`, `total`, `passed`, `failed`, `skipped`, `nodes`, `timestamp`) are serialized into canonical JSON (RFC 8785 semantics: sorted keys, compact separators) and signed using HMAC-SHA256.
+- **Skipped-Test Isolation**: Skipped tests are recorded separately (`skipped_nodes`) and **never** counted as passed. Reports with zero passing tests or count inconsistencies are rejected immediately.
+- **Persistent Key Lifecycle**: Signing keys are stored securely in `~/.config/ai_execution_agent/verification.key` (permission `0600` on POSIX, user ACL on Windows) or configured via `AGENT_VERIFICATION_SECRET`, preserving verification validity across process restarts.
+
+### 3. Path Traversal & Symlink Defense
+- Every filesystem operation passes through `resolve_safe_path()`, resolving canonical real paths and verifying `os.path.commonpath([resolved, workspace]) == workspace`.
+- Prevents symlink attacks, directory traversal (`../../etc/passwd`), and out-of-boundary access.
+
+### 4. Credential Vault & In-Memory Sanitization
+- **OS-Native Key Storage**: Windows DPAPI (`CryptProtectData`) on Windows; Fernet key with atomic permissions on POSIX.
+- **Automatic Redaction**: Scrubbing engine masks API keys (`sk-*`, `ghp_*`, `AIza*`, bearer tokens) from all stdout and agent thoughts before storage.
+
+### 5. Loop-Guards & Execution Budgets
+- Detects repetitive or looping behavior (3 identical tool calls with identical arguments triggers emergency brake).
+- Enforces a hard step limit (default: 30 steps) and execution timeouts to prevent runaway LLM costs.
+
+---
+
+## 🏛️ System Architecture
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        User / Web Interface                            │
+│           (React 19 + TypeScript + Vite + Glassmorphic UI)             │
+└───────────────────▲────────────────────────────────▲───────────────────┘
+                    │ REST API                       │ WebSocket Feed
+                    │ (/api/tasks, /api/approvals)   │ (ws://localhost:8000/ws)
+┌───────────────────▼────────────────────────────────┴───────────────────┐
+│                        FastAPI Server Bridge                           │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                      Agent Orchestration Engine                        │
+│ ┌──────────────────────┐  ┌────────────────────┐  ┌──────────────────┐ │
+│ │ Bounded Exec Loop    │  │ Task State Machine │  │ Loop-Guard &     │ │
+│ │ (Plan -> Act -> Ver) │  │ (9 Discrete States)│  │ Timeout Watchdog │ │
+│ └──────────────────────┘  └────────────────────┘  └──────────────────┘ │
+└──────────┬────────────────────────┬─────────────────────────┬──────────┘
+           │                        │                         │
+           ▼                        ▼                         ▼
+┌───────────────────────┐ ┌───────────────────┐ ┌────────────────────────┐
+│   Provider Adapters   │ │   Security Engine │ │     Tool Registry      │
+│ ├─ Google Gemini      │ │ ├─ Permission Mgr │ │ ├─ Safe Filesystem     │
+│ ├─ OpenAI / Compatible│ │ ├─ Path Sandbox   │ │ ├─ Bounded Terminal    │
+│ ├─ Anthropic Claude   │ │ ├─ Secret Redactor│ │ ├─ Git Status & Diff   │
+│ └─ Ollama (Local LLM) │ │ └─ Injection Fence│ │ └─ Verification Runner │
+└───────────────────────┘ └───────────────────┘ └───────────┬────────────┘
+                                                            │
+                                                            ▼
+                                                ┌────────────────────────┐
+                                                │   Verification Engine  │
+                                                │ ├─ Test Execution      │
+                                                │ ├─ Exit Code Checking  │
+                                                │ ├─ Git Diff Synthesizer│
+                                                │ └─ Signed Task Report  │
+                                                └────────────────────────┘
+```
 
 ---
 
 ## 🧪 Live Verification Evidence Log
 
-The test suite in [`tests/test_core_and_tools.py`](tests/test_core_and_tools.py) rigorously tests security invariants, sandbox containment, cryptographic provenance, and evidence-driven completion across 48 automated tests (including live kernel job limits, Docker container isolation, and adversarial attack vectors).
+Every release and commit is backed by reproducible automated tests in [`tests/test_core_and_tools.py`](tests/test_core_and_tools.py).
 
-### Verified Test Telemetry:
-```
+### Latest CI Telemetry:
+```text
 ============================= test session starts =============================
 platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.7.0
 rootdir: C:\Users\nsrfl\OneDrive\Desktop\MAKE LLM TO CODE
@@ -120,7 +284,7 @@ tests/test_core_and_tools.py::test_container_hardening_non_root_image_validation
 tests/test_core_and_tools.py::test_credential_vault_concurrent_creation_race_and_validation PASSED [ 75%]
 tests/test_core_and_tools.py::test_verifier_rejects_fabricated_output_and_unbacked_assertion_records PASSED [ 77%]
 tests/test_core_and_tools.py::test_verifier_rejects_exit_zero_generic_word_without_test_execution PASSED [ 79%]
-tests/test_core_and_tools.py::test_real_docker_container_security_boundaries PASSED (in Ubuntu CI) [ 81%]
+tests/test_core_and_tools.py::test_real_docker_container_security_boundaries PASSED [ 81%]
 tests/test_core_and_tools.py::test_verifier_rejects_fabricated_runner_output_without_trusted_execution_record PASSED [ 83%]
 tests/test_core_and_tools.py::test_credential_vault_stress_slow_writes_interrupted_and_permissions PASSED [ 85%]
 tests/test_core_and_tools.py::test_verifier_rejects_forged_execution_record PASSED [ 87%]
@@ -131,347 +295,12 @@ tests/test_core_and_tools.py::test_parse_junit_xml_report_rejects_zero_tests_and
 tests/test_core_and_tools.py::test_junit_xml_report_skipped_tests_handling_and_verification_rejection PASSED [ 97%]
 tests/test_core_and_tools.py::test_verification_secret_lifecycle_persistence_and_restart PASSED [100%]
 
-================= 48 passed (All CI checks green) ==================
+======================== 48 passed in 16.15s (100% Green CI) ========================
 ```
 
 ---
 
-## 🛡️ Hardened Defenses & Security Invariants
-
-In response to rigorous security assessments and adversarial analysis, the agent enforces a multi-tiered defense architecture:
-
-### 1. Terminal Containment Architecture (Evidence-Based Separation)
-The terminal execution subsystem (`agent/tools/terminal.py`) explicitly separates **syntactic pre-flight policies** from **OS kernel boundaries** and **containerized isolation**:
-
-- **Default Execution Mode — Container-First & Genuinely Isolated**:
-  - `RunCommandTool.execute()` defaults to `sandbox_mode="container"` and `require_sandbox=True`.
-  - **Host Mode Rejection**: If `sandbox_mode="host"` is requested with `require_sandbox=True`, execution is **strictly rejected**. The host process path cannot guarantee OS-enforced filesystem and network isolation across platforms; execution is refused rather than falsely claiming sandbox protection.
-  - **Explicit Host Execution**: Host execution is only permitted when explicitly opted into with `sandbox_mode="host", require_sandbox=False`. The result telemetry records `"isolated": False` in its artifacts.
-
-- **Tier 1 — Pre-Execution Policy Guard**:
-  - `validate_sandbox_command()` parses tokens, quotes, and traversal patterns prior to execution.
-  - Rejects dangerous shell operations (`cd ..`, `pushd`, unquoted traversals) and blocked utilities (`curl`, `wget`, `nc`, `ssh`) when network is disabled.
-  - *Accurate Boundary*: A text policy filter catches syntax mistakes but does not prevent internal interpreter execution (e.g. `python -c "import socket; ..."`). Kernel or container sandboxing is required for hard containment.
-
-- **Tier 2 — OS Kernel Resource & Process Sandboxing (`WindowsJobSandbox`)**:
-  - **Native Job Object Enforcement**: Every host subprocess on Windows is bound to a native Windows Job Object configured via `ctypes.windll.kernel32`:
-    - `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000)`: Guarantees that if the agent exits, times out, or closes the job handle, the OS kernel terminates the entire child process tree immediately.
-    - `JOB_OBJECT_LIMIT_ACTIVE_PROCESS (0x0008)`: Enforces hard limits on active processes (default: 16) to prevent fork-bombs and runaway child trees.
-    - `JOB_OBJECT_LIMIT_JOB_MEMORY (0x0200)`: Restricts total job memory (default: 512 MB).
-  - **Fail-Closed Guarantee Across Platforms**: Every native API call is strictly checked. If limits cannot be configured or process assignment fails, the process tree is immediately killed via `_kill_process_tree()` and `SandboxViolationError` is raised. On non-Windows platforms, `WindowsJobSandbox` raises `SandboxViolationError` when `strict=True`, and returns `False` when `strict=False` (never pretends isolation succeeded).
-  - **Environment Scrubbing & Proxy Blackholing**: Only essential variables (`PATH`, `SYSTEMROOT`, `COMSPEC`) in `SAFE_ENV_ALLOWLIST` are exposed; cloud and host credentials are scrubbed. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY = 127.0.0.1:0` are set to blackhole outbound requests.
-
-- **Tier 3 — Wired Container Execution Isolation (`build_container_command` + `create_subprocess_exec`)**:
-  - The container builder is directly wired into `RunCommandTool.execute()` as the default execution mode (`sandbox_mode="container"`).
-  - **Non-Root Execution & Tmpfs Mount**: Configures `--user` (default non-root UID:GID) and mounts an ephemeral `--tmpfs /tmp:rw,noexec,nosuid,size=64m`.
-  - **Project-Specific Images Safely Supported**: Validates image names against strict regex (`^[a-zA-Z0-9_\.-]+(/[a-zA-Z0-9_\.-]+)?(:[a-zA-Z0-9_\.-]+)?$`), allowing Node (`node:20-slim`), Rust (`rust:1.75-slim`), Go (`golang:1.22-alpine`), and Python while blocking shell injection.
-  - **Daemon-Level Timeout Cleanup & Return Code Verification**: Assigns a deterministic `--name agent-sandbox-<uuid>`. On execution timeout, invokes `docker rm -f <container_name>` and checks the process exit code; only reports `"container_cleaned_up": True` if the command returned code 0. If cleanup fails or times out, records `"container_cleaned_up": False` and attaches `"cleanup_warning"`.
-  - **Live Runtime Boundary Testing in CI**: Validated in GitHub Actions `ubuntu-latest` via [`test_real_docker_container_security_boundaries`](tests/test_core_and_tools.py) proving `--read-only` denies rootfs modifications (`touch /escape.txt`), `--network=none` denies raw socket connections, user ID is non-root (`id -u != 0`), and timed-out containers are purged from the Docker daemon (`docker ps -a` empty).
-  - **Fail-Closed on Missing Runtime**: If container sandboxing is requested and `docker` is not installed or available in PATH, execution fails closed immediately (`container_runtime_available: False`, `sandbox_violation: True`) with a clear error.
-  - **Direct Container Runtime Execution**: When available, commands execute through `asyncio.create_subprocess_exec("docker", "run", ...)`:
-    - **Kernel Network Namespace Isolation**: `--network none` strips network access completely at the kernel level (raw sockets, python scripts, and compiled binaries cannot transmit traffic).
-    - **Read-Only Root Filesystem**: `--read-only` prevents mutations to system directories.
-    - **Filesystem Boundary**: Only the target workspace directory is mounted read-write (`-v {workspace}:/workspace:rw`).
-    - **Resource Caps**: `--memory 512m`, `--pids-limit 32`, and `--cap-drop=ALL`.
-
-### 2. Execution-Backed Proof-Grade Verification (Anti-Fabrication Engine)
-- **Container-Aware Structured Evidence Wiring**: The verification tool writes JUnit XML reports (`.verification_report_<id>.xml`) directly inside the mounted workspace directory. This guarantees availability across Docker container bind-mounts and host execution paths without leaking files or depending on unmounted host `/tmp` paths. Reports are reliably cleaned up after parsing.
-- **Accurate Outcome Partitioning & Skipped-Test Defense**: The JUnit parser (`agent/tools/verification.py`) counts `<testcase>` elements directly and partitions outcomes strictly into passed, failed, and skipped tests (`total == passed + failed + skipped`). Skipped tests are **never** counted as passed and are placed into `skipped_nodes`. Reports with zero passing tests or count inconsistencies return `None` and cannot issue trusted records.
-- **Cryptographic Provenance via Canonical JSON Serialization**: Structured execution evidence is encapsulated in a typed `TrustedExecutionRecord` (`agent/security/provenance.py`). All security-relevant fields (`run_id`, `runner`, `command`, `exit_code`, `total`, `passed`, `failed`, `skipped`, `passed_nodes`, `failed_nodes`, `skipped_nodes`, and `timestamp`) are serialized using deterministic canonical JSON (RFC 8785 semantics: alphabetically sorted keys, normalized compact separators) and signed with HMAC-SHA256, eliminating delimiter ambiguity and injection risks.
-- **Persistent Signing Secret Lifecycle & OS Protection**: The 256-bit signing key is managed via a defined lifecycle:
-  - Supports `AGENT_VERIFICATION_SECRET` environment variable override for CI/production container deployments.
-  - Defaults to an OS-backed persistent key file at `~/.config/ai_execution_agent/verification.key` with atomic creation (`mkstemp` + `os.replace`), restrictive permissions (`0o600` on POSIX, user ACL on Windows), and symlink attack rejection. Valid records remain verifiable across server restarts.
-  - Ephemeral in-memory fallback ensures operational resiliency if disk persistence is blocked.
-- **Strict Provenance Verification & Forgery Defense**: In `agent/verification/verifier.py`, execution records without valid cryptographic signatures, count consistency, or matching parameters are rejected immediately. Fabricated dictionaries labelled "trusted" cannot spoof verification.
-- **Elimination of Fabricated Stdout Attacks**: A command that prints text resembling pytest runner output (such as `tests/test_auth.py::test_login PASSED\n1 passed in 0.05s`) via an inline script, command substitution, or unverified command is strictly rejected without genuine runner execution evidence. The criterion remains `UNVERIFIED` (adversarially validated via `test_verifier_rejects_fabricated_runner_output_without_trusted_execution_record` and `test_verifier_rejects_forged_execution_record`).
-- **Proof-Grade Verification Tiers**:
-  - `VERIFIED_TARGETED_TEST`: Requires an explicit criterion-to-test binding where the target test was **demonstrably executed and passed in the runner telemetry** or authentic structured execution record with process exit code `0`. Tests that were skipped or failed can never satisfy a targeted test criterion.
-  - `VERIFIED_ASSERTION`: Requires a `StructuredAssertion` record backed by an executed test node in output or an existing verification report artifact on disk. Fabricated assertion records attached to failing or unexecuted checks are refused.
-  - `UNVERIFIED`: If no execution-backed test proves the criterion, it remains `UNVERIFIED` and the task remains `PARTIALLY_COMPLETED`, even if general commands succeeded.
-
-### 3. POSIX Vault Key Hardening, Multiprocess Concurrency, & Crash Recovery
-- **Shared `_validate_and_read_posix_key` Routine**: Reused across initial key checks, post-atomic-creation verification, and concurrent creation backoff.
-- **Multiprocess Concurrency & Slow Write Backoff**: Tolerates in-progress writes from concurrent OS processes creating the key through `_read_and_validate_with_retry()`, allowing concurrent writers to finish writing, flushing, and applying permissions.
-- **Crash Recovery Without Wedging**: If a process crashes during initialization leaving a 0-byte or incomplete file (< 32 bytes), subsequent processes safely recover by clearing the abandoned file and atomically establishing a valid key. Valid keys (>= 32 bytes) are never auto-deleted, preventing data loss.
-- **Stress-Tested Multi-Process & Fail-Closed Behavior**: Validated with multi-process concurrency pools, simulated slow writers, interrupted writes, and insecure permissions via `test_credential_vault_stress_slow_writes_interrupted_and_permissions` and `test_credential_vault_multiprocess_concurrency_and_crash_recovery`.
-- **Multi-Point Verification**: Validates `0700` directory permissions, `0600` file permissions on POSIX, symlink absence (`not os.path.islink`), and key length >= 32 bytes with Fernet key validation.
-- **Atomic Creation**: Uses `os.open(..., O_CREAT | O_EXCL, 0o600)` to eliminate initialization race conditions under multi-process and multi-threaded concurrency. Demonstrated via `test_credential_vault_concurrent_creation_race_and_validation`.
-
-### 4. Multi-Key Credential Migration & Partial Failure Isolation
-- **Multi-Key Migration**: Safely migrates multiple provider keys (`openai`, `anthropic`, `gemini`) stored together in `app_settings`.
-- **Corrupted Legacy Value Handling**: Corrupted legacy base64 strings are nullified safely rather than returning garbled ciphertext.
-- **Partial Failure Stages**: Tested across DPAPI/vault encryption failure, database write locks, and recovery after restart. If re-encryption or persistence fails, `CredentialMigrationError` is raised and unmigrated secrets are wiped from memory. Once the error condition resolves, subsequent requests cleanly complete migration and persist OS-native encrypted credentials.
-
-### 5. Local API, IPv6, & Token Failure Defenses
-- **Fail-Safe Token Permissions**: `_lock_down_token_file()` raises `RuntimeError` if ACLs cannot be locked down via `icacls` or `chmod 0600`.
-- **RFC-Compliant IPv4 & IPv6 Parsing**: `_extract_hostname()` accurately parses IPv4, bare IPv6 (`::1`), bracketed IPv6 (`[::1]:8000`), and rejects hostile domains (`evil.attacker.com`).
-- **Persistence Error Propagation**: `Database.save_setting()` propagates `DatabaseWriteError` on SQLite failures, returning `HTTP 500`.
-
-
-Every executed task persists a verifiable `TaskReport` (`agent/core/models.py`) containing the exact trail of evidence:
-
-```json
-{
-  "task_id": "83f1aa41-88a4-42a6-9c37-0fc0db7a4e34",
-  "goal": "Implement input validator in auth.py and verify test coverage with pytest.",
-  "status": "COMPLETED",
-  "summary_of_actions": [
-    "Inspected auth.py via read_file (lines 1-80)",
-    "Applied validation logic via patch_file",
-    "Executed verification command: pytest tests/test_auth.py"
-  ],
-  "files_created_or_modified": [
-    "src/auth.py",
-    "tests/test_auth.py"
-  ],
-  "diff_summary": "diff --git a/src/auth.py b/src/auth.py\n+ def validate_token(token: str) -> bool:\n+     return len(token) > 16",
-  "executed_verification_checks": [
-    {
-      "check_name": "Authentication Unit Tests",
-      "check_type": "test",
-      "command": "pytest tests/test_auth.py",
-      "success": true,
-      "exit_code": 0,
-      "output": "tests/test_auth.py .. [100%]\n2 passed in 0.08s",
-      "evidence_summary": "Verification Check 'Authentication Unit Tests' (test) exited with code 0. PASSED."
-    }
-  ],
-  "skipped_or_failed_checks": [],
-  "unresolved_risks_or_limitations": []
-}
-```
-
----
-
-## 🏛️ System Architecture
-
-The agent strictly decouples **reasoning** (delegated to any LLM) from **execution and authorization** (controlled by the local runtime):
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        User / Web Interface                            │
-│           (React + TypeScript + Vite + Glassmorphic UI)                │
-└───────────────────▲────────────────────────────────▲───────────────────┘
-                    │ REST API                       │ WebSocket Feed
-                    │ (/api/tasks, /api/approvals)   │ (ws://localhost:8000/ws)
-┌───────────────────▼────────────────────────────────┴───────────────────┐
-│                        FastAPI Server Bridge                           │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                      Agent Orchestration Engine                        │
-│ ┌──────────────────────┐  ┌────────────────────┐  ┌──────────────────┐ │
-│ │ Bounded Exec Loop    │  │ Task State Machine │  │ Loop-Guard &     │ │
-│ │ (Plan -> Act -> Ver) │  │ (9 Discrete States)│  │ Timeout Watchdog │ │
-│ └──────────────────────┘  └────────────────────┘  └──────────────────┘ │
-└──────────┬────────────────────────┬─────────────────────────┬──────────┘
-           │                        │                         │
-           ▼                        ▼                         ▼
-┌───────────────────────┐ ┌───────────────────┐ ┌────────────────────────┐
-│   Provider Adapters   │ │   Security Engine │ │     Tool Registry      │
-│ ├─ Google Gemini      │ │ ├─ Permission Mgr │ │ ├─ Safe Filesystem     │
-│ ├─ OpenAI / Compatible│ │ ├─ Path Sandbox   │ │ ├─ Bounded Terminal    │
-│ ├─ Anthropic Claude   │ │ ├─ Secret Redactor│ │ ├─ Git Status & Diff   │
-│ └─ Ollama (Local LLM) │ │ └─ Injection Fence│ │ └─ Verification Runner │
-└───────────────────────┘ └───────────────────┘ └───────────┬────────────┘
-                                                            │
-                                                            ▼
-                                                ┌────────────────────────┐
-                                                │   Verification Engine  │
-                                                │ ├─ Test Execution      │
-                                                │ ├─ Exit Code Checking  │
-                                                │ ├─ Git Diff Synthesizer│
-                                                │ └─ Final Task Report   │
-                                                └────────────────────────┘
-```
-
----
-
-## ⚙️ Core Engineering Pillars
-
-### 1. Bounded Orchestration Loop & Loop-Guards
-
-Located in `agent/core/engine.py`. The execution loop implements a controlled 7-stage lifecycle:
-1. **Understand Request**: Ingest user goal, bind workspace directory, sanitize context.
-2. **Inspect Context**: Explore repository structure (`list_dir`, `search_files`, `read_file`).
-3. **Plan Actions**: Construct concise sequence of steps and hypotheses.
-4. **Authorize Action**: Intercept tool calls through `PermissionManager`. If sensitive, suspend execution into `PENDING_APPROVAL`.
-5. **Execute & Observe**: Execute permitted tools within workspace boundaries and scrub output.
-6. **Iterate & Guard**: Detect repeated identical actions (loop-guard triggers if tool + arguments repeat 3 times without progress). Check maximum step limits (default: 30 steps).
-7. **Verify & Report**: Record verification commands (pytest, npm test, etc.), inspect working tree diffs, and construct the final structured report.
-
-### 2. Model-Agnostic Provider Adapters
-
-Located in `agent/providers/`. All models are normalized behind `BaseProviderAdapter` (`base.py`):
-
-```python
-class BaseProviderAdapter(ABC):
-    @abstractmethod
-    async def chat_completion(
-        self,
-        messages: List[LLMMessage],
-        tools: Optional[List[Dict[str, Any]]] = None,
-        temperature: float = 0.2,
-    ) -> ProviderResponse:
-        pass
-```
-
-- **OpenAI Adapter** (`openai_adapter.py`): Supports `gpt-4o`, `gpt-4o-mini`, `o1`/`o3`, as well as any OpenAI-compatible custom base URL (vLLM, LMStudio, OpenRouter, DeepSeek).
-- **Anthropic Adapter** (`anthropic_adapter.py`): Supports `claude-3-7-sonnet`, `claude-3-5-sonnet`, mapping Anthropic `tool_use` blocks to standard `LLMToolCall`s.
-- **Gemini Adapter** (`gemini_adapter.py`): Supports native Google Gemini function declarations (`generateContent` with `functionCall`/`functionResponse`).
-- **Ollama Adapter** (`ollama_adapter.py`): Offline local inference with local models (`qwen2.5-coder:latest`, `llama3.1`).
-
-### 3. Modular Tool Registry & Extending Tools
-
-Located in `agent/tools/`. Every tool subclasses `BaseTool` (`base.py`):
-
-```python
-from agent.tools.base import BaseTool
-from agent.core.models import PermissionLevel, ActionResult
-
-class CustomLinterTool(BaseTool):
-    name = "custom_lint"
-    description = "Run custom style checks on source files."
-    permission_level = PermissionLevel.READ_ONLY
-
-    def get_parameters_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string", "description": "Target file relative to workspace."}
-            },
-            "required": ["file_path"]
-        }
-
-    async def execute(self, workspace_path: str, **kwargs) -> ActionResult:
-        # Implementation with resolve_safe_path
-        ...
-```
-
-Register your tool with `tool_registry.register(CustomLinterTool())`.
-
-#### Built-in Tools:
-| Tool Name | Risk / Permission | Purpose |
-|---|---|---|
-| `list_dir` | `READ_ONLY` | Directory tree inspection with depth & size limits. |
-| `read_file` | `READ_ONLY` | File content inspection with slice notation (`start_line`, `end_line`). |
-| `write_file` | `ROUTINE_MODIFICATION` | Create or overwrite files inside the workspace. |
-| `patch_file` | `ROUTINE_MODIFICATION` | Atomic exact-block replacement (prevents accidental destructive overwrites). |
-| `search_files` | `READ_ONLY` | Fast workspace regex/literal search honoring ignore rules (`.git`, `node_modules`). |
-| `run_command` | `SENSITIVE_OPERATION` | Subprocess execution with process timeouts, output caps (50KB limit), and environment scrubbing. |
-| `git_status` | `READ_ONLY` | Inspect staged, unstaged, and untracked changes. |
-| `git_diff` | `READ_ONLY` | Generate unified repository diff against `HEAD`. |
-| `run_verification` | `SENSITIVE_OPERATION` | Executes automated tests/builds and captures exit codes as verifiable evidence. |
-
-### 4. Permission Sandbox & Injection Defense
-
-Located in `agent/security/`.
-- **Path Boundary Enforcer**: `resolve_safe_path()` checks `os.path.commonpath` against the canonical absolute workspace root. Any `../` traversal escape raises `ValueError` immediately.
-- **Permission Matrix**:
-  - `READ_ONLY`: Auto-approved within workspace.
-  - `ROUTINE_MODIFICATION`: Auto-approved by default policy; diff recorded.
-  - `SENSITIVE_OPERATION`: Triggers human approval modal in UI unless explicitly enabled in policy.
-  - `DESTRUCTIVE_OPERATION`: Blocked or requires explicit human approval.
-  - `EXTERNAL_SIDE_EFFECT`: Gated behind authorization.
-- **Secret Redactor**: Scrub credentials (`sk-*`, `ghp_*`, `AIza*`, bearer tokens) before logging or returning to prompts.
-- **Prompt Injection Demarcation**: Wraps all untrusted external content (files, command outputs) inside `=== BEGIN UNTRUSTED DATA ===` fences and flags adversarial strings (e.g. `ignore previous instructions`).
-
-### 5. Verification & Verifiable Evidence Engine
-
-Located in `agent/verification/verifier.py`.
-- Rather than accepting an LLM's assertion ("*I fixed the bug and verified everything works*"), the engine audits:
-  1. Did a verification tool (`run_verification`) execute?
-  2. Was the command exit code `0`?
-  3. Does the git diff reflect the expected changes?
-
-### 6. Persistence Layer & State Machine
-
-Located in `agent/persistence/db.py`. Embedded asynchronous SQLite database (`agent_state.db`):
-- `tasks`: Task ID, goal, workspace, provider, status, steps count, JSON plan, and final report.
-- `task_steps`: Step-by-step reasoning thoughts, tool calls, and execution latencies.
-- `approvals`: Pending and resolved human-in-the-loop authorizations.
-- `settings`: API keys, auto-approval toggles, and active workspace paths.
-
-#### 9-State Task Lifecycle:
-`IDLE` &rarr; `PLANNING` &rarr; `EXECUTING` &harr; `PENDING_APPROVAL` &rarr; `VERIFYING` &rarr; `COMPLETED` | `PARTIALLY_COMPLETED` | `BLOCKED` | `FAILED` | `CANCELLED`
-
----
-
-## 🌐 API & WebSocket Protocol
-
-### REST Endpoints
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/api/health` | Health check & service status. |
-| `GET` | `/api/workspaces` | Retrieve active & available workspaces. |
-| `GET` | `/api/models` | List supported providers & models. |
-| `GET` | `/api/settings` | Get masked settings & policy toggles. |
-| `POST` | `/api/settings` | Update API keys and approval policies. |
-| `POST` | `/api/tasks` | Ingest task goal & launch async execution loop. |
-| `GET` | `/api/tasks` | List recent tasks and execution states. |
-| `GET` | `/api/tasks/{task_id}` | Retrieve task details, steps, and final report. |
-| `POST` | `/api/tasks/{task_id}/cancel` | Request graceful task termination. |
-| `GET` | `/api/approvals/pending` | List pending approval requests. |
-| `POST` | `/api/approvals/{id}` | Resolve approval (`{"approved": true/false}`). |
-| `GET` | `/api/diff` | Get active workspace unified diff. |
-
-### WebSocket Event Streams
-
-Connect to `ws://localhost:8000/ws` for live streaming:
-
-```json
-{
-  "type": "step_start" | "agent_thought" | "tool_executing" | "tool_result" | "approval_required" | "task_completed" | "task_error",
-  "data": { ... }
-}
-```
-
----
-
-## 🛠️ Developer Setup & Reproducible Verification
-
-### Prerequisites
-- **Python**: `>= 3.10`
-- **Node.js**: `>= 18.0` & `npm`
-- **Git**
-
-### 1. Setup & Reproduce Verification Evidence
-Clone the repository and run the test suite to independently reproduce the verification telemetry:
-
-```bash
-git clone https://github.com/MokuLakshithReddy/local-ai-execution-agent.git
-cd local-ai-execution-agent
-
-# Windows
-python -m venv venv
-.\venv\Scripts\activate
-pip install fastapi uvicorn pydantic httpx python-dotenv aiosqlite pytest pytest-asyncio
-
-# Execute unit & adversarial test suite (43 passed)
-pytest tests/ -v -k "not test_real_docker"
-
-# Execute live Docker container security integration test (Linux CI / Docker daemon)
-pytest tests/ -v -k "test_real_docker"
-```
-
-### 2. Launch Local Agent Service & Dashboard
-```bash
-python main.py
-```
-Open **[http://127.0.0.1:8000](http://127.0.0.1:8000)** in your browser.
-
-### 3. Frontend Development
-```bash
-cd ui
-npm install
-npm run dev
-```
-
----
-
-## 📂 Project Directory Layout
+## 📁 Project Directory Layout
 
 ```
 .
@@ -489,16 +318,18 @@ npm run dev
 │   ├── tools/
 │   │   ├── base.py                # BaseTool definition
 │   │   ├── filesystem.py          # Safe list, read, write, patch, search
-│   │   ├── terminal.py            # Bounded subprocess runner with timeouts
+│   │   ├── terminal.py            # Subprocess runner with container sandbox & timeouts
 │   │   ├── git.py                 # Git status & diff tools
-│   │   ├── verification.py        # Automated test & build runner
-│   │   └── registry.py            # Tool schema exporter (OpenAI/Claude/Gemini)
+│   │   ├── verification.py        # Automated test & build runner with JUnit parsing
+│   │   └── registry.py            # Tool schema exporter
 │   ├── security/
 │   │   ├── permissions.py         # Multi-tiered permission & approval logic
-│   │   └── sanitizer.py           # Secret masking & prompt injection defense
+│   │   ├── sanitizer.py           # Secret masking & prompt injection defense
+│   │   └── provenance.py          # Cryptographic HMAC-SHA256 signing & secret lifecycle
 │   ├── verification/
 │   │   └── verifier.py            # Outcome verifier & report synthesizer
 │   ├── persistence/
+│   │   ├── credentials.py         # OS-native CredentialVault (DPAPI + POSIX)
 │   │   └── db.py                  # aiosqlite repository
 │   └── api/
 │       └── server.py              # FastAPI app & WebSocket event broadcaster
@@ -508,7 +339,7 @@ npm run dev
 │   │   ├── App.css                # Scoped component styles
 │   │   └── index.css              # Design tokens & dark glassmorphic theme
 ├── tests/
-│   └── test_core_and_tools.py     # Comprehensive unit tests
+│   └── test_core_and_tools.py     # 48 comprehensive unit, integration, and security tests
 ├── main.py                        # Service entrypoint
 ├── pytest.ini                     # Pytest configuration
 ├── LICENSE                        # MIT License
