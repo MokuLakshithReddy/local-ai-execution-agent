@@ -231,14 +231,18 @@ class Database:
                             decrypted = vault.decrypt(raw)
                             if decrypted is not None:
                                 decrypted_val[k] = decrypted
-                                # If stored in legacy scheme (enc: or b64:) or unencrypted, migrate to native vault
+                                # If stored in legacy scheme (enc: or b64:) or unencrypted, migrate to native vault immediately
                                 if raw.startswith("enc:") or raw.startswith("b64:") or not (raw.startswith("dpapi:") or raw.startswith("fernet:")):
                                     needs_migration = True
                             else:
-                                # Corrupted or non-decryptable vault key fallback
-                                decrypted_val[k] = raw
+                                # Corrupted or non-decryptable vault key: do not return ciphertext as usable secret
+                                decrypted_val[k] = None
                     if needs_migration:
-                        asyncio.create_task(self.save_setting(key, decrypted_val))
+                        try:
+                            # Immediately re-encrypt with DPAPI and persist securely
+                            await self.save_setting(key, decrypted_val)
+                        except Exception:
+                            pass
                     return decrypted_val
 
                 return val

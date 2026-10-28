@@ -343,7 +343,13 @@ async def save_settings(req: SaveSettingsRequest):
         auto_approve_sensitive=req.auto_approve_sensitive,
     )
 
-    await db.save_setting("app_settings", settings)
+    try:
+        await db.save_setting("app_settings", settings)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Security Error: Failed to encrypt credentials safely ({str(e)}). Plaintext persistence rejected.",
+        )
     if req.current_workspace:
         real_ws = os.path.realpath(req.current_workspace)
         await db.save_setting("current_workspace", real_ws)

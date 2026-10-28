@@ -91,7 +91,8 @@ async def test_database_credential_encryption_and_sanitization():
             cursor = await raw_db.execute("SELECT value_json FROM settings WHERE key = 'app_settings'")
             row = await cursor.fetchone()
             assert raw_key not in row[0]
-            assert any(p in row[0] for p in ("dpapi:", "fernet:", "enc:", "b64:"))
+            assert "b64:" not in row[0]
+            assert any(p in row[0] for p in ("dpapi:", "fernet:"))
 
         # Retrieve through Database class and verify decryption
         loaded = await db.get_setting("app_settings")
@@ -381,10 +382,58 @@ async def test_credential_vault_corruption_and_migration():
             )
             await raw_db.commit()
 
-        # Retrieve via Database - should decrypt and schedule transparent migration
+        # Retrieve via Database - should decrypt and immediately migrate to native vault
         retrieved = await db.get_setting("app_settings")
         assert retrieved["openai_api_key"] == legacy_key
-        await asyncio.sleep(0.05)
+
+        # Assert that the legacy b64 record was immediately re-encrypted and persisted as dpapi/fernet
+        async with aiosqlite.connect(db_file) as raw_db:
+            cursor = await raw_db.execute("SELECT value_json FROM settings WHERE key = 'app_settings'")
+            migrated_row = await cursor.fetchone()
+            assert "b64:" not in migrated_row[0]
+            assert any(p in migrated_row[0] for p in ("dpapi:", "fernet:"))
+
+
+@pytest.mark.asyncio
+async def test_dpapi_failure_fails_closed():
+    """Validates that DPAPI failure fails closed and NEVER persists credentials in plaintext or Base64."""
+    from unittest.mock import patch
+    from agent.persistence.credentials import CredentialEncryptionError
+
+    test_key = "sk-super-secret-must-not-leak-987654321"
+
+    # 1. Simulate DPAPI failure in CredentialVault.encrypt
+    protect_patch = (
+        patch("ctypes.windll.crypt32.CryptProtectData", return_value=0)
+        if sys.platform == "win32"
+        else patch.object(vault._fernet, "encrypt", side_effect=Exception("Fernet error"))
+    )
+
+    with protect_patch:
+        # Must raise CredentialEncryptionError, never return b64: or plaintext
+        with pytest.raises(CredentialEncryptionError):
+            vault.encrypt(test_key)
+
+        # 2. Simulate DPAPI failure during Database.save_setting
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            db_file = os.path.join(temp_dir, "fail_closed.db")
+            db = Database(db_path=db_file)
+            await db.init()
+
+            # Attempting to save setting must raise and fail closed
+            with pytest.raises(CredentialEncryptionError):
+                await db.save_setting("app_settings", {"openai_api_key": test_key})
+
+            # Inspect database to assert NO credential was written in plaintext, base64, or any recoverable form
+            async with aiosqlite.connect(db_file) as raw_db:
+                cursor = await raw_db.execute("SELECT value_json FROM settings WHERE key = 'app_settings'")
+                row = await cursor.fetchone()
+                # Row must not exist at all, or must not contain test_key or base64 of test_key
+                if row:
+                    assert test_key not in row[0]
+                    import base64
+                    assert base64.b64encode(test_key.encode()).decode() not in row[0]
+                    assert "b64:" not in row[0]
 
 
 def test_real_process_tree_termination():

@@ -9,7 +9,7 @@
 [![React + Vite](https://img.shields.io/badge/React-19%20%7C%20Vite-646CFF.svg)](https://vitejs.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-Local--First-003B57.svg)](https://sqlite.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Verification: Passed](https://img.shields.io/badge/Verification-19%20Passed-10b981.svg)](#-live-verification-evidence-log)
+[![Verification: Passed](https://img.shields.io/badge/Verification-20%20Passed-10b981.svg)](#-live-verification-evidence-log)
 
 </div>
 
@@ -70,7 +70,7 @@ The verification engine (`agent/verification/verifier.py`) enforces an unambiguo
 
 ## 🧪 Live Verification Evidence Log
 
-The test suite in [`tests/test_core_and_tools.py`](tests/test_core_and_tools.py) tests security invariants, tool bounds, and verifiable outcomes across all 19 automated integration tests.
+The test suite in [`tests/test_core_and_tools.py`](tests/test_core_and_tools.py) tests security invariants, tool bounds, and verifiable outcomes across all 20 automated integration tests.
 
 ### Verified Test Telemetry:
 ```
@@ -79,29 +79,30 @@ platform win32 -- Python 3.12.10, pytest-9.1.1, pluggy-1.7.0
 rootdir: C:\Users\nsrfl\OneDrive\Desktop\MAKE LLM TO CODE
 configfile: pytest.ini
 plugins: anyio-4.15.1, asyncio-1.4.1
-collected 19 items
+collected 20 items
 
 tests/test_core_and_tools.py::test_resolve_safe_path_security PASSED     [  5%]
 tests/test_core_and_tools.py::test_symlink_containment_security PASSED   [ 10%]
 tests/test_core_and_tools.py::test_credential_vault_encryption PASSED    [ 15%]
-tests/test_core_and_tools.py::test_database_credential_encryption_and_sanitization PASSED [ 21%]
-tests/test_core_and_tools.py::test_security_sanitizer_redaction PASSED   [ 26%]
-tests/test_core_and_tools.py::test_security_sanitizer_injection_defense PASSED [ 31%]
-tests/test_core_and_tools.py::test_permission_manager_levels PASSED      [ 36%]
-tests/test_core_and_tools.py::test_terminal_environment_allowlist PASSED [ 42%]
-tests/test_core_and_tools.py::test_filesystem_tools_lifecycle PASSED     [ 47%]
-tests/test_core_and_tools.py::test_criteria_driven_verification PASSED   [ 52%]
-tests/test_core_and_tools.py::test_api_security_authorization PASSED     [ 57%]
-tests/test_core_and_tools.py::test_adversarial_bootstrap_attacks PASSED  [ 63%]
-tests/test_core_and_tools.py::test_token_file_acl_protection PASSED      [ 68%]
-tests/test_core_and_tools.py::test_credential_vault_corruption_and_migration PASSED [ 73%]
-tests/test_core_and_tools.py::test_real_process_tree_termination PASSED  [ 78%]
-tests/test_core_and_tools.py::test_verifier_relevance_and_anti_overstating PASSED [ 84%]
-tests/test_core_and_tools.py::test_approval_race_conditions PASSED       [ 89%]
-tests/test_core_and_tools.py::test_task_interruption_and_server_restart PASSED [ 94%]
+tests/test_core_and_tools.py::test_database_credential_encryption_and_sanitization PASSED [ 20%]
+tests/test_core_and_tools.py::test_security_sanitizer_redaction PASSED   [ 25%]
+tests/test_core_and_tools.py::test_security_sanitizer_injection_defense PASSED [ 30%]
+tests/test_core_and_tools.py::test_permission_manager_levels PASSED      [ 35%]
+tests/test_core_and_tools.py::test_terminal_environment_allowlist PASSED [ 40%]
+tests/test_core_and_tools.py::test_filesystem_tools_lifecycle PASSED     [ 45%]
+tests/test_core_and_tools.py::test_criteria_driven_verification PASSED   [ 50%]
+tests/test_core_and_tools.py::test_api_security_authorization PASSED     [ 55%]
+tests/test_core_and_tools.py::test_adversarial_bootstrap_attacks PASSED  [ 60%]
+tests/test_core_and_tools.py::test_token_file_acl_protection PASSED      [ 65%]
+tests/test_core_and_tools.py::test_credential_vault_corruption_and_migration PASSED [ 70%]
+tests/test_core_and_tools.py::test_dpapi_failure_fails_closed PASSED     [ 75%]
+tests/test_core_and_tools.py::test_real_process_tree_termination PASSED  [ 80%]
+tests/test_core_and_tools.py::test_verifier_relevance_and_anti_overstating PASSED [ 85%]
+tests/test_core_and_tools.py::test_approval_race_conditions PASSED       [ 90%]
+tests/test_core_and_tools.py::test_task_interruption_and_server_restart PASSED [ 95%]
 tests/test_core_and_tools.py::test_end_to_end_edit_test_fix_lifecycle PASSED [100%]
 
-======================= 19 passed, 3 warnings in 2.72s ========================
+======================= 20 passed, 3 warnings in 2.90s ========================
 ```
 
 ---
@@ -116,10 +117,11 @@ In response to advanced adversarial scenarios, the following protections are enf
 - **DNS Rebinding Middleware**: Host headers are strictly validated against `{"localhost", "127.0.0.1", "::1", "testserver"}`. Foreign rebind domains (e.g. `Host: evil.attacker.com:8000`) are rejected immediately with `400 Bad Request`.
 - **User-Only File ACLs**: On Windows, the `.agent_session_token` file is locked down via `icacls` (`/inheritance:r /grant:r %USERNAME%:(R,W)`), ensuring other local Windows users cannot access the session token. On POSIX, `0o600` permissions are enforced.
 
-### 2. OS-Native Credential Storage (Windows DPAPI / Platform Keychain)
+### 2. OS-Native Credential Storage & Strict Fail-Closed Invariants
 - **Zero Plaintext Keys on Disk**: On Windows, credentials use native **Data Protection API (DPAPI)** via `ctypes.windll.crypt32.CryptProtectData` with `CRYPTPROTECT_UI_FORBIDDEN`. Encryption keys are tied directly to the OS user account credentials.
+- **Fail-Closed on Encryption Error**: Never falls back to Base64 encoding or plaintext. If DPAPI encryption fails, `CredentialEncryptionError` is raised, and database writes are aborted immediately.
 - **Corrupted Vault & Tamper Recovery**: Truncated base64, corrupted DPAPI blobs, or missing keys return `None` without unhandled exceptions or crashes.
-- **Transparent Migration**: Retrieving legacy `enc:` (Fernet) or `b64:` credentials automatically re-encrypts and upgrades them to active OS-native encryption.
+- **Transparent Immediate Migration**: Retrieving legacy `b64:` or `enc:` credentials decrypts them solely for migration, then immediately re-encrypts them with native DPAPI and updates the SQLite record, eliminating Base64 from storage.
 
 ### 3. Execution Sandboxing & Process Tree Containment
 - **Process-Tree Termination**: Runaway commands and timeouts trigger `_kill_process_tree()`, which uses `psutil` and Windows `taskkill /F /T /PID` to terminate the entire process hierarchy without leaving orphaned background processes.

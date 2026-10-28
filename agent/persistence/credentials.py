@@ -22,6 +22,11 @@ if IS_WINDOWS:
         ]
 
 
+class CredentialEncryptionError(RuntimeError):
+    """Raised when OS credential encryption fails."""
+    pass
+
+
 class CredentialVault:
     def __init__(self):
         self._is_windows = IS_WINDOWS
@@ -50,10 +55,13 @@ class CredentialVault:
         return key
 
     def encrypt(self, plain_text: str) -> str:
-        """Encrypts sensitive plaintext using OS-bound DPAPI or user-restricted key."""
+        """
+        Encrypts sensitive plaintext using OS-bound DPAPI or user-restricted key.
+        Fails closed on any error. Never falls back to Base64 or plaintext.
+        """
         if not plain_text:
             return ""
-        
+
         raw_bytes = plain_text.encode("utf-8")
 
         if self._is_windows:
@@ -61,7 +69,7 @@ class CredentialVault:
                 p_in = ctypes.create_string_buffer(raw_bytes)
                 blob_in = DATA_BLOB(len(raw_bytes), ctypes.cast(p_in, ctypes.POINTER(ctypes.c_char)))
                 blob_out = DATA_BLOB()
-                
+
                 # CryptProtectData flags: CRYPTPROTECT_UI_FORBIDDEN = 0x1
                 success = ctypes.windll.crypt32.CryptProtectData(
                     ctypes.byref(blob_in),
@@ -73,21 +81,28 @@ class CredentialVault:
                     ctypes.byref(blob_out),
                 )
                 if not success:
-                    raise RuntimeError("Windows DPAPI CryptProtectData failed.")
+                    raise CredentialEncryptionError("Windows DPAPI CryptProtectData failed.")
 
                 enc_bytes = ctypes.string_at(blob_out.pbData, blob_out.cbData)
-                # Free blob_out memory
                 ctypes.windll.kernel32.LocalFree(blob_out.pbData)
                 return "dpapi:" + base64.b64encode(enc_bytes).decode("ascii")
             except Exception as e:
-                # Fallback to base64 encoding if DPAPI fails unexpectedly
-                return "b64:" + base64.b64encode(raw_bytes).decode("ascii")
+                # Strictly fail closed: never return unencrypted or base64 data
+                if isinstance(e, CredentialEncryptionError):
+                    raise
+                raise CredentialEncryptionError(f"Windows DPAPI encryption failed: {str(e)}") from e
         else:
-            enc = self._fernet.encrypt(raw_bytes)
-            return "fernet:" + enc.decode("ascii")
+            try:
+                enc = self._fernet.encrypt(raw_bytes)
+                return "fernet:" + enc.decode("ascii")
+            except Exception as e:
+                raise CredentialEncryptionError(f"POSIX Fernet encryption failed: {str(e)}") from e
 
     def decrypt(self, encrypted_text: str) -> Optional[str]:
-        """Decrypts ciphertext using OS-bound DPAPI or handles corrupted inputs gracefully."""
+        """
+        Decrypts ciphertext using OS-bound DPAPI.
+        Permits legacy formats (enc:, b64:) only for explicit migration.
+        """
         if not encrypted_text:
             return None
 
