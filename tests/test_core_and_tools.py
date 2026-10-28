@@ -175,7 +175,7 @@ async def test_terminal_environment_allowlist():
         tool = RunCommandTool()
         # Print environment keys in child process
         cmd = f'"{sys.executable}" -c "import os; print(\'KEY_FOUND:\', \'OPENAI_API_KEY\' in os.environ, \'CUSTOM_FOUND:\', \'CUSTOM_HOST_SECRET\' in os.environ)"'
-        res = await tool.execute(temp_dir, command=cmd)
+        res = await tool.execute(temp_dir, command=cmd, sandbox_mode="host", require_sandbox=False)
         assert res.success is True
         assert "KEY_FOUND: False" in res.output
         assert "CUSTOM_FOUND: False" in res.output
@@ -640,7 +640,7 @@ async def test_end_to_end_edit_test_fix_lifecycle():
         await write_tool.execute(ws_dir, file_path="calc.py", content=code)
 
         # 2. Run test - fails as expected
-        cmd_res = await terminal_tool.execute(ws_dir, command=f'"{sys.executable}" calc.py')
+        cmd_res = await terminal_tool.execute(ws_dir, command=f'"{sys.executable}" calc.py', sandbox_mode="host", require_sandbox=False)
         assert cmd_res.success is False
         assert "AssertionError: Incorrect answer" in cmd_res.output or "AssertionError" in str(cmd_res.error)
 
@@ -666,7 +666,7 @@ async def test_end_to_end_edit_test_fix_lifecycle():
         assert patch_res.success is True
 
         # 4. Re-run test - succeeds with exit code 0
-        cmd_res2 = await terminal_tool.execute(ws_dir, command=f'"{sys.executable}" calc.py')
+        cmd_res2 = await terminal_tool.execute(ws_dir, command=f'"{sys.executable}" calc.py', sandbox_mode="host", require_sandbox=False)
         assert cmd_res2.success is True
         assert cmd_res2.artifacts["exit_code"] == 0
 
@@ -1260,30 +1260,60 @@ async def test_terminal_container_execution_fail_closed_and_dispatch():
 
 
 @pytest.mark.asyncio
-async def test_windows_job_sandbox_fail_closed_and_process_killed():
-    """Validates Priority 2: Windows Job Sandbox failure causes command to fail closed
-    and terminates the spawned process tree."""
-    from unittest.mock import patch, MagicMock
+async def test_terminal_default_is_container_and_host_rejected_when_sandboxed():
+    """Validates Priority 8:
+    1. Default sandbox_mode is 'container' and fails closed if docker is unavailable.
+    2. Host execution is rejected when require_sandbox=True (host path cannot guarantee OS isolation).
+    3. Host execution is permitted only when require_sandbox=False, marking isolated=False.
+    4. WindowsJobSandbox on non-Windows platforms fails closed when strict and never returns True."""
+    from unittest.mock import patch
     from agent.tools.terminal import RunCommandTool, WindowsJobSandbox, SandboxViolationError
 
     tool = RunCommandTool()
 
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        # Simulate Windows environment with failed AssignProcessToJobObject
-        with patch("agent.tools.terminal.WindowsJobSandbox.assign_process", side_effect=SandboxViolationError("Simulated assignment failure")), \
-             patch("agent.tools.terminal._kill_process_tree") as mock_kill:
-            result = await tool.execute(
-                call_id="c_job_fail",
-                command="python -c \"import time; time.sleep(1)\"",
-                workspace_path=temp_dir,
-                sandbox_mode="host",
-                require_sandbox=True,
-            )
-            assert result.success is False
-            assert "Sandbox Isolation Failure" in result.error
-            assert "Process terminated" in result.error
-            assert result.artifacts.get("sandbox_violation") is True
-            assert mock_kill.called
+        # 1. Default execution (no sandbox_mode argument) defaults to 'container' and fails closed if docker is missing
+        with patch("shutil.which", return_value=None):
+            default_res = await tool.execute(temp_dir, command="echo 1")
+            assert default_res.success is False
+            assert "Container sandbox execution failed" in default_res.error
+            assert default_res.artifacts.get("sandbox_mode") == "container"
+            assert default_res.artifacts.get("container_runtime_available") is False
+
+        # 2. Host mode with require_sandbox=True is strictly REJECTED
+        host_reject_res = await tool.execute(
+            temp_dir,
+            command="echo 1",
+            sandbox_mode="host",
+            require_sandbox=True,
+        )
+        assert host_reject_res.success is False
+        assert "Host execution rejected" in host_reject_res.error
+        assert "require_sandbox=True requires an OS-enforced container sandbox" in host_reject_res.error
+        assert host_reject_res.artifacts.get("isolated") is False
+
+        # 3. Host mode with require_sandbox=False runs but records isolated=False
+        host_perm_res = await tool.execute(
+            temp_dir,
+            command=f'"{sys.executable}" -c "print(\'HOST_OK\')"',
+            sandbox_mode="host",
+            require_sandbox=False,
+        )
+        assert host_perm_res.success is True
+        assert "HOST_OK" in host_perm_res.output
+        assert host_perm_res.artifacts.get("sandbox_mode") == "host"
+        assert host_perm_res.artifacts.get("isolated") is False
+        assert host_perm_res.artifacts.get("require_sandbox") is False
+
+        # 4. WindowsJobSandbox on non-Windows platforms fails closed when strict, and returns False (never True)
+        with patch("sys.platform", "linux"):
+            # Strict mode fails closed on non-Windows
+            with pytest.raises(SandboxViolationError, match="not supported on non-Windows"):
+                WindowsJobSandbox(strict=True)
+
+            # Non-strict mode does not pretend isolation succeeded
+            non_strict_job = WindowsJobSandbox(strict=False)
+            assert non_strict_job.assign_process(12345) is False
 
 
 def test_posix_key_directory_permissions_and_symlink_rejection():

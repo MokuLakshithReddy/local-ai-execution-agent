@@ -113,11 +113,11 @@ tests/test_core_and_tools.py::test_credential_migration_multi_key_corrupted_and_
 tests/test_core_and_tools.py::test_terminal_os_sandbox_job_limits_and_container_config PASSED [ 85%]
 tests/test_core_and_tools.py::test_verifier_adversarial_irrelevant_passing_test_rejected PASSED [ 88%]
 tests/test_core_and_tools.py::test_terminal_container_execution_fail_closed_and_dispatch PASSED [ 91%]
-tests/test_core_and_tools.py::test_windows_job_sandbox_fail_closed_and_process_killed PASSED [ 94%]
+tests/test_core_and_tools.py::test_terminal_default_is_container_and_host_rejected_when_sandboxed PASSED [ 94%]
 tests/test_core_and_tools.py::test_posix_key_directory_permissions_and_symlink_rejection PASSED [ 97%]
 tests/test_core_and_tools.py::test_credential_migration_partial_failure_stages PASSED [100%]
 
-======================= 34 passed in 3.92s ========================
+======================= 34 passed in 3.36s ========================
 ```
 
 ---
@@ -129,6 +129,11 @@ In response to rigorous security assessments and adversarial analysis, the agent
 ### 1. Terminal Containment Architecture (Evidence-Based Separation)
 The terminal execution subsystem (`agent/tools/terminal.py`) explicitly separates **syntactic pre-flight policies** from **OS kernel boundaries** and **containerized isolation**:
 
+- **Default Execution Mode — Container-First & Genuinely Isolated**:
+  - `RunCommandTool.execute()` defaults to `sandbox_mode="container"` and `require_sandbox=True`.
+  - **Host Mode Rejection**: If `sandbox_mode="host"` is requested with `require_sandbox=True`, execution is **strictly rejected**. The host process path cannot guarantee OS-enforced filesystem and network isolation across platforms; execution is refused rather than falsely claiming sandbox protection.
+  - **Explicit Host Execution**: Host execution is only permitted when explicitly opted into with `sandbox_mode="host", require_sandbox=False`. The result telemetry records `"isolated": False` in its artifacts.
+
 - **Tier 1 — Pre-Execution Policy Guard**:
   - `validate_sandbox_command()` parses tokens, quotes, and traversal patterns prior to execution.
   - Rejects dangerous shell operations (`cd ..`, `pushd`, unquoted traversals) and blocked utilities (`curl`, `wget`, `nc`, `ssh`) when network is disabled.
@@ -139,12 +144,12 @@ The terminal execution subsystem (`agent/tools/terminal.py`) explicitly separate
     - `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE (0x2000)`: Guarantees that if the agent exits, times out, or closes the job handle, the OS kernel terminates the entire child process tree immediately.
     - `JOB_OBJECT_LIMIT_ACTIVE_PROCESS (0x0008)`: Enforces hard limits on active processes (default: 16) to prevent fork-bombs and runaway child trees.
     - `JOB_OBJECT_LIMIT_JOB_MEMORY (0x0200)`: Restricts total job memory (default: 512 MB).
-  - **Fail-Closed Guarantee**: Every native API call (`CreateJobObjectW`, `SetInformationJobObject`, `OpenProcess`, `AssignProcessToJobObject`) is strictly checked. If limits cannot be configured or process assignment fails, the process tree is immediately killed via `_kill_process_tree()` and `SandboxViolationError` is raised. Execution never silently falls back to unrestricted execution.
+  - **Fail-Closed Guarantee Across Platforms**: Every native API call is strictly checked. If limits cannot be configured or process assignment fails, the process tree is immediately killed via `_kill_process_tree()` and `SandboxViolationError` is raised. On non-Windows platforms, `WindowsJobSandbox` raises `SandboxViolationError` when `strict=True`, and returns `False` when `strict=False` (never pretends isolation succeeded).
   - **Environment Scrubbing & Proxy Blackholing**: Only essential variables (`PATH`, `SYSTEMROOT`, `COMSPEC`) in `SAFE_ENV_ALLOWLIST` are exposed; cloud and host credentials are scrubbed. `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY = 127.0.0.1:0` are set to blackhole outbound requests.
 
 - **Tier 3 — Wired Container Execution Isolation (`build_container_command` + `create_subprocess_exec`)**:
-  - The container builder is directly wired into `RunCommandTool.execute()` via `sandbox_mode="container"`.
-  - **Fail-Closed on Missing Runtime**: If container sandboxing is requested and `docker` is not installed or available in PATH, execution fails closed immediately (`container_runtime_available: False`) with a clear error.
+  - The container builder is directly wired into `RunCommandTool.execute()` as the default execution mode (`sandbox_mode="container"`).
+  - **Fail-Closed on Missing Runtime**: If container sandboxing is requested and `docker` is not installed or available in PATH, execution fails closed immediately (`container_runtime_available: False`, `sandbox_violation: True`) with a clear error.
   - **Direct Container Runtime Execution**: When available, commands execute through `asyncio.create_subprocess_exec("docker", "run", ...)`:
     - **Kernel Network Namespace Isolation**: `--network none` strips network access completely at the kernel level (raw sockets, python scripts, and compiled binaries cannot transmit traffic).
     - **Read-Only Root Filesystem**: `--read-only` prevents mutations to system directories.

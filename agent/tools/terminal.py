@@ -221,10 +221,20 @@ class WindowsJobSandbox:
                     raise
                 if self.strict:
                     raise SandboxViolationError(f"Failed to initialize Windows Job Sandbox: {str(e)}") from e
+        else:
+            if self.strict:
+                raise SandboxViolationError(
+                    "Windows Job Object kernel sandbox is not supported on non-Windows platforms. "
+                    "OS-level process limit boundary cannot be established."
+                )
 
     def assign_process(self, pid: int) -> bool:
         if sys.platform != "win32":
-            return True
+            if self.strict:
+                raise SandboxViolationError(
+                    "Windows Job Object kernel sandbox is not supported on non-Windows platforms."
+                )
+            return False
         if not self._handle or not self._kernel32:
             if self.strict:
                 raise SandboxViolationError("Windows Job Object handle is invalid; cannot attach process.")
@@ -419,10 +429,32 @@ class RunCommandTool(BaseTool):
         # Set clean python unbuffered output
         isolated_env["PYTHONUNBUFFERED"] = "1"
 
-        sandbox_mode = kwargs.get("sandbox_mode", "host")  # "host" or "container"
+        # Default execution mode is strictly isolated container
+        sandbox_mode = kwargs.get("sandbox_mode", "container")  # "container" or "host"
         require_sandbox = kwargs.get("require_sandbox", True)
 
-        # 1. Container Sandbox Execution Mode
+        # 1. Reject host execution if sandbox is required (host path cannot guarantee OS isolation)
+        if sandbox_mode == "host" and require_sandbox:
+            return ActionResult(
+                call_id=call_id,
+                tool_name=self.name,
+                success=False,
+                output="",
+                error=(
+                    "Host execution rejected: require_sandbox=True requires an OS-enforced container sandbox. "
+                    "Host process execution cannot guarantee OS-enforced filesystem and network isolation across operating systems. "
+                    "Use sandbox_mode='container' for genuine isolation, or explicitly pass require_sandbox=False to permit unisolated host execution."
+                ),
+                artifacts={
+                    "sandbox_mode": "host",
+                    "sandbox_violation": True,
+                    "require_sandbox": True,
+                    "isolated": False,
+                },
+                execution_time_ms=(time.time() - t0) * 1000,
+            )
+
+        # 2. Container Sandbox Execution Mode (Default)
         if sandbox_mode == "container":
             import shutil
             docker_bin = shutil.which("docker")
@@ -432,8 +464,8 @@ class RunCommandTool(BaseTool):
                     tool_name=self.name,
                     success=False,
                     output="",
-                    error="Container sandbox execution failed: 'docker' runtime is not installed or available in PATH.",
-                    artifacts={"sandbox_mode": "container", "container_runtime_available": False},
+                    error="Container sandbox execution failed: 'docker' runtime is not installed or available in PATH. Requested container isolation cannot be established.",
+                    artifacts={"sandbox_mode": "container", "container_runtime_available": False, "sandbox_violation": True},
                     execution_time_ms=(time.time() - t0) * 1000,
                 )
 
@@ -473,6 +505,7 @@ class RunCommandTool(BaseTool):
                         success=False,
                         output="",
                         error=f"Container execution timed out after {timeout} seconds.",
+                        artifacts={"sandbox_mode": "container", "isolated": True},
                         execution_time_ms=(time.time() - t0) * 1000,
                     )
 
@@ -487,7 +520,12 @@ class RunCommandTool(BaseTool):
                     success=(exit_code == 0),
                     output=full_text if full_text else "(container command produced no output)",
                     error=f"Exit code: {exit_code}" if exit_code != 0 else None,
-                    artifacts={"exit_code": exit_code, "command": command, "sandbox_mode": "container"},
+                    artifacts={
+                        "exit_code": exit_code,
+                        "command": command,
+                        "sandbox_mode": "container",
+                        "isolated": True,
+                    },
                     execution_time_ms=(time.time() - t0) * 1000,
                 )
             except Exception as e:
@@ -497,27 +535,19 @@ class RunCommandTool(BaseTool):
                     success=False,
                     output="",
                     error=f"Container execution error: {str(e)}",
-                    artifacts={"sandbox_mode": "container"},
+                    artifacts={"sandbox_mode": "container", "sandbox_violation": True},
                     execution_time_ms=(time.time() - t0) * 1000,
                 )
 
-        # 2. Host OS Process Execution Mode with Kernel Limits
+        # 3. Host OS Process Execution Mode (Explicit require_sandbox=False)
         try:
             job_sandbox = WindowsJobSandbox(
                 max_active_processes=16,
                 max_memory_bytes=512 * 1024 * 1024,
-                strict=require_sandbox,
+                strict=False,
             )
-        except SandboxViolationError as sve:
-            return ActionResult(
-                call_id=call_id,
-                tool_name=self.name,
-                success=False,
-                output="",
-                error=f"Sandbox Isolation Failure: {str(sve)}",
-                artifacts={"sandbox_violation": True},
-                execution_time_ms=(time.time() - t0) * 1000,
-            )
+        except SandboxViolationError:
+            job_sandbox = None
 
         try:
             process = await asyncio.create_subprocess_shell(
@@ -587,7 +617,13 @@ class RunCommandTool(BaseTool):
                 success=(exit_code == 0),
                 output=full_text if full_text else "(command produced no output)",
                 error=f"Exit code: {exit_code}" if exit_code != 0 else None,
-                artifacts={"exit_code": exit_code, "command": command},
+                artifacts={
+                    "exit_code": exit_code,
+                    "command": command,
+                    "sandbox_mode": "host",
+                    "isolated": False,
+                    "require_sandbox": False,
+                },
                 execution_time_ms=(time.time() - t0) * 1000,
             )
 
@@ -601,4 +637,5 @@ class RunCommandTool(BaseTool):
                 execution_time_ms=(time.time() - t0) * 1000,
             )
         finally:
-            job_sandbox.close()
+            if job_sandbox:
+                job_sandbox.close()
