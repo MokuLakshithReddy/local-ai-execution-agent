@@ -67,9 +67,14 @@ def get_secret_storage_path(config_dir: Optional[str] = None) -> str:
 def _lock_down_key_file(filepath: str) -> None:
     """
     Enforces strict user-only permissions:
-    - On Windows: Uses icacls to restrict access strictly to the active user (R,W) and strip inheritance.
+    - On Windows: 
+        1. Resets ACLs (icacls /reset) to eradicate any pre-existing explicit hostile or permissive ACEs.
+        2. Strips inheritance and grants (R,W) exclusively to the active USERNAME (icacls /inheritance:r /grant:r).
+        3. Audits the resulting ACL: strictly verifies that no unauthorized or permissive principals
+           (e.g. Everyone, Users, BUILTIN\\Users, Authenticated Users, Guests, ANONYMOUS) possess access,
+           and that the active user is granted access. Fails closed on any unexpected ACE.
     - On POSIX: Uses chmod 0o600 (owner read/write only).
-    Fails closed if permissions cannot be enforced.
+    Fails closed if permissions cannot be enforced or verified.
     """
     if sys.platform == "win32":
         import subprocess
@@ -78,15 +83,63 @@ def _lock_down_key_file(filepath: str) -> None:
             raise VerificationSecretStorageError(
                 "Security Failure: Unable to determine active USERNAME for Windows key ACL lockdown."
             )
-        res = subprocess.run(
+
+        # 1. Reset explicit permissions to eliminate hostile pre-existing ACEs
+        reset_res = subprocess.run(
+            ["icacls", filepath, "/reset"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if reset_res.returncode != 0:
+            raise VerificationSecretStorageError(
+                f"Security Failure: icacls /reset failed to reset key ACLs: {reset_res.stderr.strip()}"
+            )
+
+        # 2. Strip inherited permissions and grant exclusive (R,W) to active user
+        grant_res = subprocess.run(
             ["icacls", filepath, "/inheritance:r", "/grant:r", f"{username}:(R,W)"],
             capture_output=True,
             text=True,
             check=False,
         )
-        if res.returncode != 0:
+        if grant_res.returncode != 0:
             raise VerificationSecretStorageError(
-                f"Security Failure: icacls failed to lock down key ACLs: {res.stderr.strip()}"
+                f"Security Failure: icacls failed to lock down key ACLs: {grant_res.stderr.strip()}"
+            )
+
+        # 3. Audit resulting ACL to confirm no hostile or permissive ACEs remain
+        audit_res = subprocess.run(
+            ["icacls", filepath],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if audit_res.returncode != 0:
+            raise VerificationSecretStorageError(
+                f"Security Failure: icacls failed to audit resulting key ACLs: {audit_res.stderr.strip()}"
+            )
+
+        # Remove the file path from audit string so that directory names like "C:\Users" don't trigger false positives
+        acl_output = audit_res.stdout.lower()
+        acl_entries = acl_output.replace(filepath.lower(), "")
+        forbidden_principals = [
+            "everyone",
+            "builtin\\users",
+            "authenticated users",
+            "guests",
+            "builtin\\guests",
+            "anonymous",
+        ]
+        for principal in forbidden_principals:
+            if principal in acl_entries:
+                raise VerificationSecretStorageError(
+                    f"Security Failure: Key file '{filepath}' retains unauthorized or permissive ACL for '{principal}': {audit_res.stdout.strip()}"
+                )
+
+        if username.lower() not in acl_entries:
+            raise VerificationSecretStorageError(
+                f"Security Failure: Key file '{filepath}' active user '{username}' missing from audited ACL: {audit_res.stdout.strip()}"
             )
     elif hasattr(os, "chmod"):
         try:

@@ -2801,17 +2801,33 @@ def test_verification_secret_concurrent_creation_race_handled():
 
 
 def test_windows_key_file_acl_enforcement():
-    """Validates Issue 5:
-    On Windows, _lock_down_key_file invokes icacls to enforce user-only ACLs without errors."""
-    from agent.security.provenance import _lock_down_key_file
+    """Validates Issue 5 & Remaining Issue 1:
+    On Windows, _lock_down_key_file resets explicit ACLs to eliminate pre-existing hostile ACEs,
+    strips inheritance, grants user-only access, and audits the ACL to ensure no unauthorized principals remain."""
+    import subprocess
+    from agent.security.provenance import _lock_down_key_file, VerificationSecretStorageError
 
     with tempfile.NamedTemporaryFile(delete=False) as tf:
         tf.write(b"X" * 32)
         tmp_name = tf.name
 
     try:
-        # Should succeed without raising VerificationSecretStorageError
-        _lock_down_key_file(tmp_name)
+        if sys.platform == "win32":
+            # Explicitly inject a hostile pre-existing permissive ACE (Everyone:R)
+            subprocess.run(["icacls", tmp_name, "/grant", "Everyone:(R)"], check=True)
+            pre_acl = subprocess.run(["icacls", tmp_name], capture_output=True, text=True).stdout
+            assert "everyone" in pre_acl.lower()
+
+            # Execute lockdown: must strip Everyone:(R) and grant strictly to USERNAME
+            _lock_down_key_file(tmp_name)
+
+            post_acl = subprocess.run(["icacls", tmp_name], capture_output=True, text=True).stdout
+            post_entries = post_acl.lower().replace(tmp_name.lower(), "")
+            assert "everyone" not in post_entries
+            assert "users" not in post_entries
+            assert os.environ.get("USERNAME").lower() in post_entries
+        else:
+            _lock_down_key_file(tmp_name)
     finally:
         if os.path.exists(tmp_name):
             try:
@@ -3123,9 +3139,21 @@ async def test_unisolated_host_mode_gated_by_env_var():
         assert res_blocked_zero.success is False
         assert "Host execution without sandboxing is strictly disabled" in res_blocked_zero.error
 
-        # Case 3: Env var set to '1' -> permitted with audit warning
+        # Case 3: Env var set to '1' but untrusted_workload=True -> strictly rejected (untrusted code blocked from host)
         os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
         try:
+            res_untrusted = await tool.execute(
+                temp_dir,
+                command=f'"{sys.executable}" -c "print(\'HOST\')"',
+                sandbox_mode="host",
+                require_sandbox=False,
+                untrusted_workload=True,
+            )
+            assert res_untrusted.success is False
+            assert "strictly reserved for trusted development scenarios" in res_untrusted.error
+            assert res_untrusted.artifacts.get("security_warning") == "UNTRUSTED_HOST_EXECUTION_BLOCKED"
+
+            # Case 4: Env var set to '1' for trusted development invocation -> permitted with audit warning
             res_allowed = await tool.execute(
                 temp_dir,
                 command=f'"{sys.executable}" -c "print(\'HOST\')"',
@@ -3278,6 +3306,18 @@ async def test_terminal_sandbox_mode_and_require_sandbox_combinations():
         # 5. sandbox_mode='host', require_sandbox=False with env var:
         os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
         try:
+            # 5a. untrusted_workload=True -> strictly blocked
+            res_h_untrusted = await tool.execute(
+                workspace_path=temp_dir,
+                command=f'"{sys.executable}" -c "print(\'HOST_FAIL\')"',
+                sandbox_mode="host",
+                require_sandbox=False,
+                untrusted_workload=True,
+            )
+            assert res_h_untrusted.success is False
+            assert res_h_untrusted.artifacts.get("security_warning") == "UNTRUSTED_HOST_EXECUTION_BLOCKED"
+
+            # 5b. Trusted developer invocation -> allowed on host
             res_h_req_false_allowed = await tool.execute(
                 workspace_path=temp_dir,
                 command=f'"{sys.executable}" -c "print(\'HOST_SUCCESS\')"',
@@ -3492,10 +3532,25 @@ def test_verification_secret_rotation_post_replace_lockdown_failure_rollback():
         assert disk_content == initial_secret
 
         # Active secret in cache and re-fetched is still initial_secret
-        assert get_verification_secret(config_dir=cfg_dir) == initial_secret
+        active_sec = get_verification_secret(config_dir=cfg_dir)
+        assert active_sec == initial_secret
 
         # Historical records continue to verify successfully!
         assert verify_trusted_execution_record(rec, secret=initial_secret) is True
+
+        # Subsequent records issued under active secret verify cleanly
+        rec_post_rollback = issue_trusted_execution_record(
+            run_id="run_rb_post",
+            runner="pytest",
+            command="pytest tests/post.py",
+            exit_code=0,
+            total=1,
+            passed=1,
+            failed=0,
+            passed_nodes=["test_post"],
+            secret=active_sec,
+        )
+        assert verify_trusted_execution_record(rec_post_rollback, secret=active_sec) is True
 
         # 4. Catastrophic failure recovery test: if post-replace lockdown fails AND rollback lockdown ALSO fails, key is evicted to fail closed
         def fail_on_target_key_file(filepath: str):
@@ -3507,8 +3562,93 @@ def test_verification_secret_rotation_post_replace_lockdown_failure_rollback():
             with pytest.raises(VerificationSecretStorageError) as exc_catastrophic:
                 rotate_verification_secret(config_dir=cfg_dir)
             assert "Catastrophic secret rotation failure" in str(exc_catastrophic.value)
-        # Key file was evicted from disk
+
+        # Key file was evicted from disk to fail closed
         assert not os.path.exists(key_file_path)
+
+        # In-memory cache was purged for this canonical directory
+        from agent.security.provenance import _CACHED_SECRETS, _get_canonical_config_key
+        assert _get_canonical_config_key(cfg_dir) not in _CACHED_SECRETS
+
+        # Subsequent verification without key fails closed
+        assert verify_trusted_execution_record(rec) is False
+
+
+@pytest.mark.asyncio
+async def test_engine_untrusted_task_cannot_escape_to_host_even_with_env_flag():
+    """Validates Issue 3:
+    Untrusted code from agent tasks can NEVER escape to host execution
+    even if AGENT_ALLOW_UNISOLATED_HOST_EXECUTION=1 is set in the environment.
+    ExecutionEngine strictly overrides and enforces sandbox_mode='container'."""
+    from agent.core.engine import ExecutionEngine
+    from agent.core.models import Task, TaskType, TaskStatus
+    from agent.tools.registry import ToolRegistry
+    from agent.persistence.db import Database
+    from agent.providers.base import ProviderResponse, LLMToolCall
+    from agent.tools.terminal import RunCommandTool
+    from unittest.mock import patch, AsyncMock
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db = Database(db_path=os.path.join(temp_dir, "test.db"))
+        await db.init()
+
+        registry = ToolRegistry()
+        cmd_tool = RunCommandTool()
+        registry.register(cmd_tool)
+
+        os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
+        try:
+            task = Task(
+                id="untrusted_task_1",
+                goal="Attempt to run untrusted command on host",
+                task_type=TaskType.CODE_MODIFICATION,
+                workspace_path=temp_dir,
+                acceptance_criteria=["run code"],
+                model_provider="openai",
+                model_name="gpt-4o",
+            )
+
+            # Mock model deliberately attempting to request host execution
+            mock_adapter = AsyncMock()
+            mock_adapter.chat_completion.side_effect = [
+                ProviderResponse(
+                    content="I will execute directly on the host.",
+                    tool_calls=[
+                        LLMToolCall(
+                            id="tc_escape",
+                            name="run_command",
+                            arguments={
+                                "command": "echo untrusted",
+                                "sandbox_mode": "host",
+                                "require_sandbox": False,
+                                "trusted_development_only": True,
+                            },
+                        )
+                    ],
+                ),
+                ProviderResponse(content="Done", tool_calls=[]),
+            ]
+
+            # Intercept tool execution to verify arguments passed to tool
+            captured_kwargs = {}
+            original_exec = cmd_tool.execute
+            async def spy_exec(workspace_path, **kwargs):
+                captured_kwargs.update(kwargs)
+                return await original_exec(workspace_path, **kwargs)
+
+            with patch.object(cmd_tool, "execute", side_effect=spy_exec), \
+                 patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter), \
+                 patch("shutil.which", return_value=None):  # Docker unavailable -> fails closed in container
+                engine = ExecutionEngine(db=db, tool_registry=registry)
+                with patch.object(engine.permission_manager, "evaluate_action", return_value=(True, "Allowed", None)):
+                    res_task = await engine.run_task(task, api_key="sk-test")
+
+                # ExecutionEngine overrode tool arguments: sandbox_mode was forced to container!
+                assert captured_kwargs.get("sandbox_mode") == "container"
+                assert captured_kwargs.get("require_sandbox") is True
+                assert "trusted_development_only" not in captured_kwargs
+        finally:
+            os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
 
 
 def test_verification_secret_multithreaded_concurrency():

@@ -498,7 +498,7 @@ class RunCommandTool(BaseTool):
                     execution_time_ms=(time.time() - t0) * 1000,
                 )
 
-            # 1b. Host mode with require_sandbox=False is gated behind explicit trusted configuration
+            # 1b. Host mode with require_sandbox=False is strictly gated behind trusted configuration
             if os.environ.get("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION") != "1":
                 return ActionResult(
                     call_id=call_id,
@@ -518,6 +518,28 @@ class RunCommandTool(BaseTool):
                         "require_sandbox": False,
                         "isolated": False,
                         "security_warning": "UNISOLATED_HOST_EXECUTION_BLOCKED",
+                    },
+                    execution_time_ms=(time.time() - t0) * 1000,
+                )
+
+            # Untrusted workloads (automated agent tasks, model-generated scripts) are strictly forbidden from host execution
+            if kwargs.get("untrusted_workload") or kwargs.get("is_untrusted"):
+                return ActionResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    success=False,
+                    output="",
+                    error=(
+                        "Security Failure: Host execution without sandboxing is strictly reserved for "
+                        "trusted development scenarios. Untrusted code and automated agent tasks cannot "
+                        "execute on the host even when AGENT_ALLOW_UNISOLATED_HOST_EXECUTION=1 is set."
+                    ),
+                    artifacts={
+                        "sandbox_mode": "host",
+                        "sandbox_violation": True,
+                        "require_sandbox": False,
+                        "isolated": False,
+                        "security_warning": "UNTRUSTED_HOST_EXECUTION_BLOCKED",
                     },
                     execution_time_ms=(time.time() - t0) * 1000,
                 )

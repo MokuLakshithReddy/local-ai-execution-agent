@@ -303,6 +303,14 @@ class ExecutionEngine:
                     "arguments": tool_args,
                 })
 
+                # Enforce container sandboxing for all automated task executions.
+                # Automated code and model tool calls can NEVER execute on the host even if host flags are set.
+                if tool_name in ("run_command", "run_verification"):
+                    tool_args["sandbox_mode"] = "container"
+                    tool_args["require_sandbox"] = True
+                    tool_args["untrusted_workload"] = True
+                    tool_args.pop("trusted_development_only", None)
+
                 result = await self.tool_registry.execute_tool(
                     name=tool_name,
                     workspace_path=task.workspace_path,
