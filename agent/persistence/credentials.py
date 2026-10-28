@@ -28,20 +28,45 @@ class CredentialEncryptionError(RuntimeError):
 
 
 class CredentialVault:
-    def __init__(self, key_dir: Optional[str] = None):
-        self._is_windows = IS_WINDOWS
+    def __init__(self, key_dir: Optional[str] = None, is_windows: Optional[bool] = None):
+        self._is_windows = IS_WINDOWS if is_windows is None else is_windows
+        self._key_dir = key_dir or os.path.expanduser("~/.config/ai_execution_agent")
+        self._key_file = os.path.join(self._key_dir, "vault.key")
         if not self._is_windows:
             from cryptography.fernet import Fernet
-            self._key_dir = key_dir or os.path.expanduser("~/.config/ai_execution_agent")
-            self._key_file = os.path.join(self._key_dir, "vault.key")
             self._fernet = Fernet(self._get_or_create_posix_key())
 
     def _get_or_create_posix_key(self) -> bytes:
         from cryptography.fernet import Fernet
-        # 1. If key file already exists, read and verify restrictive permissions
+
+        # 1. Symlink containment check
+        if os.path.islink(self._key_dir):
+            raise CredentialEncryptionError(f"Symlink attack detected at key directory '{self._key_dir}'.")
+        if os.path.islink(self._key_file):
+            raise CredentialEncryptionError(f"Symlink attack detected at key file '{self._key_file}'.")
+
+        # 2. Key directory verification and permission hardening
+        if not os.path.exists(self._key_dir):
+            try:
+                os.makedirs(self._key_dir, mode=0o700, exist_ok=True)
+            except Exception as e:
+                raise CredentialEncryptionError(f"Failed to create key directory '{self._key_dir}': {str(e)}") from e
+
+        if sys.platform != "win32":
+            try:
+                os.chmod(self._key_dir, 0o700)
+            except Exception as e:
+                raise CredentialEncryptionError(f"Failed to enforce 0700 permissions on key directory '{self._key_dir}': {str(e)}") from e
+            dir_st = os.stat(self._key_dir)
+            if (dir_st.st_mode & 0o077) != 0:
+                raise CredentialEncryptionError(
+                    f"Insecure permissions on key directory '{self._key_dir}' (mode: {oct(dir_st.st_mode)}). Expected 0700."
+                )
+
+        # 3. If key file already exists, verify permissions and load
         if os.path.exists(self._key_file):
             try:
-                if hasattr(os, "stat") and sys.platform != "win32":
+                if sys.platform != "win32":
                     st = os.stat(self._key_file)
                     if (st.st_mode & 0o077) != 0:
                         raise CredentialEncryptionError(
@@ -57,32 +82,30 @@ class CredentialVault:
                     raise
                 raise CredentialEncryptionError(f"Failed to read existing vault key '{self._key_file}': {str(e)}") from e
 
-        # 2. Key does not exist: generate and securely persist
+        # 4. Key does not exist: generate and atomically create with exclusive lock (O_EXCL)
         key = Fernet.generate_key()
         try:
-            if not os.path.exists(self._key_dir):
-                os.makedirs(self._key_dir, mode=0o700, exist_ok=True)
-            elif hasattr(os, "chmod") and sys.platform != "win32":
-                try:
-                    os.chmod(self._key_dir, 0o700)
-                except Exception:
-                    pass
+            # Atomic creation with O_CREAT | O_EXCL prevents concurrent creation races
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | (getattr(os, "O_BINARY", 0))
+            try:
+                fd = os.open(self._key_file, flags, 0o600)
+            except FileExistsError:
+                # Concurrent creator finished first: read and verify their key
+                with open(self._key_file, "rb") as f:
+                    return f.read().strip()
 
-            with open(self._key_file, "wb") as f:
+            with os.fdopen(fd, "wb") as f:
                 f.write(key)
 
-            if hasattr(os, "chmod") and sys.platform != "win32":
-                try:
-                    os.chmod(self._key_file, 0o600)
-                except Exception:
-                    pass
+            if sys.platform != "win32":
+                os.chmod(self._key_file, 0o600)
                 st = os.stat(self._key_file)
                 if (st.st_mode & 0o077) != 0:
                     raise CredentialEncryptionError(
                         f"Failed to verify 0600 permissions on newly created vault key '{self._key_file}'."
                     )
         except Exception as e:
-            if os.path.exists(self._key_file):
+            if os.path.exists(self._key_file) and not isinstance(e, FileExistsError):
                 try:
                     os.remove(self._key_file)
                 except Exception:

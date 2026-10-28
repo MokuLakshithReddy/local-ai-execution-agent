@@ -81,6 +81,13 @@ class ApprovalRequest(BaseModel):
     resolved_at: Optional[float] = None
 
 
+class StructuredAssertion(BaseModel):
+    criterion: str
+    target_test_or_assertion: str
+    result: str = "PASSED"  # "PASSED" or "FAILED"
+    evidence_artifact: Optional[str] = None
+
+
 class VerificationCheck(BaseModel):
     check_name: str
     check_type: str  # test, build, lint, git_diff, custom
@@ -89,6 +96,9 @@ class VerificationCheck(BaseModel):
     exit_code: Optional[int] = None
     output: str
     evidence_summary: str
+    structured_assertions: List[StructuredAssertion] = Field(default_factory=list)
+    criterion_bindings: Dict[str, str] = Field(default_factory=dict)
+    evidence_artifact: Optional[str] = None
 
 
 class CriterionEvidence(BaseModel):
@@ -100,7 +110,8 @@ class CriterionEvidence(BaseModel):
     linked_check: Optional[str] = None
     exit_status: Optional[int] = None
     test_node_or_assertion: Optional[str] = None
-    verification_tier: str = "UNVERIFIED"  # VERIFIED_ASSERTION, VERIFIED_TARGETED_TEST, HEURISTIC_ONLY, UNVERIFIED
+    evidence_artifact: Optional[str] = None
+    verification_tier: str = "UNVERIFIED"  # VERIFIED_ASSERTION, VERIFIED_TARGETED_TEST, UNVERIFIED
 
 
 
@@ -134,7 +145,9 @@ class Task(BaseModel):
     timeout_seconds: int = 600
     plan: List[str] = Field(default_factory=list)
     acceptance_criteria: List[str] = Field(default_factory=list)
+    criterion_bindings: Dict[str, str] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
     error: Optional[str] = None
     final_report: Optional[TaskReport] = None
+

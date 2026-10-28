@@ -187,39 +187,65 @@ class WindowsJobSandbox:
     - JOB_OBJECT_LIMIT_JOB_MEMORY (0x0200): Limits total memory consumption of the job tree.
     - JOB_OBJECT_LIMIT_PROCESS_MEMORY (0x0100): Limits per-process memory consumption.
     - JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION (0x0400).
+    Fails closed: raises SandboxViolationError if Job Object creation, limits, or assignment fails.
     """
-    def __init__(self, max_active_processes: int = 16, max_memory_bytes: int = 512 * 1024 * 1024):
+    def __init__(self, max_active_processes: int = 16, max_memory_bytes: int = 512 * 1024 * 1024, strict: bool = True):
         self._handle = None
         self._kernel32 = None
+        self.strict = strict
         if sys.platform == "win32":
             try:
                 import ctypes
                 self._kernel32 = ctypes.windll.kernel32
                 self._handle = self._kernel32.CreateJobObjectW(None, None)
-                if self._handle:
-                    limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-                    limits.BasicLimitInformation.LimitFlags = 0x2000 | 0x0008 | 0x0200 | 0x0400
-                    limits.BasicLimitInformation.ActiveProcessLimit = max_active_processes
-                    limits.JobMemoryLimit = max_memory_bytes
-                    limits.ProcessMemoryLimit = max_memory_bytes
-                    self._kernel32.SetInformationJobObject(
-                        self._handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)
-                    )
-            except Exception:
+                if not self._handle:
+                    if self.strict:
+                        raise SandboxViolationError("Windows kernel failed to create Job Object for process isolation.")
+                    return
+                limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+                limits.BasicLimitInformation.LimitFlags = 0x2000 | 0x0008 | 0x0200 | 0x0400
+                limits.BasicLimitInformation.ActiveProcessLimit = max_active_processes
+                limits.JobMemoryLimit = max_memory_bytes
+                limits.ProcessMemoryLimit = max_memory_bytes
+                success = self._kernel32.SetInformationJobObject(
+                    self._handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)
+                )
+                if not success:
+                    self._kernel32.CloseHandle(self._handle)
+                    self._handle = None
+                    if self.strict:
+                        raise SandboxViolationError("Windows kernel rejected SetInformationJobObject limit configuration.")
+            except Exception as e:
                 self._handle = None
+                if isinstance(e, SandboxViolationError):
+                    raise
+                if self.strict:
+                    raise SandboxViolationError(f"Failed to initialize Windows Job Sandbox: {str(e)}") from e
 
     def assign_process(self, pid: int) -> bool:
+        if sys.platform != "win32":
+            return True
         if not self._handle or not self._kernel32:
+            if self.strict:
+                raise SandboxViolationError("Windows Job Object handle is invalid; cannot attach process.")
             return False
         try:
             h_proc = self._kernel32.OpenProcess(0x0100 | 0x0001, False, pid)
-            if h_proc:
-                res = self._kernel32.AssignProcessToJobObject(self._handle, h_proc)
-                self._kernel32.CloseHandle(h_proc)
-                return bool(res)
-        except Exception:
-            pass
-        return False
+            if not h_proc:
+                if self.strict:
+                    raise SandboxViolationError(f"OpenProcess failed for pid {pid}; unable to establish sandbox boundary.")
+                return False
+            res = self._kernel32.AssignProcessToJobObject(self._handle, h_proc)
+            self._kernel32.CloseHandle(h_proc)
+            if not res and self.strict:
+                raise SandboxViolationError(f"Windows kernel AssignProcessToJobObject rejected process {pid}.")
+            return bool(res)
+        except Exception as e:
+            if isinstance(e, SandboxViolationError):
+                raise
+            if self.strict:
+                raise SandboxViolationError(f"Failed to assign process {pid} to Windows Job Object: {str(e)}") from e
+            return False
 
     def close(self):
         if self._handle and self._kernel32:
@@ -393,8 +419,105 @@ class RunCommandTool(BaseTool):
         # Set clean python unbuffered output
         isolated_env["PYTHONUNBUFFERED"] = "1"
 
-        # Initialize OS kernel sandbox limit manager
-        job_sandbox = WindowsJobSandbox(max_active_processes=16, max_memory_bytes=512 * 1024 * 1024)
+        sandbox_mode = kwargs.get("sandbox_mode", "host")  # "host" or "container"
+        require_sandbox = kwargs.get("require_sandbox", True)
+
+        # 1. Container Sandbox Execution Mode
+        if sandbox_mode == "container":
+            import shutil
+            docker_bin = shutil.which("docker")
+            if not docker_bin:
+                return ActionResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    success=False,
+                    output="",
+                    error="Container sandbox execution failed: 'docker' runtime is not installed or available in PATH.",
+                    artifacts={"sandbox_mode": "container", "container_runtime_available": False},
+                    execution_time_ms=(time.time() - t0) * 1000,
+                )
+
+            container_args = build_container_command(
+                command=command,
+                workspace_path=real_workspace,
+                image=kwargs.get("container_image", "python:3.12-slim"),
+                memory_limit=kwargs.get("container_memory", "512m"),
+                pids_limit=kwargs.get("container_pids", 32),
+                allow_network=allow_network,
+            )
+
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    container_args[0],
+                    *container_args[1:],
+                    cwd=real_workspace,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=isolated_env,
+                )
+
+                try:
+                    stdout_coro = _read_bounded_stream(process.stdout, MAX_OUTPUT_BYTES)
+                    stderr_coro = _read_bounded_stream(process.stderr, MAX_OUTPUT_BYTES // 2)
+                    (stdout_bytes, stdout_trunc), (stderr_bytes, stderr_trunc) = await asyncio.wait_for(
+                        asyncio.gather(stdout_coro, stderr_coro),
+                        timeout=float(timeout),
+                    )
+                    await process.wait()
+                except asyncio.TimeoutError:
+                    if process.pid:
+                        _kill_process_tree(process.pid)
+                    return ActionResult(
+                        call_id=call_id,
+                        tool_name=self.name,
+                        success=False,
+                        output="",
+                        error=f"Container execution timed out after {timeout} seconds.",
+                        execution_time_ms=(time.time() - t0) * 1000,
+                    )
+
+                exit_code = process.returncode
+                stdout_str = stdout_bytes.decode("utf-8", errors="replace")
+                stderr_str = stderr_bytes.decode("utf-8", errors="replace")
+                full_text = f"{stdout_str}\n{stderr_str}".strip()
+
+                return ActionResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    success=(exit_code == 0),
+                    output=full_text if full_text else "(container command produced no output)",
+                    error=f"Exit code: {exit_code}" if exit_code != 0 else None,
+                    artifacts={"exit_code": exit_code, "command": command, "sandbox_mode": "container"},
+                    execution_time_ms=(time.time() - t0) * 1000,
+                )
+            except Exception as e:
+                return ActionResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    success=False,
+                    output="",
+                    error=f"Container execution error: {str(e)}",
+                    artifacts={"sandbox_mode": "container"},
+                    execution_time_ms=(time.time() - t0) * 1000,
+                )
+
+        # 2. Host OS Process Execution Mode with Kernel Limits
+        try:
+            job_sandbox = WindowsJobSandbox(
+                max_active_processes=16,
+                max_memory_bytes=512 * 1024 * 1024,
+                strict=require_sandbox,
+            )
+        except SandboxViolationError as sve:
+            return ActionResult(
+                call_id=call_id,
+                tool_name=self.name,
+                success=False,
+                output="",
+                error=f"Sandbox Isolation Failure: {str(sve)}",
+                artifacts={"sandbox_violation": True},
+                execution_time_ms=(time.time() - t0) * 1000,
+            )
 
         try:
             process = await asyncio.create_subprocess_shell(
@@ -404,9 +527,21 @@ class RunCommandTool(BaseTool):
                 stderr=asyncio.subprocess.PIPE,
                 env=isolated_env,
             )
-            # Enforce OS kernel process and memory limits
+            # Enforce OS kernel process and memory limits - fail closed if assignment fails
             if process.pid:
-                job_sandbox.assign_process(process.pid)
+                try:
+                    job_sandbox.assign_process(process.pid)
+                except SandboxViolationError as sve:
+                    _kill_process_tree(process.pid)
+                    return ActionResult(
+                        call_id=call_id,
+                        tool_name=self.name,
+                        success=False,
+                        output="",
+                        error=f"Sandbox Isolation Failure: {str(sve)} Process terminated.",
+                        artifacts={"sandbox_violation": True},
+                        execution_time_ms=(time.time() - t0) * 1000,
+                    )
 
             try:
                 # Read streams with memory bound

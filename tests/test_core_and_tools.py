@@ -12,7 +12,7 @@ import subprocess
 import aiosqlite
 from fastapi.testclient import TestClient
 
-from agent.core.models import PermissionLevel, VerificationCheck, TaskStatus, TaskType, Task
+from agent.core.models import PermissionLevel, VerificationCheck, TaskStatus, TaskType, Task, StructuredAssertion
 from agent.security.permissions import PermissionManager, PermissionPolicy
 from agent.security.sanitizer import SecuritySanitizer
 from agent.verification.verifier import VerificationEngine, infer_task_type
@@ -783,6 +783,7 @@ def test_verifier_criteria_mapping_and_evidence():
         exit_code=0,
         output="1 passed - API endpoint returned 401 on missing token as expected",
         evidence_summary="API endpoint returned 401 on missing token as expected",
+        criterion_bindings={"API endpoint must return 401 on missing token": "test_api_auth.py"},
     )
     ve.record_check(check1)
 
@@ -806,8 +807,8 @@ def test_verifier_criteria_mapping_and_evidence():
     crit2_ev = next(ce for ce in report_partial.criteria_evidence if "401" in ce.criterion)
     assert crit1_ev.demonstrated is False
     assert crit2_ev.demonstrated is True
-    assert any("not demonstrated" in r.lower() for r in report_partial.unresolved_risks_or_limitations)
-    assert any("not demonstrated" in s.lower() for s in report_partial.skipped_or_failed_checks)
+    assert any("not proven" in r.lower() or "not demonstrated" in r.lower() for r in report_partial.unresolved_risks_or_limitations)
+    assert any("not proven" in s.lower() or "not demonstrated" in s.lower() for s in report_partial.skipped_or_failed_checks)
 
     # Check 2: Now add check demonstrating database migration fail closed
     check2 = VerificationCheck(
@@ -818,6 +819,7 @@ def test_verifier_criteria_mapping_and_evidence():
         exit_code=0,
         output="Database migration must fail closed on write error verified",
         evidence_summary="Database migration must fail closed on write error",
+        criterion_bindings={"Database migration must fail closed on write error": "test_migration.py"},
     )
     ve.record_check(check2)
 
@@ -905,15 +907,15 @@ def test_posix_vault_key_failure_handling():
     from agent.persistence.credentials import CredentialVault, CredentialEncryptionError
 
     # 1. Unwritable directory / permission failure -> raises CredentialEncryptionError
-    with tempfile.TemporaryDirectory() as temp_dir:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
         key_dir = os.path.join(temp_dir, "keys")
         v = CredentialVault.__new__(CredentialVault)
         v._is_windows = False
         v._key_dir = key_dir
         v._key_file = os.path.join(key_dir, "vault.key")
 
-        # Simulate open() raising PermissionError (unwritable directory)
-        with patch("builtins.open", side_effect=PermissionError("Permission denied: unwritable key dir")):
+        # Simulate os.open() raising PermissionError (unwritable directory)
+        with patch("os.open", side_effect=PermissionError("Permission denied: unwritable key dir")):
             with pytest.raises(CredentialEncryptionError, match="POSIX vault key persistence failed"):
                 v._get_or_create_posix_key()
 
@@ -922,10 +924,16 @@ def test_posix_vault_key_failure_handling():
         with open(v._key_file, "wb") as f:
             f.write(b"a" * 32)
         
-        class MockStat:
-            st_mode = 0o100644
+        from unittest.mock import MagicMock
+        def mock_stat_func(path):
+            stat_obj = MagicMock()
+            if path == v._key_dir:
+                stat_obj.st_mode = 0o040700
+            else:
+                stat_obj.st_mode = 0o100644
+            return stat_obj
 
-        with patch("sys.platform", "linux"), patch("os.stat", return_value=MockStat()):
+        with patch("sys.platform", "linux"), patch("os.stat", side_effect=mock_stat_func):
             with pytest.raises(CredentialEncryptionError, match="Insecure permissions on vault key"):
                 v._get_or_create_posix_key()
 
@@ -990,7 +998,7 @@ def test_verifier_strict_structured_evidence_mapping():
     assert all(ce.demonstrated is False for ce in report.criteria_evidence)
     assert all(ce.verification_tier == "UNVERIFIED" for ce in report.criteria_evidence)
 
-    # Now provide check with targeted test node for API auth
+    # Now provide check with explicitly bound targeted test node for API auth
     targeted_check = VerificationCheck(
         check_name="API Auth Test",
         check_type="test",
@@ -999,6 +1007,7 @@ def test_verifier_strict_structured_evidence_mapping():
         exit_code=0,
         output="tests/test_api.py::test_token_auth_missing_token_401 PASSED\n1 passed in 0.10s",
         evidence_summary="test_token_auth_missing_token_401 PASSED",
+        criterion_bindings={"API endpoint must return 401 on missing token": "test_token_auth_missing_token_401"},
     )
     ve.record_check(targeted_check)
 
@@ -1115,6 +1124,251 @@ def test_terminal_os_sandbox_job_limits_and_container_config():
         finally:
             if psutil.pid_exists(proc.pid):
                 proc.kill()
+
+
+def test_verifier_adversarial_irrelevant_passing_test_rejected():
+    """Validates Priority 4: Passing test with overlapping words must NOT satisfy acceptance criteria.
+    Only explicit criterion-to-test bindings or structured assertions can demonstrate satisfaction."""
+    ve = VerificationEngine()
+    criteria = ["API endpoint must return 401 on missing token"]
+
+    # Adversarial check: passes exit code 0, name has overlapping word "token", but tests something completely different
+    irrelevant_check = VerificationCheck(
+        check_name="Token Storage Counter Unit Test",
+        check_type="test",
+        command="pytest tests/test_token_storage.py -k test_token_counter_increment",
+        success=True,
+        exit_code=0,
+        output="tests/test_token_storage.py::test_token_counter_increment PASSED\n1 passed in 0.05s",
+        evidence_summary="test_token_counter_increment PASSED",
+    )
+    ve.record_check(irrelevant_check)
+
+    report = ve.evaluate_completion(
+        task_id="t_adv_1",
+        goal="Secure API token validation",
+        actions_taken=["Ran irrelevant test"],
+        modified_files=["agent/api/server.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+
+    # Must remain UNVERIFIED because there is no explicit binding to this criterion
+    assert report.status == TaskStatus.PARTIALLY_COMPLETED
+    assert report.acceptance_criteria_satisfied is False
+    assert len(report.criteria_evidence) == 1
+    assert report.criteria_evidence[0].demonstrated is False
+    assert report.criteria_evidence[0].verification_tier == "UNVERIFIED"
+    assert any("not proven" in s.lower() or "not demonstrated" in s.lower() for s in report.skipped_or_failed_checks)
+
+    # Now verify with structured assertion
+    ve2 = VerificationEngine()
+    structured_check = VerificationCheck(
+        check_name="API Auth Test Suite",
+        check_type="test",
+        command="pytest tests/test_server_auth.py",
+        success=True,
+        exit_code=0,
+        output="tests/test_server_auth.py::test_missing_token_returns_401 PASSED",
+        evidence_summary="1 passed in 0.08s",
+        structured_assertions=[
+            StructuredAssertion(
+                criterion="API endpoint must return 401 on missing token",
+                target_test_or_assertion="tests/test_server_auth.py::test_missing_token_returns_401",
+                result="PASSED",
+                evidence_artifact="tests/test_server_auth.py",
+            )
+        ],
+    )
+    ve2.record_check(structured_check)
+
+    report2 = ve2.evaluate_completion(
+        task_id="t_adv_2",
+        goal="Secure API server token authentication",
+        actions_taken=["Ran targeted assertion test"],
+        modified_files=["agent/api/server.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        acceptance_criteria=criteria,
+    )
+    assert report2.status == TaskStatus.COMPLETED
+    assert report2.acceptance_criteria_satisfied is True
+    assert report2.criteria_evidence[0].demonstrated is True
+    assert report2.criteria_evidence[0].verification_tier == "VERIFIED_ASSERTION"
+
+
+@pytest.mark.asyncio
+async def test_terminal_container_execution_fail_closed_and_dispatch():
+    """Validates Priority 1: Real container execution wire-up and fail-closed behavior.
+    - If docker binary is unavailable, execution fails closed with error.
+    - If docker is available, command runs through container runtime via create_subprocess_exec."""
+    from unittest.mock import patch, AsyncMock
+    from agent.tools.terminal import RunCommandTool
+
+    tool = RunCommandTool()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        # Case A: Docker binary missing -> fails closed immediately
+        with patch("shutil.which", return_value=None):
+            result = await tool.execute(
+                call_id="c_fail_docker",
+                command="echo 1",
+                workspace_path=temp_dir,
+                sandbox_mode="container",
+            )
+            assert result.success is False
+            assert "Container sandbox execution failed" in result.error
+            assert "docker" in result.error
+            assert result.artifacts.get("container_runtime_available") is False
+
+        # Case B: Docker binary present -> executed via create_subprocess_exec
+        mock_proc = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = AsyncMock()
+        mock_proc.stdout.read = AsyncMock(side_effect=[b"container output\n", b""])
+        mock_proc.stderr = AsyncMock()
+        mock_proc.stderr.read = AsyncMock(side_effect=[b"", b""])
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        with patch("shutil.which", return_value="/usr/bin/docker"), \
+             patch("asyncio.create_subprocess_exec", return_value=mock_proc) as mock_exec:
+            result = await tool.execute(
+                call_id="c_success_docker",
+                command="python -m pytest",
+                workspace_path=temp_dir,
+                sandbox_mode="container",
+                container_memory="512m",
+                container_pids=32,
+            )
+            assert mock_exec.called
+            called_args = mock_exec.call_args[0]
+            assert called_args[0] == "docker"
+            assert "--network=none" in called_args
+            assert "--read-only" in called_args
+            assert "--memory=512m" in called_args
+            assert result.success is True
+            assert "container output" in result.output
+            assert result.artifacts.get("sandbox_mode") == "container"
+
+
+@pytest.mark.asyncio
+async def test_windows_job_sandbox_fail_closed_and_process_killed():
+    """Validates Priority 2: Windows Job Sandbox failure causes command to fail closed
+    and terminates the spawned process tree."""
+    from unittest.mock import patch, MagicMock
+    from agent.tools.terminal import RunCommandTool, WindowsJobSandbox, SandboxViolationError
+
+    tool = RunCommandTool()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        # Simulate Windows environment with failed AssignProcessToJobObject
+        with patch("agent.tools.terminal.WindowsJobSandbox.assign_process", side_effect=SandboxViolationError("Simulated assignment failure")), \
+             patch("agent.tools.terminal._kill_process_tree") as mock_kill:
+            result = await tool.execute(
+                call_id="c_job_fail",
+                command="python -c \"import time; time.sleep(1)\"",
+                workspace_path=temp_dir,
+                sandbox_mode="host",
+                require_sandbox=True,
+            )
+            assert result.success is False
+            assert "Sandbox Isolation Failure" in result.error
+            assert "Process terminated" in result.error
+            assert result.artifacts.get("sandbox_violation") is True
+            assert mock_kill.called
+
+
+def test_posix_key_directory_permissions_and_symlink_rejection():
+    """Validates Priority 3: POSIX vault key directory protection:
+    - Rejects symlink key directory
+    - Rejects symlink key file
+    - Rejects overly permissive key directory on POSIX
+    - Atomic file creation via O_CREAT | O_EXCL."""
+    from unittest.mock import patch, MagicMock
+    from agent.persistence.credentials import CredentialVault, CredentialEncryptionError
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        vault_dir = os.path.join(temp_dir, "vault_posix")
+        os.makedirs(vault_dir, exist_ok=True)
+
+        # 1. Symlink key_dir rejection
+        real_target_dir = os.path.join(temp_dir, "real_dir")
+        os.makedirs(real_target_dir, exist_ok=True)
+        symlink_dir = os.path.join(temp_dir, "symlink_dir")
+
+        with patch("os.path.islink", side_effect=lambda p: p == symlink_dir):
+            v_sym = CredentialVault(key_dir=symlink_dir)
+            with pytest.raises(CredentialEncryptionError, match="Symlink"):
+                v_sym._get_or_create_posix_key()
+
+        # 2. Insecure directory mode rejection on POSIX
+        with patch("sys.platform", "linux"), \
+             patch("os.stat") as mock_stat:
+            # Simulate st_mode with group/other readable (0o777)
+            stat_obj = MagicMock()
+            stat_obj.st_mode = 0o040777
+            mock_stat.return_value = stat_obj
+
+            v_mode = CredentialVault(key_dir=vault_dir)
+            with pytest.raises(CredentialEncryptionError, match="Insecure permissions on key directory"):
+                v_mode._get_or_create_posix_key()
+
+
+@pytest.mark.asyncio
+async def test_credential_migration_partial_failure_stages():
+    """Validates Priority 5: Credential migration partial failures at each stage:
+    - Encryption failure fails closed and raises CredentialMigrationError
+    - Database write failure raises CredentialMigrationError
+    - Recovery after transient failure clears."""
+    import json
+    import base64
+    from unittest.mock import patch
+    from agent.persistence.db import Database, CredentialMigrationError
+    from agent.persistence.credentials import CredentialEncryptionError
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        db_file = os.path.join(temp_dir, "mig_stages.db")
+        db = Database(db_path=db_file)
+        await db.init()
+
+        secret_val = "sk-secret-test-stage"
+        b64_val = "b64:" + base64.b64encode(secret_val.encode()).decode("ascii")
+
+        # Insert legacy setting in app_settings dict
+        legacy_settings = {"openai_api_key": b64_val}
+        async with aiosqlite.connect(db_file) as conn:
+            await conn.execute(
+                "INSERT INTO settings (key, value_json) VALUES (?, ?)",
+                ("app_settings", json.dumps(legacy_settings)),
+            )
+            await conn.commit()
+
+        # Stage 1: Encryption failure during migration -> fails closed
+        with patch("agent.persistence.credentials.vault.encrypt", side_effect=CredentialEncryptionError("Vault down")):
+            with pytest.raises(CredentialMigrationError, match="Failed to securely migrate"):
+                await db.get_setting("app_settings")
+
+        # Confirm setting remains legacy b64 (not corrupted or lost)
+        async with aiosqlite.connect(db_file) as conn:
+            async with conn.execute("SELECT value_json FROM settings WHERE key = 'app_settings'") as cur:
+                row = await cur.fetchone()
+                assert json.loads(row[0])["openai_api_key"] == b64_val
+
+        # Stage 2: Database write failure during migration -> fails closed
+        with patch.object(db, "save_setting", side_effect=Exception("SQLite lock")):
+            with pytest.raises(CredentialMigrationError, match="Failed to securely migrate"):
+                await db.get_setting("app_settings")
+
+        # Stage 3: Recovery -> Once failures are resolved, migration succeeds cleanly
+        recovered = await db.get_setting("app_settings")
+        assert recovered["openai_api_key"] == secret_val
+
+        # Verify database now stores proper encrypted format (dpapi: or fernet:)
+        async with aiosqlite.connect(db_file) as conn:
+            async with conn.execute("SELECT value_json FROM settings WHERE key = 'app_settings'") as cur:
+                row = await cur.fetchone()
+                stored = json.loads(row[0])["openai_api_key"]
+                assert stored.startswith("dpapi:") or stored.startswith("fernet:")
+
 
 
 

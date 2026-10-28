@@ -3,11 +3,18 @@ Verification engine and completion report builder.
 Distinguishes between model claims, executed tools, and observed verifiable evidence.
 Enforces criteria-based completion, relevance matching, skipped-check tracking, and state consistency.
 """
-from typing import List, Optional
+from typing import List, Optional, Dict
 import os
 import re
 import time
-from agent.core.models import TaskStatus, TaskType, VerificationCheck, TaskReport, CriterionEvidence
+from agent.core.models import (
+    TaskStatus,
+    TaskType,
+    VerificationCheck,
+    TaskReport,
+    CriterionEvidence,
+    StructuredAssertion,
+)
 
 # Legitimate verification runners
 VALID_CHECK_RUNNERS = [
@@ -142,11 +149,13 @@ class VerificationEngine:
         git_diff_summary: Optional[str] = None,
         unresolved_notes: Optional[List[str]] = None,
         acceptance_criteria: Optional[List[str]] = None,
+        criterion_bindings: Optional[Dict[str, str]] = None,
     ) -> TaskReport:
         """
         Synthesizes observed evidence into a structured completion report.
         Strictly requires evidence linking checks to acceptance criteria.
-        Distinguishes generic 'command passed' from concrete 'requirement demonstrated'.
+        Requires explicit criterion-to-test mappings or structured verification results.
+        Rejects keyword overlap or coincidental word-matching as insufficient proof.
         Guarantees that CANCELLED, BLOCKED, or FAILED tasks never report false success.
         """
         # Determine the latest outcome for each verification command/check
@@ -172,44 +181,63 @@ class VerificationEngine:
         criteria_evidence: List[CriterionEvidence] = []
         g_lower = goal.lower()
 
+        # Consolidate criterion bindings (from evaluate_completion parameter and checks)
+        all_bindings: Dict[str, str] = dict(criterion_bindings or {})
+        for c in self.recorded_checks:
+            if hasattr(c, "criterion_bindings") and c.criterion_bindings:
+                all_bindings.update(c.criterion_bindings)
+
         # 1. Process explicit acceptance criteria if provided
         if acceptance_criteria:
             for criterion in acceptance_criteria:
-                c_lower = criterion.lower()
-                c_words = set(re.findall(r"[a-zA-Z0-9_-]{3,}", c_lower))
-                c_words = {w for w in c_words if w not in {"the", "and", "for", "with", "this", "that", "from", "should", "must", "verify", "check", "test"}}
-
                 matching_check = None
                 matched_proof = None
+                matched_artifact = None
                 verification_tier = "UNVERIFIED"
 
-                for check in relevant_passed_checks:
-                    test_nodes = _extract_test_nodes_and_assertions(check)
-                    check_text = f"{(check.command or '')}\n{check.check_name}\n{check.output}\n{check.evidence_summary}".lower()
+                # Check 1: Explicit criterion binding (maps criterion -> exact test node/file/target)
+                target_test = None
+                for b_crit, b_target in all_bindings.items():
+                    if b_crit.strip().lower() == criterion.strip().lower() or b_crit.strip() == criterion.strip():
+                        target_test = b_target
+                        break
 
-                    # 1. Check for targeted test node (highest fidelity tier: VERIFIED_TARGETED_TEST)
-                    for node in test_nodes:
-                        node_terms = set(re.findall(r"[a-z0-9]+", node))
-                        if len(c_words.intersection(node_terms)) >= 2:
+                if target_test:
+                    target_test_clean = target_test.strip().lower()
+                    for check in relevant_passed_checks:
+                        test_nodes = [n.lower() for n in _extract_test_nodes_and_assertions(check)]
+                        cmd_lower = (check.command or "").lower()
+                        check_name_lower = check.check_name.lower()
+                        output_lower = check.output.lower()
+
+                        if (
+                            any(target_test_clean in node or node in target_test_clean for node in test_nodes)
+                            or target_test_clean in cmd_lower
+                            or target_test_clean in check_name_lower
+                            or target_test_clean in output_lower
+                        ):
                             matching_check = check
-                            matched_proof = f"Targeted test node '{node}' passed"
+                            matched_proof = f"Explicitly bound test target '{target_test}' executed and passed"
+                            matched_artifact = check.evidence_artifact or (check.command or check.check_name)
                             verification_tier = "VERIFIED_TARGETED_TEST"
                             break
-                    if matching_check:
-                        break
 
-                    # 2. Check for explicit structured assertion in output/summary (tier: VERIFIED_ASSERTION)
-                    for line in check_text.splitlines():
-                        line_words = set(re.findall(r"[a-z0-9_-]+", line))
-                        common = c_words.intersection(line_words)
-                        if len(common) >= 2 and any(p in line for p in ("passed", "assert", "verified", "succeeded", "ok", "200", "401", "403", "404", "error", "closed")):
-                            matching_check = check
-                            matched_proof = f"Assertion verified: {line.strip()[:120]}"
-                            verification_tier = "VERIFIED_ASSERTION"
+                # Check 2: Structured verification assertion on check model
+                if not matching_check:
+                    for check in relevant_passed_checks:
+                        for sa in getattr(check, "structured_assertions", []):
+                            if sa.criterion.strip().lower() == criterion.strip().lower():
+                                if sa.result.upper() == "PASSED":
+                                    matching_check = check
+                                    matched_proof = f"Structured assertion: '{sa.target_test_or_assertion}' (result: PASSED)"
+                                    matched_artifact = sa.evidence_artifact or check.evidence_artifact or (check.command or check.check_name)
+                                    verification_tier = "VERIFIED_ASSERTION"
+                                    break
+                        if matching_check:
                             break
-                    if matching_check:
-                        break
 
+                # If no explicit binding or structured assertion, retain UNVERIFIED.
+                # Word-overlap or coincidental substring matching in test names is rejected.
                 if matching_check:
                     criteria_evidence.append(
                         CriterionEvidence(
@@ -221,6 +249,7 @@ class VerificationEngine:
                             linked_check=matching_check.command or matching_check.check_name,
                             exit_status=matching_check.exit_code,
                             test_node_or_assertion=matched_proof,
+                            evidence_artifact=matched_artifact,
                             verification_tier=verification_tier,
                         )
                     )
@@ -229,18 +258,23 @@ class VerificationEngine:
                     criteria_evidence.append(
                         CriterionEvidence(
                             criterion=criterion,
-                            requirement="Concrete test execution demonstrating requirement",
+                            requirement="Explicit criterion-to-test binding or structured assertion proving requirement",
                             demonstrated=False,
                             evidence_type="unverified",
-                            evidence_summary=f"Check '{best_general.check_name}' exited 0, but no targeted test node or assertion proved this criterion." if best_general else "No passing check executed for this criterion.",
+                            evidence_summary=(
+                                f"Check '{best_general.check_name}' exited 0, but no explicit test binding or structured assertion proved this criterion."
+                                if best_general
+                                else "No passing check executed for this criterion."
+                            ),
                             linked_check=best_general.command if best_general else None,
                             exit_status=best_general.exit_code if best_general else None,
                             test_node_or_assertion=None,
+                            evidence_artifact=None,
                             verification_tier="UNVERIFIED",
                         )
                     )
                     skipped_or_failed.append(
-                        f"Unmet Acceptance Criterion: '{criterion}' was not demonstrated by concrete verification evidence."
+                        f"Unmet Acceptance Criterion: '{criterion}' was not proven by an explicit test binding or structured assertion."
                     )
 
 
