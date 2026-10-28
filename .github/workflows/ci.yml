@@ -44,8 +44,10 @@ jobs:
 
     - name: Run Live Docker Container Security Boundaries Integration Test
       if: matrix.os == 'ubuntu-latest'
+      env:
+        REQUIRE_DOCKER: "1"
       run: |
-        pytest tests/ -v -k "test_real_docker"
+        pytest tests/ -v -k "test_real_docker or test_run_verification_tool_structured_record_e2e"
 
   frontend:
     name: Frontend Build & Typecheck

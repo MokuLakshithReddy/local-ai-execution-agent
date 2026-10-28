@@ -1765,6 +1765,8 @@ async def test_real_docker_container_security_boundaries():
     3. User boundary: container runs as non-root user (id -u != 0).
     4. Timeout cleanup: timed-out container is forcefully removed and not left in docker ps -a."""
     if not is_docker_daemon_available():
+        if os.environ.get("REQUIRE_DOCKER") == "1":
+            pytest.fail("Docker daemon is required in dedicated Docker CI integration test job but was not available.")
         pytest.skip("Docker daemon is not running on this host.")
 
     from agent.tools.terminal import RunCommandTool
@@ -2086,10 +2088,16 @@ async def test_run_verification_tool_structured_record_e2e():
         xml_leftovers = [f for f in os.listdir(temp_dir) if f.startswith(".verification_report_")]
         assert len(xml_leftovers) == 0
 
-        # If Docker daemon is available and container image has pytest, execute through real container boundary
-        if is_docker_daemon_available():
+        # In dedicated Docker CI job, container verification is mandatory (fails rather than skips)
+        require_docker = os.environ.get("REQUIRE_DOCKER") == "1"
+        if require_docker or is_docker_daemon_available():
+            if not is_docker_daemon_available():
+                pytest.fail("Docker daemon is required in Docker CI integration test job but was not available.")
             chk = subprocess.run(["docker", "run", "--rm", "python:3.12-slim", "pytest", "--version"], capture_output=True)
-            if chk.returncode == 0:
+            if chk.returncode != 0:
+                if require_docker:
+                    pytest.fail(f"Required pytest was not found in python:3.12-slim image: {chk.stderr.decode()}")
+            else:
                 res_c = await tool.execute(
                     workspace_path=temp_dir,
                     call_id="call_verify_container_e2e",
@@ -2154,6 +2162,158 @@ def test_credential_vault_multiprocess_concurrency_and_crash_recovery():
         assert len(key) >= 32
         enc = v.encrypt("recovered_after_crash")
         assert v.decrypt(enc) == "recovered_after_crash"
+
+
+def test_trusted_execution_record_individual_field_tampering_rejected():
+    """Validates Blocker 1:
+    All security-relevant fields (run_id, runner, command, exit_code, total, passed, failed,
+    passed_nodes, failed_nodes, timestamp) are signed. Tampering with ANY individual field
+    invalidates the cryptographic signature and causes verification to fail."""
+    original = issue_trusted_execution_record(
+        run_id="run_100",
+        runner="pytest",
+        command="pytest tests/test_security.py",
+        exit_code=0,
+        total=2,
+        passed=2,
+        failed=0,
+        passed_nodes=["tests/test_security.py::test_boundary", "test_boundary"],
+        failed_nodes=[],
+    )
+    assert verify_trusted_execution_record(original) is True
+
+    # 1. Modify run_id
+    t = original.model_copy()
+    t.run_id = "run_tampered"
+    assert verify_trusted_execution_record(t) is False
+
+    # 2. Modify runner
+    t = original.model_copy()
+    t.runner = "unittest"
+    assert verify_trusted_execution_record(t) is False
+
+    # 3. Modify command
+    t = original.model_copy()
+    t.command = "pytest tests/other.py"
+    assert verify_trusted_execution_record(t) is False
+
+    # 4. Modify exit_code
+    t = original.model_copy()
+    t.exit_code = 1
+    assert verify_trusted_execution_record(t) is False
+
+    # 5. Modify total count
+    t = original.model_copy()
+    t.total = 3
+    assert verify_trusted_execution_record(t) is False
+
+    # 6. Modify passed count
+    t = original.model_copy()
+    t.passed = 1
+    assert verify_trusted_execution_record(t) is False
+
+    # 7. Modify failed count
+    t = original.model_copy()
+    t.failed = 1
+    assert verify_trusted_execution_record(t) is False
+
+    # 8. Modify passed_nodes
+    t = original.model_copy()
+    t.passed_nodes = ["tests/test_other.py::test_tampered"]
+    assert verify_trusted_execution_record(t) is False
+
+    # 9. Modify failed_nodes
+    t = original.model_copy()
+    t.failed_nodes = ["tests/test_security.py::test_failed"]
+    assert verify_trusted_execution_record(t) is False
+
+    # 10. Modify timestamp
+    t = original.model_copy()
+    t.timestamp = original.timestamp + 10.0
+    assert verify_trusted_execution_record(t) is False
+
+    # 11. Modify signature
+    t = original.model_copy()
+    t.signature = "a" * 64
+    assert verify_trusted_execution_record(t) is False
+
+    # 12. Inconsistent counts (passed + failed != total)
+    t = original.model_copy()
+    t.total = 10
+    assert verify_trusted_execution_record(t) is False
+
+    # 13. Zero testcases
+    t = original.model_copy()
+    t.total = 0
+    t.passed = 0
+    assert verify_trusted_execution_record(t) is False
+
+
+def test_parse_junit_xml_report_rejects_zero_tests_and_counts_cases_accurately():
+    """Validates Blocker 2:
+    1. JUnit parser rejects reports with 0 test cases (returns None).
+    2. JUnit parser counts testcases, not identifier tokens (failed count accurately equals failed testcases).
+    3. Rejects reports with inconsistent counts or 0 passed tests.
+    4. issue_trusted_execution_record rejects zero-test or inconsistent counts."""
+    from agent.tools.verification import parse_junit_xml_report
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Case 1: Empty XML report with 0 test cases
+        zero_xml = os.path.join(temp_dir, "zero_tests.xml")
+        with open(zero_xml, "w") as f:
+            f.write('<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest" tests="0" errors="0" failures="0" skipped="0"></testsuite></testsuites>')
+        assert parse_junit_xml_report(zero_xml) is None
+
+        # Case 2: Accurate case counting vs identifier tokens
+        # 1 passed testcase, 1 failed testcase (each testcase generates multiple identifier aliases)
+        report_xml = os.path.join(temp_dir, "counted_tests.xml")
+        with open(report_xml, "w") as f:
+            f.write(
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                '<testsuites>\n'
+                '  <testsuite name="pytest" tests="2">\n'
+                '    <testcase classname="tests.test_auth" file="tests/test_auth.py" name="test_ok" time="0.01"/>\n'
+                '    <testcase classname="tests.test_auth" file="tests/test_auth.py" name="test_bad" time="0.01">\n'
+                '      <failure message="AssertionError">assert False</failure>\n'
+                '    </testcase>\n'
+                '  </testsuite>\n'
+                '</testsuites>'
+            )
+        parsed = parse_junit_xml_report(report_xml)
+        assert parsed is not None
+        # MUST count test cases, NOT identifier list lengths!
+        assert parsed["total"] == 2
+        assert parsed["passed"] == 1
+        assert parsed["failed"] == 1
+        # Identifier list contains the aliases
+        assert len(parsed["passed_nodes"]) >= 2
+        assert len(parsed["failed_nodes"]) >= 2
+
+        # Case 3: issue_trusted_execution_record rejects zero tests or count inconsistency
+        with pytest.raises(ValueError, match="Zero-test or inconsistent reports"):
+            issue_trusted_execution_record(
+                run_id="r_zero",
+                runner="pytest",
+                command="pytest",
+                exit_code=0,
+                total=0,
+                passed=0,
+                failed=0,
+                passed_nodes=[],
+            )
+
+        with pytest.raises(ValueError, match="Zero-test or inconsistent reports"):
+            issue_trusted_execution_record(
+                run_id="r_inconsistent",
+                runner="pytest",
+                command="pytest",
+                exit_code=0,
+                total=5,
+                passed=2,
+                failed=1,
+                passed_nodes=["test_a", "test_b"],
+            )
+
 
 
 
