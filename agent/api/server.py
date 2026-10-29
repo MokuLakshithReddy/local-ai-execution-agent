@@ -506,18 +506,38 @@ async def cancel_task(task_id: str):
 
 @app.get("/api/approvals/pending", dependencies=[Depends(verify_auth)])
 async def get_pending_approvals():
+    pending_list = sorted(
+        permission_manager.pending_approvals.values(),
+        key=lambda a: a.sequence_id,
+    )
     return {
-        "approvals": [a.model_dump() for a in permission_manager.pending_approvals.values()]
+        "approvals": [a.model_dump() for a in pending_list]
     }
 
 
 @app.post("/api/approvals/{approval_id}", dependencies=[Depends(verify_auth)])
 async def resolve_approval(approval_id: str, req: ResolveApprovalRequest):
-    resolved = permission_manager.resolve_approval(approval_id, req.approved)
-    if not resolved:
-        raise HTTPException(status_code=404, detail="Pending approval not found or already resolved.")
-    await broadcast_event("approval_resolved", {"approval_id": approval_id, "status": resolved.status})
-    return {"status": "resolved", "approval": resolved.model_dump()}
+    resolved, code = permission_manager.resolve_approval(approval_id, req.approved)
+    if code == "NOT_FOUND":
+        raise HTTPException(
+            status_code=404,
+            detail=f"Approval request '{approval_id}' was not found or has expired.",
+        )
+    if code == "ALREADY_RESOLVED":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Approval request '{approval_id}' was already resolved (status: {resolved.status}).",
+        )
+    await broadcast_event(
+        "approval_resolved",
+        {
+            "approval_id": approval_id,
+            "task_id": resolved.task_id,
+            "status": resolved.status,
+            "sequence_id": resolved.sequence_id,
+        },
+    )
+    return {"status": "resolved", "code": code, "approval": resolved.model_dump()}
 
 
 @app.get("/api/diff", dependencies=[Depends(verify_auth)])
