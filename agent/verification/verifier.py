@@ -270,6 +270,21 @@ class VerificationEngine:
         # 1. Process explicit acceptance criteria if provided
         if acceptance_criteria:
             for criterion in acceptance_criteria:
+                if task_type == TaskType.INFORMATIONAL:
+                    demonstrated = bool(actions_taken)
+                    criteria_evidence.append(
+                        CriterionEvidence(
+                            criterion=criterion,
+                            requirement="Inspect codebase and synthesize informational findings",
+                            demonstrated=demonstrated,
+                            evidence_type="inspection_and_reasoning",
+                            evidence_summary=f"Addressed criterion via {len(actions_taken)} inspection action(s)." if demonstrated else "No inspection actions taken.",
+                            linked_check=None,
+                            verification_tier="VERIFIED_INSPECTION" if demonstrated else "UNVERIFIED",
+                        )
+                    )
+                    continue
+
                 matching_check = None
                 matched_proof = None
                 matched_artifact = None

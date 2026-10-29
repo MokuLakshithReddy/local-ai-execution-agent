@@ -178,6 +178,9 @@ export default function App() {
   const [showWorkspaceModal, setShowWorkspaceModal] = useState(false)
   const [workspaceInput, setWorkspaceInput] = useState('')
   const [historyTasks, setHistoryTasks] = useState<any[]>([])
+  const [settingsError, setSettingsError] = useState<string | null>(null)
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null)
+  const [isCancelling, setIsCancelling] = useState(false)
 
   // Accessibility refs for focus management
   const approveBtnRef = useRef<HTMLButtonElement | null>(null)
@@ -384,6 +387,12 @@ export default function App() {
           const data = await res.json()
           if (data && data.detail) errMsg = data.detail
         } catch {}
+        if (res.status === 404) {
+          // Approval already resolved, cancelled, or expired on server
+          setPendingApproval(null)
+          setApprovalError(null)
+          return
+        }
         setApprovalError(errMsg)
         // Keep pendingApproval intact on server error
         return
@@ -588,23 +597,27 @@ export default function App() {
   }
 
   const cancelTask = async () => {
-    if (!currentTaskId) return
+    if (!currentTaskId || isCancelling) return
+    setIsCancelling(true)
+    setTaskStatus('CANCELLING...')
     try {
       await authFetch(`${API_BASE}/api/tasks/${currentTaskId}/cancel`, { method: 'POST' })
       setTaskStatus('CANCELLED')
       fetchDiff()
     } catch {
-      // Ignore cancellation error
+      setTaskStatus('CANCELLED')
+    } finally {
+      setIsCancelling(false)
     }
   }
 
   const saveSettingsToServer = async () => {
+    setSettingsError(null)
     try {
       const payload: any = {
         auto_approve_routine: settings.auto_approve_routine,
         auto_approve_sensitive: settings.auto_approve_sensitive,
         ollama_base_url: settings.ollama_base_url,
-        current_workspace: currentWorkspace,
       }
       if (inputApiKey.trim()) {
         if (provider === 'gemini') payload.gemini_api_key = inputApiKey.trim()
@@ -612,33 +625,91 @@ export default function App() {
         if (provider === 'anthropic') payload.anthropic_api_key = inputApiKey.trim()
       }
 
-      await authFetch(`${API_BASE}/api/settings`, {
+      const res = await authFetch(`${API_BASE}/api/settings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       })
+      if (!res.ok) {
+        let errMsg = 'Failed to save settings'
+        try {
+          const d = await res.json()
+          if (d && d.detail) errMsg = d.detail
+        } catch {}
+        setSettingsError(errMsg)
+        return
+      }
       setInputApiKey('')
       setShowSettings(false)
       loadSettings()
-    } catch {
-      // Ignore settings save error
+    } catch (err: any) {
+      setSettingsError(err?.message || 'Network error while saving settings.')
     }
   }
 
   const applyWorkspaceChange = async () => {
     if (!workspaceInput.trim()) return
     const newWs = workspaceInput.trim()
-    setCurrentWorkspace(newWs)
-    setShowWorkspaceModal(false)
-    fetchDiff(newWs)
+    setWorkspaceError(null)
     try {
-      await authFetch(`${API_BASE}/api/settings`, {
+      const res = await authFetch(`${API_BASE}/api/workspaces/approve`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ current_workspace: newWs }),
+        body: JSON.stringify({ workspace_path: newWs }),
       })
-    } catch {
-      // Ignore workspace save error
+      if (!res.ok) {
+        let errMsg = 'Failed to approve workspace'
+        try {
+          const d = await res.json()
+          if (d && d.detail) errMsg = d.detail
+        } catch {}
+        setWorkspaceError(errMsg)
+        return
+      }
+      setCurrentWorkspace(newWs)
+      setShowWorkspaceModal(false)
+      fetchDiff(newWs)
+      loadWorkspaces()
+    } catch (err: any) {
+      setWorkspaceError(err?.message || 'Network error while approving workspace.')
+    }
+  }
+
+  const loadHistoricalTask = async (taskId: string) => {
+    try {
+      const res = await authFetch(`${API_BASE}/api/tasks/${taskId}`)
+      if (!res.ok) return
+      const data = await res.json()
+      if (!data || !data.task) return
+
+      const t = data.task
+      setCurrentTaskId(t.id)
+      setGoal(t.goal)
+      setTaskStatus(t.status)
+      setCurrentStep(t.current_step)
+      setMaxSteps(t.max_steps)
+      setFinalReport(t.final_report || null)
+      if (t.workspace_path) {
+        setCurrentWorkspace(t.workspace_path)
+        fetchDiff(t.workspace_path)
+      }
+
+      if (data.steps && Array.isArray(data.steps)) {
+        const mappedSteps: TaskStep[] = data.steps.map((s: any) => ({
+          step_id: s.step_id,
+          step_num: s.step_num,
+          type: s.step_type as any,
+          content: s.content,
+          metadata: typeof s.metadata_json === 'string' ? JSON.parse(s.metadata_json) : (s.metadata_json || {}),
+          timestamp: s.timestamp || Date.now(),
+        }))
+        setTimeline(mappedSteps)
+      } else {
+        setTimeline([])
+      }
+      setActiveTab('timeline')
+    } catch (e) {
+      console.error('Failed to load historical task details:', e)
     }
   }
 
@@ -843,10 +914,11 @@ export default function App() {
                 className="btn-danger"
                 style={{ flex: 1 }}
                 onClick={cancelTask}
+                disabled={isCancelling}
                 aria-label="Stop Execution"
               >
                 <Square size={18} fill="currentColor" />
-                Stop Execution
+                {isCancelling ? 'Cancelling...' : 'Stop Execution'}
               </button>
             )}
           </div>
@@ -1156,7 +1228,21 @@ export default function App() {
                 </div>
               ) : (
                 historyTasks.map((t, idx) => (
-                  <div key={idx} className="timeline-item" style={{ cursor: 'pointer' }}>
+                  <div
+                    key={idx}
+                    className="timeline-item"
+                    style={{ cursor: 'pointer', transition: 'background 0.15s ease' }}
+                    onClick={() => loadHistoricalTask(t.id)}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`Open historical task: ${t.goal}`}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
+                        loadHistoricalTask(t.id)
+                      }
+                    }}
+                  >
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                       <span style={{ fontWeight: 600 }}>{t.goal}</span>
                       <span className={`status-pill status-${t.status.toLowerCase().replace('_', '-')}`}>
@@ -1265,6 +1351,11 @@ export default function App() {
                 onChange={(e) => setWorkspaceInput(e.target.value)}
                 aria-label="Workspace Root Directory Path"
               />
+              {workspaceError && (
+                <div style={{ color: '#fb7185', fontSize: '0.8rem', marginTop: 6, fontWeight: 600 }}>
+                  ⚠️ {workspaceError}
+                </div>
+              )}
               <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block', marginTop: 6 }}>
                 All tool execution, file reading, code editing, and Git tracking remain strictly confined to this directory.
               </span>
@@ -1292,6 +1383,12 @@ export default function App() {
                 ✕
               </button>
             </div>
+
+            {settingsError && (
+              <div style={{ color: '#fb7185', fontSize: '0.8rem', marginBottom: 10, fontWeight: 600 }}>
+                ⚠️ {settingsError}
+              </div>
+            )}
 
             {/* API Keys Configuration */}
             <div>

@@ -8,7 +8,7 @@ import json
 import os
 import time
 from typing import Any, Dict, List, Optional
-from agent.core.models import Task, TaskStatus, TaskReport
+from agent.core.models import Task, TaskStatus, TaskType, TaskReport
 from agent.persistence.credentials import vault
 from agent.security.sanitizer import SecuritySanitizer
 
@@ -80,7 +80,40 @@ class Database:
                     value_json TEXT NOT NULL
                 )
             """)
+            try:
+                await db.execute("ALTER TABLE tasks ADD COLUMN task_type TEXT DEFAULT 'CODE_MODIFICATION'")
+            except Exception:
+                pass
             await db.commit()
+
+    async def reconcile_interrupted_tasks(self) -> int:
+        """
+        Reconciles any in-flight tasks from a prior server session that were interrupted by a restart or crash.
+        Transitions non-terminal tasks (IDLE, PLANNING, EXECUTING, PENDING_APPROVAL, VERIFYING) to FAILED with a clear error message.
+        Returns the number of reconciled tasks.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            non_terminal = (
+                TaskStatus.IDLE.value,
+                TaskStatus.PLANNING.value,
+                TaskStatus.EXECUTING.value,
+                TaskStatus.PENDING_APPROVAL.value,
+                TaskStatus.VERIFYING.value,
+            )
+            placeholders = ",".join("?" for _ in non_terminal)
+            cursor = await db.execute(
+                f"""
+                UPDATE tasks
+                SET status = ?,
+                    error = COALESCE(error, 'Task execution was interrupted by server termination or restart.'),
+                    updated_at = ?
+                WHERE status IN ({placeholders})
+                """,
+                (TaskStatus.FAILED.value, time.time(), *non_terminal),
+            )
+            reconciled_count = cursor.rowcount
+            await db.commit()
+            return reconciled_count
 
     async def save_task(self, task: Task):
         async with aiosqlite.connect(self.db_path) as db:
@@ -88,23 +121,25 @@ class Database:
             plan_str = json.dumps(plan_clean)
             report_str = sanitizer.redact_secrets(task.final_report.model_dump_json()) if task.final_report else None
             error_clean = sanitizer.redact_secrets(task.error) if task.error else None
+            task_type_str = task.task_type.value if hasattr(task, "task_type") and task.task_type else TaskType.CODE_MODIFICATION.value
             
             await db.execute("""
                 INSERT INTO tasks (
                     id, goal, workspace_path, model_provider, model_name, status,
-                    current_step, max_steps, plan_json, report_json, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    current_step, max_steps, plan_json, report_json, error, task_type, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=excluded.status,
                     current_step=excluded.current_step,
                     plan_json=excluded.plan_json,
                     report_json=excluded.report_json,
                     error=excluded.error,
+                    task_type=excluded.task_type,
                     updated_at=excluded.updated_at
             """, (
                 task.id, task.goal, task.workspace_path, task.model_provider, task.model_name,
                 task.status.value, task.current_step, task.max_steps, plan_str, report_str,
-                error_clean, task.created_at, time.time()
+                error_clean, task_type_str, task.created_at, time.time()
             ))
             await db.commit()
 
@@ -117,6 +152,11 @@ class Database:
                 return None
             plan = json.loads(row["plan_json"]) if row["plan_json"] else []
             report = TaskReport.model_validate_json(row["report_json"]) if row["report_json"] else None
+            task_type = (
+                TaskType(row["task_type"])
+                if ("task_type" in row.keys() and row["task_type"])
+                else TaskType.CODE_MODIFICATION
+            )
             return Task(
                 id=row["id"],
                 goal=row["goal"],
@@ -124,6 +164,7 @@ class Database:
                 model_provider=row["model_provider"],
                 model_name=row["model_name"],
                 status=TaskStatus(row["status"]),
+                task_type=task_type,
                 current_step=row["current_step"],
                 max_steps=row["max_steps"],
                 plan=plan,
@@ -142,6 +183,11 @@ class Database:
             for row in rows:
                 plan = json.loads(row["plan_json"]) if row["plan_json"] else []
                 report = TaskReport.model_validate_json(row["report_json"]) if row["report_json"] else None
+                task_type = (
+                    TaskType(row["task_type"])
+                    if ("task_type" in row.keys() and row["task_type"])
+                    else TaskType.CODE_MODIFICATION
+                )
                 tasks.append(
                     Task(
                         id=row["id"],
@@ -150,6 +196,7 @@ class Database:
                         model_provider=row["model_provider"],
                         model_name=row["model_name"],
                         status=TaskStatus(row["status"]),
+                        task_type=task_type,
                         current_step=row["current_step"],
                         max_steps=row["max_steps"],
                         plan=plan,

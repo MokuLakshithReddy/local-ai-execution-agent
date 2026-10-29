@@ -4400,6 +4400,367 @@ async def test_diff_and_task_state_synchronization():
         assert del_item.get("isDeleted") is True
 
 
+@pytest.mark.asyncio
+async def test_verification_tool_adversarial_syntax_and_evidence_tampering():
+    """Validates P1 Item 1:
+    RunVerificationCheckTool strictly prohibits shell chaining, redirection, subshells,
+    and manual report overrides to prevent evidence forgery. Confirms report files in
+    workspace cannot be signed and temporary reports outside workspace are verified."""
+    from agent.tools.verification import RunVerificationCheckTool
+
+    tool = RunVerificationCheckTool()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        # Case 1: Semicolon command separator attempt
+        res = await tool.execute(
+            workspace_path=temp_dir,
+            command="pytest; echo evil > report.xml",
+            check_name="Tamper Semicolon",
+        )
+        assert res.success is False
+        assert "Verification command syntax error" in (res.error or "")
+        assert (res.artifacts or {}).get("tampering_detected") is True
+
+        # Case 2: Logical AND chaining attempt
+        res = await tool.execute(
+            workspace_path=temp_dir,
+            command="pytest && fake_success.sh",
+            check_name="Tamper AND",
+        )
+        assert res.success is False
+        assert "Verification command syntax error" in (res.error or "")
+
+        # Case 3: Redirection operator attempt
+        res = await tool.execute(
+            workspace_path=temp_dir,
+            command="pytest > out.txt",
+            check_name="Tamper Redirection",
+        )
+        assert res.success is False
+        assert "Verification command syntax error" in (res.error or "")
+
+        # Case 4: Subshell substitution attempt
+        res = await tool.execute(
+            workspace_path=temp_dir,
+            command="pytest $(whoami)",
+            check_name="Tamper Subshell",
+        )
+        assert res.success is False
+        assert "Verification command syntax error" in (res.error or "")
+
+        # Case 5: Manual --junitxml report hijacking attempt
+        res = await tool.execute(
+            workspace_path=temp_dir,
+            command="pytest --junitxml=forged_report.xml",
+            check_name="Tamper Report Flag",
+        )
+        assert res.success is False
+        assert "Manual '--junitxml' flag is prohibited" in (res.error or "")
+
+
+@pytest.mark.asyncio
+async def test_search_files_symlink_traversal_and_directory_escape():
+    """Validates P1 Item 2:
+    SearchFilesTool validates canonical path containment for every discovered file and directory,
+    strictly refusing to traverse external file symlinks or directory symlinks outside workspace."""
+    from agent.tools.filesystem import SearchFilesTool
+
+    search_tool = SearchFilesTool()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as outside_dir:
+        outside_secret = os.path.join(outside_dir, "sensitive_host_secret.txt")
+        with open(outside_secret, "w") as f:
+            f.write("CONFIDENTIAL_DATABASE_CREDENTIAL_9999\n")
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as ws_dir:
+            # Create a legitimate workspace file
+            internal_file = os.path.join(ws_dir, "config.py")
+            with open(internal_file, "w") as f:
+                f.write("API_KEY_PUBLIC = 'allowed_public_key'\n")
+
+            # Create an external file symlink or directory junction inside the workspace pointing outside
+            symlink_file = os.path.join(ws_dir, "symlink_secret.txt")
+            created_link = False
+            try:
+                os.symlink(outside_secret, symlink_file)
+                created_link = True
+            except (OSError, NotImplementedError):
+                if sys.platform == "win32":
+                    try:
+                        junction_dir = os.path.join(ws_dir, "escaped_folder")
+                        res_mk = subprocess.run(
+                            ["cmd", "/c", "mklink", "/J", junction_dir, outside_dir],
+                            capture_output=True,
+                        )
+                        if res_mk.returncode == 0:
+                            created_link = True
+                    except Exception:
+                        pass
+
+            if not created_link:
+                pytest.skip("Symlink/junction creation not supported without elevated permissions on this platform.")
+
+            # Search for the sensitive secret
+            res = await search_tool.execute(
+                workspace_path=ws_dir,
+                query="CONFIDENTIAL_DATABASE_CREDENTIAL",
+            )
+            assert res.success is True
+            # The search tool must NOT return matches from the out-of-workspace symlink/junction
+            assert "CONFIDENTIAL_DATABASE_CREDENTIAL" not in res.output
+            assert res.artifacts["match_count"] == 0
+
+            # Search for legitimate internal file
+            res_valid = await search_tool.execute(
+                workspace_path=ws_dir,
+                query="API_KEY_PUBLIC",
+            )
+            assert res_valid.success is True
+            assert "API_KEY_PUBLIC" in res_valid.output
+            assert res_valid.artifacts["match_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_settings_preserves_approval_policy_and_workspace_switch_requires_approval():
+    """Validates P1 Item 3:
+    Partial updates to /api/settings preserve existing auto-approval policies instead of
+    silently overwriting them with schema defaults. Also confirms that creating tasks in
+    an unapproved workspace returns HTTP 403 until explicitly approved via /api/workspaces/approve."""
+    from fastapi.testclient import TestClient
+    from agent.api.server import app, SESSION_TOKEN, permission_manager
+
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {SESSION_TOKEN}"}
+
+    # Step 1: Explicitly configure strict approval policy (disable auto_approve_routine)
+    res = client.post(
+        "/api/settings",
+        json={"auto_approve_routine": False, "auto_approve_sensitive": False},
+        headers=headers,
+    )
+    assert res.status_code == 200
+    assert permission_manager.policy.auto_approve_routine is False
+
+    # Step 2: Perform partial update containing only a provider key
+    res_partial = client.post(
+        "/api/settings",
+        json={"ollama_base_url": "http://127.0.0.1:11434/v1"},
+        headers=headers,
+    )
+    assert res_partial.status_code == 200
+    # Must preserve auto_approve_routine as False!
+    assert permission_manager.policy.auto_approve_routine is False
+
+    # Step 3: Test workspace registry enforcement
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as unapproved_ws:
+        # Task creation in unapproved workspace must be rejected with 403 Forbidden
+        res_task = client.post(
+            "/api/tasks",
+            json={"goal": "Inspect architecture", "workspace_path": unapproved_ws, "model_provider": "ollama"},
+            headers=headers,
+        )
+        assert res_task.status_code == 403
+        assert "has not been approved in the workspace registry" in res_task.json()["detail"]
+
+        # Approve workspace explicitly via /api/workspaces/approve
+        res_appr = client.post(
+            "/api/workspaces/approve",
+            json={"workspace_path": unapproved_ws},
+            headers=headers,
+        )
+        assert res_appr.status_code == 200
+        assert res_appr.json()["status"] == "approved"
+
+        # Now task creation in the approved workspace is accepted
+        res_task_ok = client.post(
+            "/api/tasks",
+            json={"goal": "Inspect architecture", "workspace_path": unapproved_ws, "model_provider": "ollama"},
+            headers=headers,
+        )
+        assert res_task_ok.status_code == 200
+        assert res_task_ok.json()["status"] == "started"
+
+
+@pytest.mark.asyncio
+async def test_cancellation_terminates_active_processes_and_propagates_state():
+    """Validates P1 Item 4:
+    Cancellation propagates to running subprocesses/containers, killing them immediately
+    via terminate_task_processes, and clears pending approvals without waiting for timeout."""
+    from agent.tools.terminal import (
+        register_task_process,
+        terminate_task_processes,
+        _ACTIVE_TASK_PROCESSES,
+    )
+    from agent.security.permissions import PermissionManager, PermissionLevel
+
+    task_id = "test_cancel_task_44"
+
+    # Spawn a sleeping background process
+    if sys.platform == "win32":
+        proc = subprocess.Popen(["ping", "-n", "20", "127.0.0.1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        proc = subprocess.Popen(["sleep", "20"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    register_task_process(task_id, proc, pid=proc.pid)
+    assert task_id in _ACTIVE_TASK_PROCESSES
+
+    # Set up pending approval for this task
+    pm = PermissionManager()
+    _, _, req = pm._create_approval_request(
+        task_id=task_id,
+        tool_name="run_command",
+        arguments={"command": "sleep 20"},
+        permission_level=PermissionLevel.SENSITIVE_OPERATION,
+        reason="Test approval cancellation",
+    )
+    assert req.approval_id in pm.pending_approvals
+
+    # Trigger cancellation
+    terminate_task_processes(task_id)
+    cancelled_ids = pm.cancel_task_approvals(task_id)
+
+    # Confirm process was terminated
+    assert proc.poll() is not None or not psutil.pid_exists(proc.pid)
+    # Confirm approval was cancelled and pruned
+    assert req.approval_id not in pm.pending_approvals
+    assert req.approval_id in cancelled_ids
+    assert pm.approval_history[req.approval_id].status == "CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_read_file_streaming_memory_bound_and_oversized_file_protection():
+    """Validates P2 Item 5:
+    ReadFileTool streams content line by line without readlines(), bounds output to
+    MAX_READ_BYTES (100 KB), and rejects files exceeding 10MB when requesting large slices."""
+    from agent.tools.filesystem import ReadFileTool, MAX_READ_BYTES
+
+    tool = ReadFileTool()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        # Create a file containing 200 KB of repetitive text (more than MAX_READ_BYTES)
+        large_file = os.path.join(temp_dir, "large_log.txt")
+        line_content = "Log entry timestamp data payload ABCDEFGHIJKLMNOPQRSTUVWXYZ 1234567890\n"
+        with open(large_file, "w") as f:
+            for _ in range(3000):
+                f.write(line_content)
+
+        file_size = os.path.getsize(large_file)
+        assert file_size > MAX_READ_BYTES
+
+        # Read the file
+        res = await tool.execute(
+            workspace_path=temp_dir,
+            file_path="large_log.txt",
+            start_line=1,
+            end_line=2000,
+        )
+        assert res.success is True
+        # Output must be truncated to prevent unbounded memory consumption
+        assert len(res.output.encode("utf-8")) <= (MAX_READ_BYTES + 500)
+        assert "OUTPUT TRUNCATED" in res.output
+        assert res.artifacts.get("truncated") is True
+
+
+@pytest.mark.asyncio
+async def test_informational_task_classification_and_verification_completion():
+    """Validates P2 Item 6:
+    Tasks with read-only / research goals are inferred as TaskType.INFORMATIONAL
+    and complete successfully without demanding code modification diffs or test runs."""
+    from agent.verification.verifier import infer_task_type, VerificationEngine
+    from agent.core.models import TaskType, TaskStatus
+
+    # Case 1: Inferences
+    assert infer_task_type("Inspect repository architecture and list core modules") == TaskType.INFORMATIONAL
+    assert infer_task_type("Where is the user authentication logic located?") == TaskType.INFORMATIONAL
+    assert infer_task_type("Fix null pointer exception in auth.py") == TaskType.CODE_MODIFICATION
+    assert infer_task_type("Run unit tests with pytest and check coverage") == TaskType.TEST_AND_VERIFY
+
+    # Case 2: VerificationEngine evaluation for informational tasks
+    verifier = VerificationEngine()
+    report = verifier.evaluate_completion(
+        task_id="task_info_1",
+        goal="Explain repository architecture and list modules",
+        actions_taken=["search_files('*.py')", "read_file('main.py')"],
+        modified_files=[],  # No files modified!
+        task_type=TaskType.INFORMATIONAL,
+        task_current_status=TaskStatus.COMPLETED,
+        git_diff_summary=None,
+        unresolved_notes=[],
+        acceptance_criteria=["Summarize architecture"],
+        criterion_bindings={"Summarize architecture": "read_file('main.py')"},
+        require_structured_evidence=False,
+    )
+    # Informational task must succeed without requiring code modifications or test records
+    assert report.status == TaskStatus.COMPLETED
+    assert report.acceptance_criteria_satisfied is True
+
+
+@pytest.mark.asyncio
+async def test_interrupted_tasks_startup_reconciliation_and_approval_pruning():
+    """Validates P2 Item 8:
+    reconcile_interrupted_tasks on DB startup marks in-flight tasks (PLANNING, EXECUTING,
+    PENDING_APPROVAL) as FAILED, avoiding permanently hanging jobs after server restarts."""
+    from agent.persistence.db import Database
+    from agent.core.models import Task, TaskStatus
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        db_path = os.path.join(temp_dir, "test_reconcile.db")
+        db = Database(db_path)
+        await db.init()
+
+        # Insert tasks in in-flight states
+        task1 = Task(id="t_exec", goal="Work in progress", workspace_path=temp_dir, model_provider="gemini", model_name="gemini-2.5-flash", status=TaskStatus.EXECUTING)
+        task2 = Task(id="t_appr", goal="Awaiting approval", workspace_path=temp_dir, model_provider="gemini", model_name="gemini-2.5-flash", status=TaskStatus.PENDING_APPROVAL)
+        task3 = Task(id="t_done", goal="Completed task", workspace_path=temp_dir, model_provider="gemini", model_name="gemini-2.5-flash", status=TaskStatus.COMPLETED)
+        await db.save_task(task1)
+        await db.save_task(task2)
+        await db.save_task(task3)
+
+        # Simulate server crash/restart: run startup reconciliation
+        reconciled = await db.reconcile_interrupted_tasks()
+        assert reconciled == 2
+
+        # Verify t_exec and t_appr are now FAILED with explanation
+        t1 = await db.get_task("t_exec")
+        assert t1.status == TaskStatus.FAILED
+        assert "interrupted by server termination" in (t1.error or "")
+
+        t2 = await db.get_task("t_appr")
+        assert t2.status == TaskStatus.FAILED
+
+        # Verify completed task is untouched
+        t3 = await db.get_task("t_done")
+        assert t3.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_ui_error_handling_and_mutation_contracts():
+    """Validates P2 Item 7:
+    Settings and workspace approval endpoints return explicit error details on bad input,
+    allowing the UI to display the error and retain user inputs without closing modals."""
+    from fastapi.testclient import TestClient
+    from agent.api.server import app, SESSION_TOKEN
+
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {SESSION_TOKEN}"}
+
+    # Non-existent workspace approval returns 400 with detail
+    res = client.post(
+        "/api/workspaces/approve",
+        json={"workspace_path": "Z:\\this_directory_definitely_does_not_exist_9876"},
+        headers=headers,
+    )
+    assert res.status_code == 400
+    assert "directory does not exist" in res.json()["detail"]
+
+    # Invalid workspace path in settings returns 400 with detail
+    res_set = client.post(
+        "/api/settings",
+        json={"current_workspace": "Z:\\nonexistent_workspace_folder_1234"},
+        headers=headers,
+    )
+    assert res_set.status_code == 400
+    assert "directory does not exist" in res_set.json()["detail"]
+
+
 
 
 

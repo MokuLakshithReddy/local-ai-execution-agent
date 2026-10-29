@@ -8,6 +8,7 @@ import os
 import secrets
 import sys
 import uuid
+import logging
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header, Request, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +20,7 @@ from agent.core.engine import ExecutionEngine
 from agent.persistence.db import Database
 from agent.security.permissions import PermissionManager, PermissionPolicy
 from agent.tools.registry import ToolRegistry
+from agent.verification.verifier import infer_task_type
 
 import urllib.parse
 
@@ -221,6 +223,11 @@ def verify_auth(
 @app.on_event("startup")
 async def on_startup():
     await db.init()
+    reconciled = await db.reconcile_interrupted_tasks()
+    if reconciled > 0:
+        logging.getLogger("agent.server").warning(
+            "Startup reconciliation: marked %d interrupted task(s) as FAILED.", reconciled
+        )
     # Seed current project directory as default approved workspace
     curr_dir = os.path.realpath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
     existing_ws = await db.get_setting("current_workspace")
@@ -231,6 +238,10 @@ async def on_startup():
     if curr_dir not in approved:
         approved.append(curr_dir)
         await db.save_setting("approved_workspaces", approved)
+
+    # Populate permission manager approved workspaces
+    for ws in approved:
+        permission_manager.approve_workspace(ws)
 
 
 @app.get("/api/auth/token")
@@ -286,6 +297,7 @@ async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = Query(
 class CreateTaskRequest(BaseModel):
     goal: str
     workspace_path: Optional[str] = None
+    task_type: Optional[TaskType] = None
     model_provider: str = "gemini"
     model_name: str = "gemini-2.5-flash"
     max_steps: int = 30
@@ -305,9 +317,9 @@ class SaveSettingsRequest(BaseModel):
     openai_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
     gemini_api_key: Optional[str] = None
-    ollama_base_url: Optional[str] = "http://localhost:11434/v1"
-    auto_approve_routine: bool = True
-    auto_approve_sensitive: bool = False
+    ollama_base_url: Optional[str] = None
+    auto_approve_routine: Optional[bool] = None
+    auto_approve_sensitive: Optional[bool] = None
     current_workspace: Optional[str] = None
 
 
@@ -332,10 +344,12 @@ async def approve_workspace(req: ApproveWorkspaceRequest):
     if not os.path.exists(real_path) or not os.path.isdir(real_path):
         raise HTTPException(status_code=400, detail="Invalid workspace path: directory does not exist.")
 
+    permission_manager.approve_workspace(real_path)
     approved = await db.get_setting("approved_workspaces", [])
     if real_path not in approved:
         approved.append(real_path)
         await db.save_setting("approved_workspaces", approved)
+    await db.save_setting("current_workspace", real_path)
 
     return {"status": "approved", "workspace": real_path, "approved_workspaces": approved}
 
@@ -403,13 +417,12 @@ async def save_settings(req: SaveSettingsRequest):
         settings["gemini_api_key"] = req.gemini_api_key
     if req.ollama_base_url is not None:
         settings["ollama_base_url"] = req.ollama_base_url
-    settings["auto_approve_routine"] = req.auto_approve_routine
-    settings["auto_approve_sensitive"] = req.auto_approve_sensitive
-
-    permission_manager.policy = PermissionPolicy(
-        auto_approve_routine=req.auto_approve_routine,
-        auto_approve_sensitive=req.auto_approve_sensitive,
-    )
+    if req.auto_approve_routine is not None:
+        settings["auto_approve_routine"] = req.auto_approve_routine
+        permission_manager.policy.auto_approve_routine = req.auto_approve_routine
+    if req.auto_approve_sensitive is not None:
+        settings["auto_approve_sensitive"] = req.auto_approve_sensitive
+        permission_manager.policy.auto_approve_sensitive = req.auto_approve_sensitive
 
     try:
         await db.save_setting("app_settings", settings)
@@ -420,6 +433,13 @@ async def save_settings(req: SaveSettingsRequest):
         )
     if req.current_workspace:
         real_ws = os.path.realpath(req.current_workspace)
+        if not os.path.exists(real_ws) or not os.path.isdir(real_ws):
+            raise HTTPException(status_code=400, detail="Specified workspace directory does not exist.")
+        permission_manager.approve_workspace(real_ws)
+        approved = await db.get_setting("approved_workspaces", [])
+        if real_ws not in approved:
+            approved.append(real_ws)
+            await db.save_setting("approved_workspaces", approved)
         await db.save_setting("current_workspace", real_ws)
 
     return {"status": "saved"}
@@ -461,26 +481,29 @@ async def create_task(req: CreateTaskRequest):
             detail=f"API key for '{req.model_provider}' is not configured. Please supply an API key in Settings.",
         )
 
+    task_type = req.task_type or infer_task_type(req.goal)
     task_id = str(uuid.uuid4())
     task = Task(
         id=task_id,
         goal=req.goal,
         workspace_path=real_ws,
+        task_type=task_type,
         model_provider=req.model_provider,
         model_name=req.model_name,
         max_steps=req.max_steps,
     )
 
-    # Launch in background
-    asyncio.create_task(
+    # Launch in background and register with execution engine for prompt cancellation
+    bg_task = asyncio.create_task(
         engine.run_task(
             task=task,
             api_key=api_key or "",
             custom_base_url=req.custom_base_url or settings.get("ollama_base_url"),
         )
     )
+    engine.register_running_task(task_id, bg_task)
 
-    return {"task_id": task_id, "status": "started"}
+    return {"task_id": task_id, "status": "started", "task_type": task_type.value}
 
 
 @app.get("/api/tasks", dependencies=[Depends(verify_auth)])

@@ -6,6 +6,7 @@ import asyncio
 import os
 import sys
 import time
+import threading
 from typing import Any, Dict, Optional, List
 import re
 import psutil
@@ -73,7 +74,12 @@ BLOCKED_ESCAPE_COMMANDS = {
 }
 
 
-def validate_sandbox_command(command: str, workspace_path: str, allow_network: bool = False):
+def validate_sandbox_command(
+    command: str,
+    workspace_path: str,
+    allow_network: bool = False,
+    allowed_paths: Optional[List[str]] = None,
+):
     """
     Syntactic pre-execution command policy filter.
 
@@ -121,6 +127,9 @@ def validate_sandbox_command(command: str, workspace_path: str, allow_network: b
         os.path.realpath(sys.prefix),
         os.path.realpath(sys.base_prefix),
     ]
+    if allowed_paths:
+        for ap in allowed_paths:
+            allowed_prefixes.append(os.path.realpath(ap))
 
     for cand in tokens:
         clean_cand = cand.strip(" '\"`();|&<>")
@@ -296,6 +305,7 @@ def build_container_command(
     allow_network: bool = False,
     container_name: Optional[str] = None,
     user: Optional[str] = None,
+    extra_mounts: Optional[list[str]] = None,
 ) -> list[str]:
     """
     Constructs an OS container sandbox command line enforcing:
@@ -333,6 +343,13 @@ def build_container_command(
     cmd.extend([
         "-v", f"{real_ws}:/workspace:rw",
         "-w", "/workspace",
+    ])
+
+    if extra_mounts:
+        for em in extra_mounts:
+            cmd.extend(["-v", em])
+
+    cmd.extend([
         image,
         "sh", "-c", command,
     ])
@@ -364,6 +381,83 @@ def _kill_process_tree(pid: int):
             )
         except Exception:
             pass
+
+
+_ACTIVE_TASK_PROCESSES: Dict[str, List[Dict[str, Any]]] = {}
+_PROCESS_REGISTRY_LOCK = threading.Lock()
+
+
+def register_task_process(
+    task_id: str,
+    proc: Any,
+    container_name: Optional[str] = None,
+    pid: Optional[int] = None,
+):
+    """Registers an active process or container under task_id for instant cancellation."""
+    if not task_id:
+        return
+    with _PROCESS_REGISTRY_LOCK:
+        if task_id not in _ACTIVE_TASK_PROCESSES:
+            _ACTIVE_TASK_PROCESSES[task_id] = []
+        _ACTIVE_TASK_PROCESSES[task_id].append({
+            "process": proc,
+            "container_name": container_name,
+            "pid": pid,
+        })
+
+
+def unregister_task_process(task_id: str, proc: Any):
+    """Unregisters a completed process or container."""
+    if not task_id:
+        return
+    with _PROCESS_REGISTRY_LOCK:
+        if task_id in _ACTIVE_TASK_PROCESSES:
+            _ACTIVE_TASK_PROCESSES[task_id] = [
+                entry for entry in _ACTIVE_TASK_PROCESSES[task_id]
+                if entry.get("process") != proc
+            ]
+            if not _ACTIVE_TASK_PROCESSES[task_id]:
+                del _ACTIVE_TASK_PROCESSES[task_id]
+
+
+def terminate_task_processes(task_id: str):
+    """
+    Forcefully and immediately terminates all active host processes and containers associated with task_id.
+    Ensures prompt cancellation without waiting for process timeouts.
+    """
+    if not task_id:
+        return
+    entries: List[Dict[str, Any]] = []
+    with _PROCESS_REGISTRY_LOCK:
+        if task_id in _ACTIVE_TASK_PROCESSES:
+            entries = list(_ACTIVE_TASK_PROCESSES.pop(task_id, []))
+
+    for entry in entries:
+        pid = entry.get("pid")
+        proc = entry.get("process")
+        container_name = entry.get("container_name")
+
+        if pid:
+            _kill_process_tree(pid)
+        if proc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        if container_name:
+            import shutil
+            docker_bin = shutil.which("docker")
+            if docker_bin:
+                try:
+                    import subprocess
+                    subprocess.run(
+                        [docker_bin, "rm", "-f", container_name],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                    )
+                except Exception:
+                    pass
 
 
 async def _read_bounded_stream(stream: asyncio.StreamReader, max_bytes: int) -> tuple[bytes, bool]:
@@ -425,9 +519,12 @@ class RunCommandTool(BaseTool):
     async def execute(self, workspace_path: str, **kwargs) -> ActionResult:
         t0 = time.time()
         call_id = kwargs.get("call_id", "run_command")
+        task_id = kwargs.get("task_id") or kwargs.get("call_id")
         command = kwargs.get("command", "").strip()
         timeout = min(kwargs.get("timeout_seconds", 60), 300)
         allow_network = kwargs.get("allow_network", False)
+        allowed_paths = kwargs.get("allowed_paths")
+        extra_mounts = kwargs.get("extra_mounts")
 
         # Enforce canonical workspace path
         real_workspace = os.path.realpath(workspace_path)
@@ -443,7 +540,12 @@ class RunCommandTool(BaseTool):
 
         # Enforce sandbox filesystem, escape, and network isolation
         try:
-            validate_sandbox_command(command, real_workspace, allow_network=allow_network)
+            validate_sandbox_command(
+                command,
+                real_workspace,
+                allow_network=allow_network,
+                allowed_paths=allowed_paths,
+            )
         except SandboxViolationError as sve:
             return ActionResult(
                 call_id=call_id,
@@ -584,6 +686,7 @@ class RunCommandTool(BaseTool):
                     allow_network=allow_network,
                     container_name=container_name,
                     user=container_user,
+                    extra_mounts=extra_mounts,
                 )
             except SandboxViolationError as sve:
                 return ActionResult(
@@ -605,6 +708,7 @@ class RunCommandTool(BaseTool):
                     stderr=asyncio.subprocess.PIPE,
                     env=isolated_env,
                 )
+                register_task_process(task_id, process, container_name=container_name, pid=process.pid)
 
                 try:
                     stdout_coro = _read_bounded_stream(process.stdout, MAX_OUTPUT_BYTES)
@@ -658,6 +762,8 @@ class RunCommandTool(BaseTool):
                         artifacts=artifacts,
                         execution_time_ms=(time.time() - t0) * 1000,
                     )
+                finally:
+                    unregister_task_process(task_id, process)
 
                 exit_code = process.returncode
                 stdout_str = stdout_bytes.decode("utf-8", errors="replace")
@@ -712,6 +818,7 @@ class RunCommandTool(BaseTool):
                 stderr=asyncio.subprocess.PIPE,
                 env=isolated_env,
             )
+            register_task_process(task_id, process, pid=process.pid)
             # Enforce OS kernel process and memory limits - fail closed if assignment fails
             if process.pid:
                 try:
@@ -750,6 +857,8 @@ class RunCommandTool(BaseTool):
                     error=f"Command timed out after {timeout} seconds and process tree was terminated.",
                     execution_time_ms=(time.time() - t0) * 1000,
                 )
+            finally:
+                unregister_task_process(task_id, process)
 
             exit_code = process.returncode
             stdout_str = stdout_bytes.decode("utf-8", errors="replace")

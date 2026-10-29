@@ -3,6 +3,8 @@ Verification tools: runs tests, linters, builds, and registers verifiable outcom
 Captures trusted execution evidence directly from the test-runner process via structured output.
 """
 import os
+import shutil
+import tempfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -137,19 +139,82 @@ class RunVerificationCheckTool(BaseTool):
         check_type = kwargs.get("check_type", "test")
         command = (kwargs.get("command") or "").strip()
 
-        # If running a pytest suite, attach structured junitxml destination inside workspace
-        # This guarantees availability across container bind-mounts and host execution
-        report_filename = None
-        report_host_path = None
-        exec_cmd = command
-        is_pytest = "pytest" in command.lower()
-        if is_pytest and "--junitxml" not in command and "--help" not in command:
-            report_filename = f".verification_report_{uuid.uuid4().hex}.xml"
-            report_host_path = os.path.join(workspace_path, report_filename)
-            # Use relative path so it correctly targets /workspace in container or workspace_path on host
-            exec_cmd = f"{command} --junitxml=\"{report_filename}\""
+        # Strict syntactic check to prevent shell chaining and evidence tampering
+        forbidden_patterns = [
+            (";", "semicolon command separator"),
+            ("&&", "logical AND chaining"),
+            ("||", "logical OR chaining"),
+            ("|", "pipe operator"),
+            ("&", "backgrounding operator"),
+            ("\n", "newline command separator"),
+            ("\r", "newline command separator"),
+            (">", "output redirection"),
+            ("<", "input redirection"),
+            ("$", "subshell or variable substitution"),
+            ("`", "backtick subshell substitution"),
+        ]
+        for op, desc in forbidden_patterns:
+            if op in command:
+                return ActionResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    success=False,
+                    output="",
+                    error=(
+                        f"Verification command syntax error: Detected {desc} ('{op}'). "
+                        "Shell chaining, redirection, backgrounding, subshells, and variable substitutions "
+                        "are strictly prohibited in verification commands to prevent evidence tampering."
+                    ),
+                    artifacts={"command": command, "tampering_detected": True},
+                    execution_time_ms=(time.time() - t0) * 1000,
+                )
 
+        # Prohibit user-supplied report overrides or help flags
+        cmd_lower = command.lower()
+        if "--junitxml" in cmd_lower or "-o junit" in cmd_lower:
+            return ActionResult(
+                call_id=call_id,
+                tool_name=self.name,
+                success=False,
+                output="",
+                error="Verification command syntax error: Manual '--junitxml' flag is prohibited. The verification system attaches authenticated report destinations automatically.",
+                artifacts={"command": command, "tampering_detected": True},
+                execution_time_ms=(time.time() - t0) * 1000,
+            )
+        if "--help" in cmd_lower or " -h" in cmd_lower:
+            return ActionResult(
+                call_id=call_id,
+                tool_name=self.name,
+                success=False,
+                output="",
+                error="Verification command syntax error: Help flags are prohibited in formal verification execution.",
+                artifacts={"command": command, "tampering_detected": True},
+                execution_time_ms=(time.time() - t0) * 1000,
+            )
+
+        # Create isolated temporary directory strictly OUTSIDE workspace for evidence collection
+        report_dir = tempfile.mkdtemp(prefix=".agent_verification_evidence_")
+        report_filename = f"junit_{uuid.uuid4().hex}.xml"
+        report_host_path = os.path.join(report_dir, report_filename)
+
+        sandbox_mode = kwargs.get("sandbox_mode", "container")
+        exec_cmd = command
         cmd_kwargs = {k: v for k, v in kwargs.items() if k not in ("call_id", "command", "check_name", "check_type")}
+
+        is_pytest = "pytest" in command.lower()
+        if is_pytest:
+            if sandbox_mode == "container":
+                # Mount external report dir inside container at /verification_evidence
+                extra_mounts = list(cmd_kwargs.get("extra_mounts", []))
+                extra_mounts.append(f"{report_dir}:/verification_evidence:rw")
+                cmd_kwargs["extra_mounts"] = extra_mounts
+                exec_cmd = f"{command} --junitxml=/verification_evidence/{report_filename}"
+            else:
+                allowed_paths = list(cmd_kwargs.get("allowed_paths", []))
+                allowed_paths.append(report_dir)
+                cmd_kwargs["allowed_paths"] = allowed_paths
+                exec_cmd = f'{command} --junitxml="{report_host_path}"'
+
         try:
             res = await self._command_tool.execute(
                 workspace_path=workspace_path,
@@ -165,25 +230,28 @@ class RunVerificationCheckTool(BaseTool):
             # Extract structured execution record if generated directly by runner
             trusted_record: Optional[TrustedExecutionRecord] = None
             parsed: Optional[Dict[str, Any]] = None
-            if report_host_path and os.path.exists(report_host_path):
-                parsed = parse_junit_xml_report(report_host_path)
-                if parsed and is_success and parsed["total"] > 0 and parsed["passed"] > 0:
-                    try:
-                        trusted_record = issue_trusted_execution_record(
-                            run_id=call_id,
-                            runner="pytest",
-                            command=command,
-                            exit_code=exit_code if exit_code is not None else -1,
-                            total=parsed["total"],
-                            passed=parsed["passed"],
-                            failed=parsed["failed"],
-                            skipped=parsed.get("skipped", 0),
-                            passed_nodes=parsed["passed_nodes"],
-                            failed_nodes=parsed["failed_nodes"],
-                            skipped_nodes=parsed.get("skipped_nodes", []),
-                        )
-                    except ValueError:
-                        trusted_record = None
+            if report_host_path and os.path.exists(report_host_path) and not os.path.islink(report_host_path):
+                # Check report file creation timestamp is strictly at or after t0
+                report_stat = os.stat(report_host_path)
+                if report_stat.st_mtime >= (t0 - 1.0) and report_stat.st_size > 0:
+                    parsed = parse_junit_xml_report(report_host_path)
+                    if parsed and is_success and parsed["total"] > 0 and parsed["passed"] > 0:
+                        try:
+                            trusted_record = issue_trusted_execution_record(
+                                run_id=call_id,
+                                runner="pytest",
+                                command=command,
+                                exit_code=exit_code if exit_code is not None else -1,
+                                total=parsed["total"],
+                                passed=parsed["passed"],
+                                failed=parsed["failed"],
+                                skipped=parsed.get("skipped", 0),
+                                passed_nodes=parsed["passed_nodes"],
+                                failed_nodes=parsed["failed_nodes"],
+                                skipped_nodes=parsed.get("skipped_nodes", []),
+                            )
+                        except ValueError:
+                            trusted_record = None
 
             evidence = (
                 f"Verification Check '{check_name}' ({check_type}) exited with code {exit_code}. "
@@ -210,8 +278,5 @@ class RunVerificationCheckTool(BaseTool):
                 execution_time_ms=(time.time() - t0) * 1000,
             )
         finally:
-            if report_host_path and os.path.exists(report_host_path):
-                try:
-                    os.remove(report_host_path)
-                except Exception:
-                    pass
+            if report_dir and os.path.exists(report_dir):
+                shutil.rmtree(report_dir, ignore_errors=True)

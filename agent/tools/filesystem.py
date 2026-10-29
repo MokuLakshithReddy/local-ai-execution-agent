@@ -177,29 +177,47 @@ class ReadFileTool(BaseTool):
                 )
 
             size = os.path.getsize(target_file)
-            if size > MAX_READ_BYTES and (end_line - start_line) > 500:
+            if size > 10 * 1024 * 1024 and (end_line - start_line) > 500:
                 return ActionResult(
                     call_id=call_id,
                     tool_name=self.name,
                     success=False,
                     output="",
-                    error=f"File exceeds maximum read limit ({size} bytes > {MAX_READ_BYTES} bytes). Specify a narrower start_line and end_line slice.",
+                    error=f"File exceeds maximum read limit ({size} bytes > 10 MB). Specify a narrower start_line and end_line slice.",
                     execution_time_ms=(time.time() - t0) * 1000,
                 )
 
-            with open(target_file, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+            selected = []
+            returned_bytes = 0
+            truncated = False
+            total_lines = 0
 
-            total_lines = len(lines)
-            selected = lines[start_line - 1 : end_line]
-            formatted_lines = [f"{i + start_line}: {line}" for i, line in enumerate(selected)]
+            # Stream line-by-line without buffering entire file in memory
+            with open(target_file, "r", encoding="utf-8", errors="replace") as f:
+                for line_idx, line in enumerate(f, start=1):
+                    total_lines = line_idx
+                    if line_idx < start_line:
+                        continue
+                    if line_idx > end_line:
+                        continue
+                    formatted = f"{line_idx}: {line}"
+                    f_bytes = len(formatted.encode("utf-8", errors="replace"))
+                    if returned_bytes + f_bytes > MAX_READ_BYTES:
+                        truncated = True
+                        break
+                    selected.append(formatted)
+                    returned_bytes += f_bytes
+
+            output_content = "".join(selected)
+            if truncated:
+                output_content += f"\n[OUTPUT TRUNCATED: Reached {MAX_READ_BYTES} byte limit. Specify narrower start_line and end_line]."
 
             return ActionResult(
                 call_id=call_id,
                 tool_name=self.name,
                 success=True,
-                output="".join(formatted_lines),
-                artifacts={"total_lines": total_lines, "returned_lines": len(selected)},
+                output=output_content,
+                artifacts={"total_lines": total_lines, "returned_lines": len(selected), "truncated": truncated},
                 execution_time_ms=(time.time() - t0) * 1000,
             )
         except Exception as e:
@@ -387,20 +405,53 @@ class SearchFilesTool(BaseTool):
         ext = kwargs.get("file_extension", "")
 
         try:
+            workspace_real = os.path.realpath(workspace_path)
+            if not os.path.isdir(workspace_real):
+                return ActionResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    success=False,
+                    output="",
+                    error=f"Workspace path does not exist: {workspace_path}",
+                    execution_time_ms=(time.time() - t0) * 1000,
+                )
+
             pattern = re.compile(query, re.IGNORECASE)
             matches = []
             max_matches = 50
 
-            for root, dirs, files in os.walk(workspace_path):
-                dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+            for root, dirs, files in os.walk(workspace_real, followlinks=False):
+                # Filter directories: remove ignored dirs and any symlinks/out-of-workspace dirs
+                safe_dirs = []
+                for d in dirs:
+                    if d in IGNORED_DIRS:
+                        continue
+                    d_path = os.path.join(root, d)
+                    try:
+                        # Reject symlink directories or directory escaping outside workspace
+                        if os.path.islink(d_path):
+                            continue
+                        resolve_safe_path(workspace_real, d_path)
+                        safe_dirs.append(d)
+                    except Exception:
+                        continue
+                dirs[:] = safe_dirs
+
                 for file in files:
                     if ext and not file.endswith(ext):
                         continue
                     full_p = os.path.join(root, file)
-                    rel_p = os.path.relpath(full_p, workspace_path)
-
                     try:
-                        with open(full_p, "r", encoding="utf-8", errors="ignore") as f:
+                        # Validate that file resolves strictly within workspace and reject out-of-workspace symlinks
+                        safe_file = resolve_safe_path(workspace_real, full_p)
+                        if not os.path.isfile(safe_file):
+                            continue
+                    except Exception:
+                        continue
+
+                    rel_p = os.path.relpath(safe_file, workspace_real)
+                    try:
+                        with open(safe_file, "r", encoding="utf-8", errors="ignore") as f:
                             for idx, line in enumerate(f, start=1):
                                 if pattern.search(line):
                                     matches.append(f"{rel_p}:{idx}: {line.strip()[:160]}")

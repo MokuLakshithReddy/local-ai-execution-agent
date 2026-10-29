@@ -29,6 +29,19 @@ class PermissionManager:
         self.policy = policy or PermissionPolicy()
         self.pending_approvals: Dict[str, ApprovalRequest] = {}
         self.approval_history: Dict[str, ApprovalRequest] = {}
+        self.approved_workspaces: set[str] = set()
+
+    def approve_workspace(self, workspace_path: str):
+        """Registers a workspace directory as explicitly approved."""
+        real_p = os.path.realpath(workspace_path)
+        self.approved_workspaces.add(real_p)
+
+    def is_workspace_approved(self, workspace_path: str) -> bool:
+        """Verifies whether the given workspace path is in the approved registry."""
+        if not workspace_path:
+            return False
+        real_p = os.path.realpath(workspace_path)
+        return real_p in self.approved_workspaces
 
     def evaluate_action(
         self,
@@ -115,6 +128,30 @@ class PermissionManager:
             return None
         req = self.pending_approvals.pop(approval_id)
         req.status = "APPROVED" if approved else "REJECTED"
+        import time
+        req.resolved_at = time.time()
+        self.approval_history[approval_id] = req
+        return req
+
+    def cancel_task_approvals(self, task_id: str) -> list[str]:
+        """Prunes all pending approvals for a cancelled task and marks them CANCELLED in history."""
+        cancelled_ids = []
+        import time
+        for aid, req in list(self.pending_approvals.items()):
+            if req.task_id == task_id:
+                self.pending_approvals.pop(aid, None)
+                req.status = "CANCELLED"
+                req.resolved_at = time.time()
+                self.approval_history[aid] = req
+                cancelled_ids.append(aid)
+        return cancelled_ids
+
+    def expire_approval(self, approval_id: str) -> ApprovalRequest | None:
+        """Expires a pending approval when its timeout has passed."""
+        if approval_id not in self.pending_approvals:
+            return None
+        req = self.pending_approvals.pop(approval_id)
+        req.status = "EXPIRED"
         import time
         req.resolved_at = time.time()
         self.approval_history[approval_id] = req

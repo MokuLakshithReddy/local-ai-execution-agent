@@ -9,19 +9,24 @@ from agent.core.models import PermissionLevel, ActionResult
 
 
 async def _run_git(args: list[str], cwd: str) -> tuple[int, str, str]:
-    cmd = ["git"] + args
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    return (
-        proc.returncode or 0,
-        stdout.decode("utf-8", errors="replace"),
-        stderr.decode("utf-8", errors="replace"),
-    )
+    try:
+        cmd = ["git"] + args
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        return (
+            proc.returncode if proc.returncode is not None else 0,
+            stdout.decode("utf-8", errors="replace"),
+            stderr.decode("utf-8", errors="replace"),
+        )
+    except FileNotFoundError:
+        return (-1, "", "Git binary not found in system PATH.")
+    except Exception as e:
+        return (-1, "", f"Git execution error: {str(e)}")
 
 
 class GitStatusTool(BaseTool):

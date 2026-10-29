@@ -726,6 +726,9 @@ def issue_trusted_execution_record(
     All security-relevant fields are canonically serialized via deterministic JSON and signed with HMAC-SHA256.
     Rejects zero-test reports, zero-pass reports, and count-inconsistent reports.
     """
+    if exit_code != 0:
+        raise ValueError(f"Cannot issue trusted execution record for failed test execution (exit_code={exit_code}).")
+
     if total <= 0 or passed <= 0 or (passed + failed + skipped != total):
         raise ValueError(
             f"Invalid execution record counts: total={total}, passed={passed}, failed={failed}, skipped={skipped}. "
