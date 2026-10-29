@@ -255,6 +255,11 @@ class ExecutionEngine:
                             await asyncio.sleep(1.0)
 
                         if not approved:
+                            # Revert status from PENDING_APPROVAL back to EXECUTING as engine processes rejection
+                            task.status = TaskStatus.EXECUTING
+                            await self.db.save_task(task)
+                            await self.emit("task_status", {"task_id": task.id, "status": task.status.value})
+
                             result = ActionResult(
                                 call_id=tool_call.id,
                                 tool_name=tool_name,

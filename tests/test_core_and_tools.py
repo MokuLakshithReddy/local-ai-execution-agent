@@ -1242,7 +1242,7 @@ async def test_terminal_container_execution_fail_closed_and_dispatch():
     """Validates Priority 1: Real container execution wire-up and fail-closed behavior.
     - If docker binary is unavailable, execution fails closed with error.
     - If docker is available, command runs through container runtime via create_subprocess_exec."""
-    from unittest.mock import patch, AsyncMock
+    from unittest.mock import patch, AsyncMock, MagicMock
     from agent.tools.terminal import RunCommandTool
 
     tool = RunCommandTool()
@@ -1468,7 +1468,7 @@ async def test_container_hardening_non_root_image_validation_and_timeout_cleanup
     2. Invalid or dangerous container images are strictly rejected with SandboxViolationError.
     3. Project-specific container images (Node, Rust, Go) are safely accepted.
     4. On execution timeout, 'docker rm -f <container_name>' is called to purge the running container."""
-    from unittest.mock import patch, AsyncMock
+    from unittest.mock import patch, AsyncMock, MagicMock
     from agent.tools.terminal import (
         build_container_command,
         RunCommandTool,
@@ -2225,33 +2225,32 @@ async def test_run_verification_tool_structured_record_e2e():
 
 
 def test_credential_vault_multiprocess_concurrency_and_crash_recovery():
-    """Validates Finding 3:
+    """Validates Finding 3 & P0 Security Hardening:
     1. Multi-process concurrency: multiple OS processes simultaneously initialize CredentialVault
-       and obtain identical encryption keys.
-    2. Crash recovery: a process crash leaving a 0-byte key file during initialization does NOT
-       wedge the vault permanently; subsequent processes recover safely and establish a valid key."""
+       from clean slate and obtain identical encryption keys.
+    2. Multi-process crash recovery: multiple OS processes simultaneously race to recover from an abandoned
+       0-byte key file left by a crashed process; all safely recover and obtain identical keys without race errors.
+    3. Truncated key recovery: multiple OS processes simultaneously recover from an invalid/truncated file (<32 bytes).
+    4. Stale lock reclamation: an abandoned lock directory is safely reclaimed and does not permanently wedge the vault."""
     from agent.persistence.credentials import CredentialVault
 
-    # 1. Multi-process concurrency test using independent OS processes with robust child cleanup
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        key_dir = os.path.join(temp_dir, "mp_keys")
-        os.makedirs(key_dir, mode=0o700)
+    script = (
+        "import sys\n"
+        "from agent.persistence.credentials import CredentialVault\n"
+        "v = CredentialVault(key_dir=sys.argv[1], is_windows=False)\n"
+        "k = v._get_or_create_posix_key()\n"
+        "sys.stdout.write(k.decode('ascii'))\n"
+    )
 
-        script = (
-            "import sys\n"
-            "from agent.persistence.credentials import CredentialVault\n"
-            "v = CredentialVault(key_dir=sys.argv[1], is_windows=False)\n"
-            "k = v._get_or_create_posix_key()\n"
-            "sys.stdout.write(k.decode('ascii'))\n"
-        )
+    def _run_parallel_vault_processes(target_dir: str, num_procs: int = 6) -> list[str]:
         procs = [
             subprocess.Popen(
-                [sys.executable, "-c", script, key_dir],
+                [sys.executable, "-c", script, target_dir],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            for _ in range(4)
+            for _ in range(num_procs)
         ]
         results = []
         try:
@@ -2260,7 +2259,6 @@ def test_credential_vault_multiprocess_concurrency_and_crash_recovery():
                 assert p.returncode == 0, f"Process failed with returncode {p.returncode}: {err}"
                 results.append(out.strip())
         finally:
-            # Reaping cleanup block: terminate, wait, and kill any lingering child processes
             for p in procs:
                 if p.poll() is None:
                     try:
@@ -2272,30 +2270,62 @@ def test_credential_vault_multiprocess_concurrency_and_crash_recovery():
                             p.wait(timeout=2)
                         except Exception:
                             pass
+        return results
 
-        assert len(results) == 4
-        # All distinct OS processes must have obtained the exact same key
+    # 1. Clean-slate multi-process concurrency test
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        key_dir = os.path.join(temp_dir, "mp_keys")
+        os.makedirs(key_dir, mode=0o700)
+        results = _run_parallel_vault_processes(key_dir, num_procs=6)
+        assert len(results) == 6
         assert len(set(results)) == 1
         assert len(results[0]) >= 32
 
-    # 2. Crash recovery test: 0-byte key file left by crashed process
+    # 2. Multi-process crash recovery test: abandoned 0-byte file with 6 racing processes
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
         key_dir = os.path.join(temp_dir, "mp_crashed_keys")
         os.makedirs(key_dir, mode=0o700)
         key_file = os.path.join(key_dir, "vault.key")
-
-        # Simulate process crash leaving 0-byte file
         with open(key_file, "wb") as f:
             pass
         if sys.platform != "win32":
             os.chmod(key_file, 0o600)
 
-        # Subsequent process recovers rather than failing forever
+        # Multiple processes race to recover from the 0-byte file
+        crashed_results = _run_parallel_vault_processes(key_dir, num_procs=6)
+        assert len(crashed_results) == 6
+        assert len(set(crashed_results)) == 1
+        assert len(crashed_results[0]) >= 32
+
+    # 3. Multi-process recovery from truncated/corrupted key file (<32 bytes)
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        key_dir = os.path.join(temp_dir, "mp_truncated_keys")
+        os.makedirs(key_dir, mode=0o700)
+        key_file = os.path.join(key_dir, "vault.key")
+        with open(key_file, "wb") as f:
+            f.write(b"too_short_key_data")
+        if sys.platform != "win32":
+            os.chmod(key_file, 0o600)
+
+        trunc_results = _run_parallel_vault_processes(key_dir, num_procs=6)
+        assert len(trunc_results) == 6
+        assert len(set(trunc_results)) == 1
+        assert len(trunc_results[0]) >= 32
+
+    # 4. Stale lock reclamation test
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        key_dir = os.path.join(temp_dir, "mp_stale_lock")
+        os.makedirs(key_dir, mode=0o700)
+        lock_dir = os.path.join(key_dir, ".vault_key_init.lock")
+        os.mkdir(lock_dir)
+        # Set lock directory modification time to 30 seconds ago (stale)
+        old_time = time.time() - 30.0
+        os.utime(lock_dir, (old_time, old_time))
+
         v = CredentialVault(key_dir=key_dir, is_windows=False)
-        key = v._get_or_create_posix_key()
-        assert len(key) >= 32
-        enc = v.encrypt("recovered_after_crash")
-        assert v.decrypt(enc) == "recovered_after_crash"
+        reclaimed_key = v._get_or_create_posix_key()
+        assert len(reclaimed_key) >= 32
+        assert not os.path.exists(lock_dir)
 
 
 def test_trusted_execution_record_individual_field_tampering_rejected():
@@ -3492,7 +3522,7 @@ async def test_terminal_sandbox_mode_and_require_sandbox_combinations():
     6. sandbox_mode='unknown' is rejected with invalid mode error.
     """
     from agent.tools.terminal import RunCommandTool
-    from unittest.mock import patch, AsyncMock
+    from unittest.mock import patch, AsyncMock, MagicMock
 
     tool = RunCommandTool()
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -3841,7 +3871,7 @@ async def test_engine_untrusted_task_cannot_escape_to_host_even_with_env_flag():
     from agent.persistence.db import Database
     from agent.providers.base import ProviderResponse, LLMToolCall
     from agent.tools.terminal import RunCommandTool
-    from unittest.mock import patch, AsyncMock
+    from unittest.mock import patch, AsyncMock, MagicMock
 
     with tempfile.TemporaryDirectory() as temp_dir:
         db = Database(db_path=os.path.join(temp_dir, "test.db"))
@@ -4036,6 +4066,115 @@ def test_ci_status_reporter_strict_and_failure_modes():
                 summary_success = sf.read()
             assert "Commit Status Published" in summary_success
             assert "Backend Tests (ubuntu-latest)" in summary_success
+
+
+@pytest.mark.asyncio
+async def test_engine_approval_rejection_and_timeout_lifecycle_e2e():
+    """Validates P0:
+    ExecutionEngine handles approval rejection and timeout end to end:
+    1. Rejection: When user explicitly rejects a pending approval, task status reverts to EXECUTING,
+       a tool failure message is returned to the LLM, and the task completes without getting stuck in PENDING_APPROVAL.
+    2. Timeout: When an approval request is abandoned and times out, the engine fails the action closed
+       and restores the executing status cleanly."""
+    from agent.core.engine import ExecutionEngine
+    from agent.core.models import Task, TaskType, TaskStatus, ActionResult, PermissionLevel
+    from agent.persistence.db import Database
+    from agent.tools.registry import ToolRegistry
+    from agent.tools.base import BaseTool
+    from agent.security.permissions import PermissionManager, PermissionPolicy
+    from agent.providers.base import ProviderResponse, LLMToolCall
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    class SensitiveActionTool(BaseTool):
+        name = "sensitive_tool"
+        description = "A sensitive tool requiring human approval"
+        permission_level = PermissionLevel.SENSITIVE_OPERATION
+
+        def get_parameters_schema(self) -> dict:
+            return {"type": "object", "properties": {}}
+
+        async def execute(self, workspace_path: str, **kwargs) -> ActionResult:
+            return ActionResult(call_id=kwargs.get("call_id", "c1"), tool_name=self.name, success=True)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db = Database(db_path=os.path.join(temp_dir, "test.db"))
+        await db.init()
+
+        # Part 1: Explicit rejection
+        pm = PermissionManager(policy=PermissionPolicy(auto_approve_routine=True, auto_approve_sensitive=False))
+        registry = ToolRegistry()
+        registry.register(SensitiveActionTool())
+
+        task = Task(
+            id="task_approval_rejection",
+            goal="Perform sensitive action",
+            type=TaskType.INFORMATIONAL,
+            model_provider="anthropic",
+            model_name="claude-3-7-sonnet",
+            workspace_path=temp_dir,
+        )
+        await db.save_task(task)
+
+        call_1 = LLMToolCall(id="call_sens_1", name="sensitive_tool", arguments={"param": "value"})
+        resp_step1 = ProviderResponse(content="Requesting sensitive action", tool_calls=[call_1])
+        resp_step2 = ProviderResponse(content="Action was rejected, so I have safely aborted the operation.", tool_calls=[])
+
+        mock_adapter = MagicMock()
+        mock_adapter.chat_completion = AsyncMock(side_effect=[resp_step1, resp_step2])
+
+        emitted_events = []
+        async def event_collector(event_type: str, data: dict):
+            emitted_events.append((event_type, data))
+            if event_type == "approval_required":
+                # Simulate user rejecting the approval
+                approval_id = data["approval"]["approval_id"]
+                pm.resolve_approval(approval_id, approved=False)
+
+        with patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter):
+            engine = ExecutionEngine(db=db, tool_registry=registry, permission_manager=pm, on_event=event_collector)
+            res_task = await engine.run_task(task, api_key="sk-test")
+
+        # Assertions for Part 1:
+        assert res_task.status == TaskStatus.PARTIALLY_COMPLETED
+        assert res_task.status != TaskStatus.PENDING_APPROVAL
+        assert any(ev[0] == "approval_required" for ev in emitted_events)
+        status_events = [ev[1]["status"] for ev in emitted_events if ev[0] == "task_status"]
+        assert "EXECUTING" in status_events
+        last_call_messages = mock_adapter.chat_completion.call_args_list[-1][1]["messages"]
+        tool_msg = next(m for m in last_call_messages if m.role == "tool")
+        assert "rejected by user or timed out" in tool_msg.content
+
+        # Part 2: Approval Timeout
+        pm_timeout = PermissionManager(policy=PermissionPolicy(auto_approve_routine=True, auto_approve_sensitive=False))
+        task_timeout = Task(
+            id="task_approval_timeout",
+            goal="Perform sensitive action that times out",
+            type=TaskType.INFORMATIONAL,
+            model_provider="anthropic",
+            model_name="claude-3-7-sonnet",
+            workspace_path=temp_dir,
+        )
+        await db.save_task(task_timeout)
+
+        mock_adapter_to = MagicMock()
+        mock_adapter_to.chat_completion = AsyncMock(side_effect=[
+            ProviderResponse(content="Calling sensitive tool", tool_calls=[LLMToolCall(id="call_to_1", name="sensitive_tool", arguments={"param": "timeout_val"})]),
+            ProviderResponse(content="Approval timed out, operation aborted.", tool_calls=[]),
+        ])
+
+        with patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter_to):
+            engine_to = ExecutionEngine(db=db, tool_registry=registry, permission_manager=pm_timeout)
+            curr_t = [100.0]
+            def advancing_time():
+                curr_t[0] += 100.0
+                return curr_t[0]
+
+            with patch("time.time", side_effect=advancing_time), \
+                 patch("asyncio.sleep", AsyncMock()):
+                res_timeout_task = await engine_to.run_task(task_timeout, api_key="sk-test")
+
+        assert res_timeout_task.status == TaskStatus.PARTIALLY_COMPLETED
+        assert res_timeout_task.status != TaskStatus.PENDING_APPROVAL
 
 
 

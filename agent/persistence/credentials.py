@@ -7,6 +7,7 @@ Tied directly to the operating system user account without plaintext keys on dis
 import os
 import sys
 import time
+import secrets
 import base64
 import ctypes
 from typing import Optional
@@ -42,6 +43,36 @@ class CredentialVault:
                     raise
                 raise CredentialEncryptionError(f"Failed to initialize Fernet with vault key: {e}") from e
 
+    def _acquire_init_lock(self, timeout_sec: float = 10.0, poll_sec: float = 0.05) -> str:
+        """Acquires an atomic directory-based initialization lock with stale lock reclamation."""
+        lock_dir = os.path.join(self._key_dir, ".vault_key_init.lock")
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            try:
+                os.mkdir(lock_dir)
+                return lock_dir
+            except FileExistsError:
+                # Check for stale lock (older than 10 seconds)
+                try:
+                    mtime = os.path.getmtime(lock_dir)
+                    if time.time() - mtime > 10.0:
+                        try:
+                            os.rmdir(lock_dir)
+                            continue
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                time.sleep(poll_sec)
+        raise CredentialEncryptionError(f"Timed out waiting for vault initialization lock '{lock_dir}'.")
+
+    def _release_init_lock(self, lock_dir: str) -> None:
+        try:
+            if os.path.exists(lock_dir):
+                os.rmdir(lock_dir)
+        except Exception:
+            pass
+
     def _get_or_create_posix_key(self) -> bytes:
         from cryptography.fernet import Fernet
 
@@ -69,53 +100,81 @@ class CredentialVault:
                     f"Insecure permissions on key directory '{self._key_dir}' (mode: {oct(dir_st.st_mode)}). Expected 0700."
                 )
 
-        # 3. If key file already exists, verify permissions and load via shared routine with concurrent write tolerance
+        # 3. If key file already exists, read with retry backoff to tolerate concurrent writes in progress
         if os.path.exists(self._key_file):
-            return self._read_and_validate_with_retry(self._key_file)
-
-        # 4. Key does not exist: generate and atomically create with exclusive lock (O_EXCL)
-        key = Fernet.generate_key()
-        try:
-            # Atomic creation with O_CREAT | O_EXCL prevents concurrent creation races
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | (getattr(os, "O_BINARY", 0))
             try:
-                fd = os.open(self._key_file, flags, 0o600)
-            except FileExistsError:
-                # Concurrent creator is in the middle of creating/writing the key.
-                # Retry for up to 1 second to allow concurrent writer to write, flush, and chmod.
                 return self._read_and_validate_with_retry(self._key_file)
+            except CredentialEncryptionError as err:
+                if "Symlink attack" in str(err) or "Insecure permissions" in str(err):
+                    raise
+                # A corrupted or unreadable key >= 32 bytes must fail closed to protect existing encrypted data
+                if os.path.exists(self._key_file) and os.path.getsize(self._key_file) >= 32:
+                    raise
+                # Only if file is an abandoned incomplete remnant (< 32 bytes) do we fall through to locked recovery
 
-            with os.fdopen(fd, "wb") as f:
-                f.write(key)
-                f.flush()
-                if hasattr(os, "fdatasync"):
-                    try:
-                        os.fdatasync(f.fileno())
-                    except Exception:
-                        pass
-
-            if sys.platform != "win32":
-                os.chmod(self._key_file, 0o600)
-
-            # Re-verify newly written key through shared validation routine
-            return self._validate_and_read_posix_key(self._key_file)
-        except Exception as e:
-            if os.path.exists(self._key_file) and not isinstance(e, FileExistsError):
+        # 4. Acquire exclusive creation / recovery lock to eliminate cross-process races
+        lock_dir = self._acquire_init_lock()
+        staging_file = None
+        try:
+            # Under lock: re-check if another process established the key while we waited for lock
+            if os.path.exists(self._key_file):
                 try:
-                    os.remove(self._key_file)
+                    if os.path.getsize(self._key_file) >= 32:
+                        return self._validate_and_read_posix_key(self._key_file)
+                except CredentialEncryptionError:
+                    pass
+
+                # If key file is incomplete (< 32 bytes from an aborted crash), safely clean it up under lock
+                try:
+                    if os.path.getsize(self._key_file) < 32:
+                        os.remove(self._key_file)
                 except Exception:
                     pass
-            if isinstance(e, CredentialEncryptionError):
-                raise
-            raise CredentialEncryptionError(
-                f"POSIX vault key persistence failed. Startup aborted to prevent credential loss: {str(e)}"
-            ) from e
+
+            # 5. Staged key creation: write to temporary file first so self._key_file is NEVER exposed with 0 bytes
+            try:
+                key = Fernet.generate_key()
+                staging_file = os.path.join(self._key_dir, f".vault_key_tmp.{os.getpid()}.{secrets.token_hex(8)}")
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | (getattr(os, "O_BINARY", 0))
+                fd = os.open(staging_file, flags, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(key)
+                    f.flush()
+                    if hasattr(os, "fdatasync"):
+                        try:
+                            os.fdatasync(f.fileno())
+                        except Exception:
+                            pass
+
+                if sys.platform != "win32":
+                    os.chmod(staging_file, 0o600)
+
+                # Atomically replace staging file into target key path
+                os.replace(staging_file, self._key_file)
+                staging_file = None
+
+                if sys.platform != "win32":
+                    os.chmod(self._key_file, 0o600)
+
+                return self._validate_and_read_posix_key(self._key_file)
+            except Exception as e:
+                if isinstance(e, CredentialEncryptionError):
+                    raise
+                raise CredentialEncryptionError(
+                    f"POSIX vault key persistence failed. Startup aborted to prevent credential loss: {str(e)}"
+                ) from e
+        finally:
+            if staging_file and os.path.exists(staging_file):
+                try:
+                    os.remove(staging_file)
+                except Exception:
+                    pass
+            self._release_init_lock(lock_dir)
 
     def _read_and_validate_with_retry(self, key_path: str, max_attempts: int = 20, delay_sec: float = 0.05) -> bytes:
         """
         Validates and reads the key file with retry backoff to tolerate concurrent writes in progress.
         Fails closed safely on timeout, corruption, or security violations.
-        Recovers safely if a creator crashed during initialization leaving an abandoned incomplete file (< 32 bytes).
         """
         last_err = None
         for _ in range(max_attempts):
@@ -126,16 +185,6 @@ class CredentialVault:
                     raise
                 last_err = err
                 time.sleep(delay_sec)
-
-        # Crash recovery: if a previous creator process crashed during initialization leaving
-        # an incomplete key (< 32 bytes) that was never established or used for encryption,
-        # safely remove the abandoned file and re-attempt atomic key generation.
-        try:
-            if os.path.exists(key_path) and os.path.getsize(key_path) < 32:
-                os.remove(key_path)
-                return self._get_or_create_posix_key()
-        except Exception:
-            pass
 
         raise CredentialEncryptionError(
             f"Vault key initialization failed after concurrent creation: {last_err}"
