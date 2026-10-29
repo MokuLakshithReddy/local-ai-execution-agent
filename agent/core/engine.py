@@ -251,7 +251,28 @@ class ExecutionEngine:
 
                     # Retrieve tool metadata
                     tool_inst = self.tool_registry.get(tool_name)
-                    permission_level = tool_inst.permission_level if tool_inst else PermissionLevel.SENSITIVE_OPERATION
+                    if not tool_inst:
+                        result = ActionResult(
+                            call_id=tool_call.id,
+                            tool_name=tool_name,
+                            success=False,
+                            output="",
+                            error=f"Tool '{tool_name}' not found.",
+                        )
+                        messages.append(LLMMessage(role="tool", content=result.error, tool_call_id=tool_call.id, name=tool_name))
+                        continue
+
+                    # Proactively strip dangerous container/sandbox control arguments if attempted by model
+                    FORBIDDEN_MODEL_ARGS = {
+                        "extra_mounts", "allowed_paths", "container_user", "container_image",
+                        "image", "memory_limit", "pids_limit", "sandbox_mode", "require_sandbox",
+                        "untrusted_workload", "trusted_development_only", "container_memory",
+                        "container_pids", "allow_network", "container_name",
+                    }
+                    for bad_arg in FORBIDDEN_MODEL_ARGS:
+                        tool_args.pop(bad_arg, None)
+
+                    permission_level = tool_inst.permission_level
 
                     # Evaluate permissions
                     is_permitted, perm_reason, approval_req = self.permission_manager.evaluate_action(
@@ -342,6 +363,23 @@ class ExecutionEngine:
                             continue
 
                     # Execute permitted tool
+                    # Strict runtime schema validation: reject unknown tool arguments against declared properties
+                    schema = tool_inst.get_parameters_schema() if tool_inst else {}
+                    properties = schema.get("properties")
+                    if isinstance(properties, dict) and properties:
+                        allowed_props = set(properties.keys())
+                        unknown_args = [k for k in tool_args.keys() if k not in allowed_props]
+                        if unknown_args:
+                            result = ActionResult(
+                                call_id=tool_call.id,
+                                tool_name=tool_name,
+                                success=False,
+                                output="",
+                                error=f"Invalid arguments for tool '{tool_name}': unexpected parameters {unknown_args}. Allowed parameters are: {sorted(list(allowed_props))}.",
+                            )
+                            messages.append(LLMMessage(role="tool", content=result.error, tool_call_id=tool_call.id, name=tool_name))
+                            continue
+
                     await self.emit("tool_executing", {
                         "task_id": task.id,
                         "tool": tool_name,
@@ -356,13 +394,14 @@ class ExecutionEngine:
                     ):
                         tool_args.pop(bad_arg, None)
 
-                    # Enforce container sandboxing for all automated task executions.
-                    # Automated code and model tool calls can NEVER execute on the host even if host flags are set.
+                    # Enforce container sandboxing & network isolation for all automated task executions.
+                    # Automated code and model tool calls can NEVER execute on the host or access outbound network.
                     if tool_name in ("run_command", "run_verification"):
                         tool_args["task_id"] = task.id
                         tool_args["sandbox_mode"] = "container"
                         tool_args["require_sandbox"] = True
                         tool_args["untrusted_workload"] = True
+                        tool_args["allow_network"] = False
 
                     # Strict wall-clock deadline bounding for tool execution
                     t_rem = max(0.1, overall_deadline - (time.monotonic() - task_start_time))

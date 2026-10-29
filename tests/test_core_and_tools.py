@@ -5136,7 +5136,7 @@ async def test_verification_evidence_identity_mismatch_and_fail_closed():
     2. When verification produces no trusted record, ActionResult.success is False (fails closed)."""
     from agent.tools.verification import RunVerificationCheckTool
     from agent.core.models import ActionResult
-    from unittest.mock import patch
+    from unittest.mock import patch, AsyncMock, MagicMock
 
     tool = RunVerificationCheckTool()
 
@@ -5409,3 +5409,278 @@ async def test_informational_task_requires_genuine_inspection():
     )
     assert report_with_read.status == TaskStatus.COMPLETED
     assert report_with_read.acceptance_criteria_satisfied is True
+
+
+
+
+
+
+@pytest.mark.asyncio
+async def test_terminal_and_engine_reject_unknown_arguments_and_network():
+    """Validates P1:
+    1. ExecutionEngine rejects unexpected/unknown tool parameters fail-closed.
+    2. Model cannot enable network access: allow_network is removed from schema & automated runs set allow_network=False.
+    3. RunCommandTool rejects allow_network=True for untrusted workloads.
+    4. Hard upper bounds on container memory and pids are strictly enforced."""
+    from agent.tools.terminal import RunCommandTool, build_container_command
+    from agent.core.engine import ExecutionEngine
+    from agent.core.models import Task, TaskStatus, TaskType, ActionResult
+    from agent.persistence.db import Database
+    from agent.tools.registry import ToolRegistry
+    from agent.security.permissions import PermissionManager, PermissionPolicy
+    from agent.providers.base import ProviderResponse, LLMToolCall
+    from unittest.mock import patch, MagicMock, AsyncMock
+
+    tool = RunCommandTool()
+    schema = tool.get_parameters_schema()
+    assert "allow_network" not in schema.get("properties", {})
+    assert schema.get("additionalProperties") is False
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Case A: Untrusted workload requesting allow_network=True is rejected
+        res_net = await tool.execute(
+            workspace_path=temp_dir,
+            command="echo test",
+            allow_network=True,
+            untrusted_workload=True,
+        )
+        assert res_net.success is False
+        assert "Outbound network access is strictly prohibited" in res_net.error
+
+        # Case B: Excessive resource limits are capped to hard upper bounds
+        with patch("agent.tools.terminal.build_container_command", wraps=build_container_command) as mock_build:
+            with patch("asyncio.create_subprocess_exec", AsyncMock()) as mock_sub:
+                mock_proc = AsyncMock()
+                mock_proc.pid = 99999
+                mock_proc.stdout = AsyncMock()
+                mock_proc.stdout.read = AsyncMock(return_value=b"")
+                mock_proc.stderr = AsyncMock()
+                mock_proc.stderr.read = AsyncMock(return_value=b"")
+                mock_proc.wait = AsyncMock(return_value=0)
+                mock_sub.return_value = mock_proc
+                await tool.execute(
+                    workspace_path=temp_dir,
+                    command="echo test",
+                    sandbox_mode="container",
+                    container_memory="100g",
+                    container_pids=9999,
+                )
+                assert mock_build.called
+                called_kw = mock_build.call_args[1]
+                assert called_kw["memory_limit"] == "1024m"
+                assert called_kw["pids_limit"] == 64
+
+        # Case C: Engine rejects unknown tool argument
+        db = Database(db_path=os.path.join(temp_dir, "test.db"))
+        await db.init()
+        pm = PermissionManager(policy=PermissionPolicy(auto_approve_routine=True, auto_approve_sensitive=True))
+        registry = ToolRegistry()
+        registry.register(tool)
+
+        task = Task(
+            id="task_unknown_arg",
+            goal="Try injecting unknown parameters",
+            workspace_path=temp_dir,
+            model_provider="anthropic",
+            model_name="claude-3-7-sonnet",
+        )
+
+        malicious_call = LLMToolCall(
+            id="call_unknown_1",
+            name="run_command",
+            arguments={
+                "command": "echo test",
+                "malicious_unknown_flag": "exploit",
+            },
+        )
+        mock_adapter = MagicMock()
+        mock_adapter.chat_completion = AsyncMock(side_effect=[
+            ProviderResponse(content="Running tool", tool_calls=[malicious_call]),
+            ProviderResponse(content="Done", tool_calls=[]),
+        ])
+
+        with patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter):
+            engine = ExecutionEngine(db=db, tool_registry=registry, permission_manager=pm)
+            with patch.object(registry, "execute_tool", AsyncMock()) as mock_exec:
+                await engine.run_task(task, api_key="sk-test")
+                # Confirm tool was NEVER executed due to unexpected parameter rejection
+                assert not any(call[1].get("name") == "run_command" for call in mock_exec.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_windows_docker_mount_parsing_and_exact_evidence_authorization():
+    import shutil
+    """Validates P1/P2:
+    1. parse_docker_mount correctly parses Windows drive paths (C:\\...:/container:mode) and Linux paths.
+    2. Evidence mount validation requires exact registered directory match; substring trickery is rejected."""
+    from agent.tools.terminal import (
+        parse_docker_mount,
+        RunCommandTool,
+        register_authorized_evidence_dir,
+        unregister_authorized_evidence_dir,
+    )
+
+    # 1. Mount parsing: Windows drive letters
+    h1, c1, m1 = parse_docker_mount(r"C:\Users\alice\AppData\Local\Temp\.agent_evidence:/verification_evidence:rw")
+    assert h1 == r"C:\Users\alice\AppData\Local\Temp\.agent_evidence"
+    assert c1 == "/verification_evidence"
+    assert m1 == "rw"
+
+    h2, c2, m2 = parse_docker_mount("D:/projects/code:/workspace:ro")
+    assert h2 == "D:/projects/code"
+    assert c2 == "/workspace"
+    assert m2 == "ro"
+
+    h3, c3, m3 = parse_docker_mount("/var/lib/docker/evidence:/verification_evidence")
+    assert h3 == "/var/lib/docker/evidence"
+    assert c3 == "/verification_evidence"
+    assert m3 is None
+
+    # 2. Exact directory authorization vs substring trickery
+    tool = RunCommandTool()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        real_ws = os.path.realpath(temp_dir)
+        exact_ev = os.path.join(temp_dir, "exact_evidence_123")
+        os.makedirs(exact_ev, exist_ok=True)
+
+        fake_substring_dir = tempfile.mkdtemp(prefix="fake_.agent_verification_evidence_escape_")
+        try:
+            # When exact_ev is registered:
+            register_authorized_evidence_dir(exact_ev)
+
+            # Mount pointing to exact_ev succeeds (is_ev = True)
+            res_valid = await tool.execute(
+                workspace_path=temp_dir,
+                command="echo test",
+                sandbox_mode="container",
+                extra_mounts=[f"{exact_ev}:/verification_evidence:rw"],
+            )
+            # Fails on container execution if docker not installed, but does NOT fail on mount escape
+            assert "Host mount escape detected" not in (res_valid.error or "")
+
+            # Unregistered directory with substring in name MUST BE REJECTED
+            res_fake = await tool.execute(
+                workspace_path=temp_dir,
+                command="echo test",
+                sandbox_mode="container",
+                extra_mounts=[f"{fake_substring_dir}:/verification_evidence:rw"],
+            )
+            assert res_fake.success is False
+            assert "Host mount escape detected" in res_fake.error
+        finally:
+            unregister_authorized_evidence_dir(exact_ev)
+            shutil.rmtree(fake_substring_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_verification_identity_checks_cannot_be_skipped():
+    """Validates P1:
+    1. If console output lacks individual testcase confirmation nodes, verification fails (no skip).
+    2. If any testcase in JUnit XML is unconfirmed in console output, tampering is detected (zero tolerance).
+    3. If verbose runner outputs matching testcase identities, verification passes."""
+    from agent.tools.verification import RunVerificationCheckTool
+    from agent.core.models import ActionResult
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    tool = RunVerificationCheckTool()
+
+    mock_xml = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" tests="2" errors="0" failures="0" skipped="0">
+    <testcase classname="tests.test_auth" file="tests/test_auth.py" name="test_login" time="0.05"/>
+    <testcase classname="tests.test_auth" file="tests/test_auth.py" name="test_logout" time="0.04"/>
+  </testsuite>
+</testsuites>
+"""
+
+    with tempfile.TemporaryDirectory() as ws_dir:
+        orig_stat = os.stat
+        def safe_stat(path, *args, **kwargs):
+            if ".agent_verification_evidence_" in str(path) or "junit_" in str(path):
+                m = MagicMock()
+                m.st_mtime = time.time() + 10.0
+                m.st_size = 500
+                return m
+            return orig_stat(path, *args, **kwargs)
+
+        orig_exists = os.path.exists
+        def safe_exists(path, *args, **kwargs):
+            if ".agent_verification_evidence_" in str(path) or "junit_" in str(path):
+                return True
+            return orig_exists(path, *args, **kwargs)
+
+        # Case 1: Console summary matches count, but output is non-verbose (dots only) -> FAILS (missing identities)
+        non_verbose_output = "..\n=== 2 passed in 0.10s ==="
+        with patch.object(tool._command_tool, "execute", AsyncMock(return_value=ActionResult(
+            call_id="c1", tool_name="run_command", success=True, output=non_verbose_output, artifacts={"exit_code": 0}
+        ))):
+            with patch("agent.tools.verification.parse_junit_xml_report", return_value={
+                "total": 2, "passed": 2, "failed": 0, "skipped": 0,
+                "passed_nodes": ["tests/test_auth.py::test_login", "tests/test_auth.py::test_logout"],
+                "passed_testcases": [
+                    {"name": "test_login", "file": "tests/test_auth.py", "classname": "tests.test_auth"},
+                    {"name": "test_logout", "file": "tests/test_auth.py", "classname": "tests.test_auth"},
+                ],
+                "failed_nodes": [], "skipped_nodes": [],
+            }):
+                with patch("os.path.exists", side_effect=safe_exists), patch("os.stat", side_effect=safe_stat):
+                    res_no_nodes = await tool.execute(
+                        workspace_path=ws_dir,
+                        command="pytest tests/test_auth.py",
+                        check_type="test",
+                    )
+                    assert res_no_nodes.success is False
+                    assert res_no_nodes.artifacts["tampering_detected"] is True
+                    assert "Runner console output did not contain individual testcase execution confirmations" in res_no_nodes.artifacts["discrepancy"]
+
+        # Case 2: One testcase matches, but the second testcase is fabricated/unconfirmed -> FAILS (zero tolerance)
+        partial_verbose_output = "tests/test_auth.py::test_login PASSED [ 50%]\n=== 2 passed in 0.12s ==="
+        with patch.object(tool._command_tool, "execute", AsyncMock(return_value=ActionResult(
+            call_id="c2", tool_name="run_command", success=True, output=partial_verbose_output, artifacts={"exit_code": 0}
+        ))):
+            with patch("agent.tools.verification.parse_junit_xml_report", return_value={
+                "total": 2, "passed": 2, "failed": 0, "skipped": 0,
+                "passed_nodes": ["tests/test_auth.py::test_login", "tests/test_auth.py::test_logout"],
+                "passed_testcases": [
+                    {"name": "test_login", "file": "tests/test_auth.py", "classname": "tests.test_auth"},
+                    {"name": "test_logout", "file": "tests/test_auth.py", "classname": "tests.test_auth"},
+                ],
+                "failed_nodes": [], "skipped_nodes": [],
+            }):
+                with patch("os.path.exists", side_effect=safe_exists), patch("os.stat", side_effect=safe_stat):
+                    res_unconfirmed = await tool.execute(
+                        workspace_path=ws_dir,
+                        command="pytest tests/test_auth.py",
+                        check_type="test",
+                    )
+                    assert res_unconfirmed.success is False
+                    assert res_unconfirmed.artifacts["tampering_detected"] is True
+                    assert "unconfirmed testcase identities" in res_unconfirmed.artifacts["discrepancy"]
+
+        # Case 3: All testcases match one-for-one -> PASSES with trusted execution record
+        full_verbose_output = (
+            "tests/test_auth.py::test_login PASSED [ 50%]\n"
+            "tests/test_auth.py::test_logout PASSED [100%]\n"
+            "=== 2 passed in 0.12s ==="
+        )
+        with patch.object(tool._command_tool, "execute", AsyncMock(return_value=ActionResult(
+            call_id="c3", tool_name="run_command", success=True, output=full_verbose_output, artifacts={"exit_code": 0}
+        ))):
+            with patch("agent.tools.verification.parse_junit_xml_report", return_value={
+                "total": 2, "passed": 2, "failed": 0, "skipped": 0,
+                "passed_nodes": ["tests/test_auth.py::test_login", "tests/test_auth.py::test_logout"],
+                "passed_testcases": [
+                    {"name": "test_login", "file": "tests/test_auth.py", "classname": "tests.test_auth"},
+                    {"name": "test_logout", "file": "tests/test_auth.py", "classname": "tests.test_auth"},
+                ],
+                "failed_nodes": [], "skipped_nodes": [],
+            }):
+                with patch("os.path.exists", side_effect=safe_exists), patch("os.stat", side_effect=safe_stat):
+                    res_valid = await tool.execute(
+                        workspace_path=ws_dir,
+                        command="pytest tests/test_auth.py",
+                        check_type="test",
+                    )
+                    assert res_valid.success is True
+                    assert res_valid.artifacts["tampering_detected"] is False
+                    assert res_valid.artifacts["trusted_execution_record"] is not None

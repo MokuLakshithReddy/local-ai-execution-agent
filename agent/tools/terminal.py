@@ -296,6 +296,58 @@ def get_default_container_user() -> Optional[str]:
     return "1000:1000"
 
 
+_AUTHORIZED_EVIDENCE_DIRS: set[str] = set()
+
+
+def register_authorized_evidence_dir(path: str) -> None:
+    """Registers an exact temporary evidence directory authorized for verification mounts."""
+    if path:
+        _AUTHORIZED_EVIDENCE_DIRS.add(os.path.realpath(path))
+
+
+def unregister_authorized_evidence_dir(path: str) -> None:
+    """Unregisters an evidence directory when verification finishes."""
+    if path:
+        _AUTHORIZED_EVIDENCE_DIRS.discard(os.path.realpath(path))
+
+
+def is_authorized_evidence_dir(path: str) -> bool:
+    """Checks if a resolved path is an authorized evidence directory or inside one."""
+    if not path or not _AUTHORIZED_EVIDENCE_DIRS:
+        return False
+    real_p = os.path.realpath(path)
+    return any(
+        real_p == auth_dir or real_p.startswith(auth_dir + os.sep)
+        for auth_dir in _AUTHORIZED_EVIDENCE_DIRS
+    )
+
+
+def parse_docker_mount(mount_str: str) -> tuple[str, str, Optional[str]]:
+    """
+    Parses a Docker volume mount specification '<host_path>:<container_path>[:<mode>]'
+    in a platform-aware manner, correctly handling Windows drive letters (e.g. C:\\path).
+    Returns (host_path, container_path, mode).
+    """
+    s = mount_str.strip()
+    if not s:
+        return "", "", None
+
+    # Handle Windows drive letter prefix (e.g. C:\... or C:/...)
+    if len(s) >= 2 and s[1] == ":" and s[0].isalpha():
+        rest = s[2:]
+        parts = rest.split(":")
+        host_path = s[:2] + parts[0]
+        container_path = parts[1] if len(parts) > 1 else ""
+        mode = parts[2] if len(parts) > 2 else None
+    else:
+        parts = s.split(":")
+        host_path = parts[0]
+        container_path = parts[1] if len(parts) > 1 else ""
+        mode = parts[2] if len(parts) > 2 else None
+
+    return host_path.strip(), container_path.strip(), mode.strip() if mode else None
+
+
 def build_container_command(
     command: str,
     workspace_path: str,
@@ -507,13 +559,9 @@ class RunCommandTool(BaseTool):
                     "description": "Maximum seconds to wait before terminating the process tree (default: 60).",
                     "default": 60,
                 },
-                "allow_network": {
-                    "type": "boolean",
-                    "description": "Whether to permit outbound network connections (default: false).",
-                    "default": False,
-                },
             },
             "required": ["command"],
+            "additionalProperties": False,
         }
 
     async def execute(self, workspace_path: str, **kwargs) -> ActionResult:
@@ -527,15 +575,36 @@ class RunCommandTool(BaseTool):
         raw_mounts = kwargs.get("extra_mounts")
         extra_mounts = []
 
+        # Network boundary: untrusted workloads or automated tasks can NEVER enable network access
+        if kwargs.get("untrusted_workload", False) and allow_network:
+            return ActionResult(
+                call_id=call_id,
+                tool_name=self.name,
+                success=False,
+                output="",
+                error="Sandbox Violation: Outbound network access is strictly prohibited for untrusted execution workloads.",
+                artifacts={"sandbox_violation": True},
+                execution_time_ms=(time.time() - t0) * 1000,
+            )
+
         # Validate that any extra_mounts are strictly contained within workspace or authorized verification evidence tempdirs
         if raw_mounts:
             real_ws = os.path.realpath(workspace_path)
             for em in raw_mounts:
-                parts = em.split(":")
-                host_p = parts[0]
+                host_p, container_p, mount_mode = parse_docker_mount(em)
+                if not host_p or not container_p:
+                    return ActionResult(
+                        call_id=call_id,
+                        tool_name=self.name,
+                        success=False,
+                        output="",
+                        error=f"Sandbox Violation: Malformed Docker mount specification: '{em}'",
+                        artifacts={"tampering_detected": True},
+                        execution_time_ms=(time.time() - t0) * 1000,
+                    )
                 real_hp = os.path.realpath(host_p)
                 is_ws = (real_hp == real_ws) or real_hp.startswith(real_ws + os.sep)
-                is_ev = (".agent_verification_evidence_" in real_hp)
+                is_ev = is_authorized_evidence_dir(real_hp)
                 if not (is_ws or is_ev):
                     return ActionResult(
                         call_id=call_id,
@@ -546,7 +615,8 @@ class RunCommandTool(BaseTool):
                         artifacts={"tampering_detected": True},
                         execution_time_ms=(time.time() - t0) * 1000,
                     )
-                extra_mounts.append(em)
+                norm_mode = f":{mount_mode}" if mount_mode else ""
+                extra_mounts.append(f"{real_hp}:{container_p}{norm_mode}")
 
         # Enforce canonical workspace path
         real_workspace = os.path.realpath(workspace_path)
@@ -698,13 +768,29 @@ class RunCommandTool(BaseTool):
             container_image = kwargs.get("container_image") or kwargs.get("image") or "python:3.12-slim"
             container_user = kwargs.get("container_user")
 
+            # Enforce hard upper bounds on resource limits (cannot be overridden to exceed bounds)
+            raw_mem = str(kwargs.get("container_memory", "512m")).strip().lower()
+            mem_m = re.match(r"^(\d+)([mg])$", raw_mem)
+            if mem_m:
+                val, unit = int(mem_m.group(1)), mem_m.group(2)
+                mb = val * 1024 if unit == "g" else val
+                mem_limit = f"{max(64, min(mb, 1024))}m"
+            else:
+                mem_limit = "512m"
+
+            try:
+                raw_pids = int(kwargs.get("container_pids", 32))
+                pids_limit = max(4, min(raw_pids, 64))
+            except (ValueError, TypeError):
+                pids_limit = 32
+
             try:
                 container_args = build_container_command(
                     command=command,
                     workspace_path=real_workspace,
                     image=container_image,
-                    memory_limit=kwargs.get("container_memory", "512m"),
-                    pids_limit=kwargs.get("container_pids", 32),
+                    memory_limit=mem_limit,
+                    pids_limit=pids_limit,
                     allow_network=allow_network,
                     container_name=container_name,
                     user=container_user,

@@ -10,7 +10,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Set
 from agent.tools.base import BaseTool
-from agent.tools.terminal import RunCommandTool
+from agent.tools.terminal import RunCommandTool, register_authorized_evidence_dir, unregister_authorized_evidence_dir
 from agent.core.models import PermissionLevel, ActionResult
 from agent.security.provenance import issue_trusted_execution_record, TrustedExecutionRecord
 
@@ -90,14 +90,14 @@ def extract_pytest_console_passed_nodes(output: str) -> Set[str]:
             if raw_target:
                 clean_target = raw_target.replace("\\", "/").lower()
                 passed_nodes.add(clean_target)
-                base = os.path.basename(clean_target)
-                passed_nodes.add(base)
                 if "::" in clean_target:
-                    test_fn = clean_target.split("::")[-1]
+                    parts = clean_target.split("::")
+                    test_fn = parts[-1]
                     passed_nodes.add(test_fn)
-                    passed_nodes.add(test_fn.replace(".py", ""))
-                test_stem = os.path.splitext(base)[0]
-                passed_nodes.add(test_stem)
+                    if len(parts) > 2:
+                        passed_nodes.add(f"{parts[0]}::{parts[-1]}")
+                else:
+                    passed_nodes.add(clean_target)
 
     return passed_nodes
 
@@ -118,6 +118,7 @@ def parse_junit_xml_report(xml_path: str) -> Optional[Dict[str, Any]]:
         passed_nodes: List[str] = []
         failed_nodes: List[str] = []
         skipped_nodes: List[str] = []
+        passed_testcases: List[Dict[str, str]] = []
 
         # JUnit XML can have <testcase> under root or inside <testsuite>
         testcases = root.findall(".//testcase")
@@ -167,6 +168,11 @@ def parse_junit_xml_report(xml_path: str) -> Optional[Dict[str, Any]]:
             else:
                 passed_testcase_count += 1
                 passed_nodes.extend(nodes)
+                passed_testcases.append({
+                    "name": name.lower(),
+                    "file": file_attr.replace("\\", "/").lower() if file_attr else "",
+                    "classname": classname.lower() if classname else "",
+                })
 
         # Validate count consistency: total must match sum of individual testcase outcomes
         if total_testcases != (passed_testcase_count + failed_testcase_count + skipped_testcase_count):
@@ -180,6 +186,7 @@ def parse_junit_xml_report(xml_path: str) -> Optional[Dict[str, Any]]:
             "failed": failed_testcase_count,
             "skipped": skipped_testcase_count,
             "passed_nodes": list(set(passed_nodes)),
+            "passed_testcases": passed_testcases,
             "failed_nodes": list(set(failed_nodes)),
             "skipped_nodes": list(set(skipped_nodes)),
         }
@@ -298,6 +305,7 @@ class RunVerificationCheckTool(BaseTool):
 
         # Create isolated temporary directory strictly OUTSIDE workspace for evidence collection
         report_dir = tempfile.mkdtemp(prefix=".agent_verification_evidence_")
+        register_authorized_evidence_dir(report_dir)
         report_filename = f"junit_{uuid.uuid4().hex}.xml"
         report_host_path = os.path.join(report_dir, report_filename)
 
@@ -307,17 +315,20 @@ class RunVerificationCheckTool(BaseTool):
 
         is_pytest = "pytest" in command.lower()
         if is_pytest:
+            # Force verbose mode so pytest outputs every single executed testcase identity to stdout
+            has_verbose = any(v in command.split() for v in ("-v", "-vv", "--verbose"))
+            verbose_arg = "" if has_verbose else " -v"
             if sandbox_mode == "container":
                 # Mount external report dir inside container at /verification_evidence
                 extra_mounts = list(cmd_kwargs.get("extra_mounts", []))
                 extra_mounts.append(f"{report_dir}:/verification_evidence:rw")
                 cmd_kwargs["extra_mounts"] = extra_mounts
-                exec_cmd = f"{command} --junitxml=/verification_evidence/{report_filename}"
+                exec_cmd = f"{command}{verbose_arg} --junitxml=/verification_evidence/{report_filename}"
             else:
                 allowed_paths = list(cmd_kwargs.get("allowed_paths", []))
                 allowed_paths.append(report_dir)
                 cmd_kwargs["allowed_paths"] = allowed_paths
-                exec_cmd = f'{command} --junitxml="{report_host_path}"'
+                exec_cmd = f'{command}{verbose_arg} --junitxml="{report_host_path}"'
 
         try:
             res = await self._command_tool.execute(
@@ -363,20 +374,34 @@ class RunVerificationCheckTool(BaseTool):
                                     f"Tampering detected: Report counts ({parsed['passed']} passed, {parsed['failed']} failed) "
                                     f"do not match runner console summary ({console_summary['passed']} passed, {console_summary['failed']} failed)."
                                 )
-                            elif console_nodes:
-                                # Validate individual testcase identities: every test in XML must be verified by console stream
-                                unconfirmed_nodes = []
-                                for pnode in parsed["passed_nodes"]:
-                                    clean_pn = pnode.replace("\\", "/").lower()
-                                    if not any(clean_pn in cn or cn in clean_pn for cn in console_nodes):
-                                        unconfirmed_nodes.append(pnode)
-                                if len(unconfirmed_nodes) > (len(parsed["passed_nodes"]) // 2):
+                            elif not console_nodes:
+                                # Mandatory identity evidence: verbose runner output must contain individual testcase identities
+                                tampering_detected = True
+                                discrepancy_msg = "Discrepancy: Runner console output did not contain individual testcase execution confirmations (verbose runner output required)."
+                            else:
+                                # Strict one-for-one testcase validation: every testcase in XML report must have matching console confirmation
+                                unconfirmed_cases = []
+                                for tc in parsed.get("passed_testcases", []):
+                                    tc_name = tc.get("name", "").strip().lower()
+                                    tc_file = tc.get("file", "").strip().replace("\\", "/").lower()
+                                    matched = False
+                                    if tc_file and tc_name:
+                                        canonical = f"{tc_file}::{tc_name}"
+                                        if canonical in console_nodes:
+                                            matched = True
+                                        elif any(cn.endswith(f"::{tc_name}") and tc_file in cn for cn in console_nodes):
+                                            matched = True
+                                    if not matched and tc_name:
+                                        if tc_name in console_nodes or any(cn.endswith(f"::{tc_name}") for cn in console_nodes):
+                                            matched = True
+                                    if not matched:
+                                        unconfirmed_cases.append(f"{tc_file}::{tc_name}" if tc_file else tc_name)
+
+                                if unconfirmed_cases:
                                     tampering_detected = True
-                                    discrepancy_msg = f"Tampering detected: Report contains unconfirmed testcase identities: {unconfirmed_nodes[:3]}"
+                                    discrepancy_msg = f"Tampering detected: Report contains unconfirmed testcase identities: {unconfirmed_cases[:5]}"
                                 else:
                                     cross_check_passed = True
-                            else:
-                                cross_check_passed = True
                         else:
                             cross_check_passed = True
 
@@ -434,5 +459,7 @@ class RunVerificationCheckTool(BaseTool):
                 execution_time_ms=(time.time() - t0) * 1000,
             )
         finally:
-            if report_dir and os.path.exists(report_dir):
-                shutil.rmtree(report_dir, ignore_errors=True)
+            if report_dir:
+                unregister_authorized_evidence_dir(report_dir)
+                if os.path.exists(report_dir):
+                    shutil.rmtree(report_dir, ignore_errors=True)
