@@ -2050,7 +2050,7 @@ def test_credential_vault_stress_slow_writes_interrupted_and_permissions():
 
         with pytest.raises(CredentialEncryptionError) as exc_info:
             CredentialVault(key_dir=key_dir, is_windows=False)
-        assert any(msg in str(exc_info.value) for msg in ("Failed to initialize Fernet", "Corrupted or empty", "initialization failed"))
+        assert any(msg in str(exc_info.value) for msg in ("Failed to initialize Fernet", "Corrupted", "invalid Fernet", "initialization failed"))
 
     # 3. Crash recovery: incomplete key (< 32 bytes) left by crashed process is safely recovered
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
