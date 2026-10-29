@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   Play,
   Square,
@@ -14,7 +14,13 @@ import {
   Layers,
   Sparkles,
   RefreshCw,
-  FolderOpen
+  FolderOpen,
+  Wifi,
+  WifiOff,
+  ShieldCheck,
+  Check,
+  X,
+  Code2
 } from 'lucide-react'
 import './App.css'
 
@@ -59,6 +65,61 @@ interface ApprovalRequest {
   reason: string
 }
 
+interface DiffFile {
+  filename: string
+  oldPath: string
+  newPath: string
+  additions: number
+  deletions: number
+  lines: { type: 'add' | 'delete' | 'normal' | 'chunk' | 'header'; text: string }[]
+}
+
+function parseGitDiff(rawDiff: string): DiffFile[] {
+  if (!rawDiff || !rawDiff.trim()) return []
+  const files: DiffFile[] = []
+  const rawFiles = rawDiff.split(/(?=diff --git )/g)
+
+  for (const block of rawFiles) {
+    if (!block.trim()) continue
+    const lines = block.split('\n')
+    let filename = 'Modified File'
+    const headerMatch = lines[0].match(/diff --git a\/(.+?) b\/(.+)/)
+    if (headerMatch) {
+      filename = headerMatch[2]
+    }
+
+    let additions = 0
+    let deletions = 0
+    const parsedLines: { type: 'add' | 'delete' | 'normal' | 'chunk' | 'header'; text: string }[] = []
+
+    for (const line of lines) {
+      if (line.startsWith('diff --git') || line.startsWith('index ') || line.startsWith('---') || line.startsWith('+++')) {
+        parsedLines.push({ type: 'header', text: line })
+      } else if (line.startsWith('@@')) {
+        parsedLines.push({ type: 'chunk', text: line })
+      } else if (line.startsWith('+')) {
+        additions++
+        parsedLines.push({ type: 'add', text: line })
+      } else if (line.startsWith('-')) {
+        deletions++
+        parsedLines.push({ type: 'delete', text: line })
+      } else {
+        parsedLines.push({ type: 'normal', text: line })
+      }
+    }
+
+    files.push({
+      filename,
+      oldPath: headerMatch ? headerMatch[1] : filename,
+      newPath: headerMatch ? headerMatch[2] : filename,
+      additions,
+      deletions,
+      lines: parsedLines,
+    })
+  }
+  return files
+}
+
 export default function App() {
   // State
   const [goal, setGoal] = useState('')
@@ -73,11 +134,18 @@ export default function App() {
   const [currentStep, setCurrentStep] = useState<number>(0)
   const [timeline, setTimeline] = useState<TaskStep[]>([])
   const [gitDiff, setGitDiff] = useState<string>('')
+  const [selectedDiffFile, setSelectedDiffFile] = useState<number>(0)
   const [finalReport, setFinalReport] = useState<TaskReport | null>(null)
 
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null)
   const [showSettings, setShowSettings] = useState(false)
+  const [showWorkspaceModal, setShowWorkspaceModal] = useState(false)
+  const [workspaceInput, setWorkspaceInput] = useState('')
   const [historyTasks, setHistoryTasks] = useState<any[]>([])
+
+  // WebSocket Connection State
+  const [wsStatus, setWsStatus] = useState<'connected' | 'connecting' | 'disconnected' | 'error'>('connecting')
+  const reconnectTimerRef = useRef<number | null>(null)
 
   // Settings State
   const [settings, setSettings] = useState({
@@ -92,70 +160,83 @@ export default function App() {
   const [inputApiKey, setInputApiKey] = useState('')
 
   const authTokenRef = useRef<string>('')
-
   const wsRef = useRef<WebSocket | null>(null)
   const timelineEndRef = useRef<HTMLDivElement | null>(null)
 
-  const authFetch = async (url: string, options: RequestInit = {}) => {
+  const authFetch = useCallback(async (url: string, options: RequestInit = {}) => {
     const headers = new Headers(options.headers || {})
     if (authTokenRef.current) {
       headers.set('X-Agent-Auth-Token', authTokenRef.current)
     }
     return fetch(url, { ...options, headers })
-  }
+  }, [])
 
-  // Initialize
-  useEffect(() => {
-    const initAuthAndData = async () => {
-      try {
-        const tokenRes = await fetch('http://localhost:8000/api/auth/token')
-        if (tokenRes.ok) {
-          const { token } = await tokenRes.json()
-          authTokenRef.current = token
-          loadSettings(token)
-          loadWorkspaces(token)
-          loadTaskHistory(token)
-          setupWebSocket(token)
+  const loadSettings = useCallback(async (tok?: string) => {
+    try {
+      const headers: Record<string, string> = {}
+      const token = tok || authTokenRef.current
+      if (token) headers['X-Agent-Auth-Token'] = token
+      const res = await fetch('http://localhost:8000/api/settings', { headers })
+      if (res.ok) {
+        const data = await res.json()
+        setSettings(data)
+        if (data.current_workspace) {
+          setCurrentWorkspace(data.current_workspace)
+          setWorkspaceInput(data.current_workspace)
         }
-      } catch (err) {
-        console.warn('Initial session auth failed or server offline', err)
       }
-    }
-
-    initAuthAndData()
-
-    return () => {
-      if (wsRef.current) wsRef.current.close()
+    } catch {
+      // API may be temporarily offline
     }
   }, [])
 
-  // Auto-scroll timeline
-  useEffect(() => {
-    timelineEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [timeline])
-
-  const setupWebSocket = (token?: string) => {
-    const tok = token || authTokenRef.current
-    const wsUrl = `ws://${window.location.hostname || 'localhost'}:8000/ws?token=${encodeURIComponent(tok)}`
-    const ws = new WebSocket(wsUrl)
-    wsRef.current = ws
-
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data)
-        handleSocketEvent(msg.type, msg.data)
-      } catch (err) {
-        console.error('WebSocket parse error:', err)
+  const loadWorkspaces = useCallback(async (tok?: string) => {
+    try {
+      const headers: Record<string, string> = {}
+      const token = tok || authTokenRef.current
+      if (token) headers['X-Agent-Auth-Token'] = token
+      const res = await fetch('http://localhost:8000/api/workspaces', { headers })
+      if (res.ok) {
+        const data = await res.json()
+        if (data.current) {
+          setCurrentWorkspace(data.current)
+          setWorkspaceInput(data.current)
+        }
       }
+    } catch {
+      // Ignore background fetch error
     }
+  }, [])
 
-    ws.onclose = () => {
-      setTimeout(() => setupWebSocket(), 3000)
+  const loadTaskHistory = useCallback(async (tok?: string) => {
+    try {
+      const headers: Record<string, string> = {}
+      const token = tok || authTokenRef.current
+      if (token) headers['X-Agent-Auth-Token'] = token
+      const res = await fetch('http://localhost:8000/api/tasks', { headers })
+      if (res.ok) {
+        const data = await res.json()
+        setHistoryTasks(data.tasks || [])
+      }
+    } catch {
+      // Ignore background fetch error
     }
-  }
+  }, [])
 
-  const handleSocketEvent = (type: string, data: any) => {
-    const now = new Date().toLocaleTimeString()
+  const fetchDiff = useCallback(async () => {
+    try {
+      const res = await authFetch('http://localhost:8000/api/diff')
+      if (res.ok) {
+        const data = await res.json()
+        setGitDiff(data.diff || '')
+      }
+    } catch {
+      // Ignore diff fetch error
+    }
+  }, [authFetch])
+
+  const handleSocketEvent = useCallback((type: string, data: any) => {
+    const timestamp = new Date().toLocaleTimeString()
 
     if (type === 'task_status') {
       setTaskStatus(data.status)
@@ -168,7 +249,7 @@ export default function App() {
           type: 'status',
           title: `Step ${data.step} / ${data.max_steps}`,
           content: 'Reasoning and inspecting workspace...',
-          timestamp: now,
+          timestamp,
         },
       ])
     } else if (type === 'agent_thought') {
@@ -179,7 +260,7 @@ export default function App() {
           type: 'thought',
           title: 'Agent Reasoning',
           content: data.thought,
-          timestamp: now,
+          timestamp,
         },
       ])
     } else if (type === 'tool_executing') {
@@ -190,7 +271,7 @@ export default function App() {
           type: 'tool_call',
           title: `Tool: ${data.tool}`,
           content: JSON.stringify(data.arguments, null, 2),
-          timestamp: now,
+          timestamp,
         },
       ])
     } else if (type === 'tool_result') {
@@ -202,10 +283,9 @@ export default function App() {
           title: `Result: ${data.tool} (${data.success ? 'Success' : 'Failed'})`,
           content: data.output || data.error || '(no output)',
           metadata: { success: data.success },
-          timestamp: now,
+          timestamp,
         },
       ])
-      // Refresh diff whenever files might have changed
       fetchDiff()
     } else if (type === 'approval_required') {
       setTaskStatus('PENDING_APPROVAL')
@@ -226,60 +306,140 @@ export default function App() {
           type: 'error',
           title: 'Task Error',
           content: data.error,
-          timestamp: now,
+          timestamp,
         },
       ])
     }
-  }
+  }, [currentStep, fetchDiff, loadTaskHistory])
 
-  const loadSettings = async (tok?: string) => {
+  const resolveApproval = useCallback(async (approved: boolean) => {
+    if (!pendingApproval) return
     try {
-      const headers: any = {}
-      if (tok || authTokenRef.current) headers['X-Agent-Auth-Token'] = tok || authTokenRef.current
-      const res = await fetch('http://localhost:8000/api/settings', { headers })
-      if (res.ok) {
-        const data = await res.json()
-        setSettings(data)
-        if (data.current_workspace) setCurrentWorkspace(data.current_workspace)
-      }
-    } catch (e) {
-      console.warn('API offline or loading', e)
+      await authFetch(`http://localhost:8000/api/approvals/${pendingApproval.approval_id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ approved }),
+      })
+      setPendingApproval(null)
+    } catch {
+      // Ignore approval resolution error
     }
-  }
+  }, [pendingApproval, authFetch])
 
-  const loadWorkspaces = async (tok?: string) => {
-    try {
-      const headers: any = {}
-      if (tok || authTokenRef.current) headers['X-Agent-Auth-Token'] = tok || authTokenRef.current
-      const res = await fetch('http://localhost:8000/api/workspaces', { headers })
-      if (res.ok) {
-        const data = await res.json()
-        if (data.current) setCurrentWorkspace(data.current)
-      }
-    } catch (e) {}
-  }
+  const setupWebSocketRef = useRef<((tok?: string) => void) | null>(null)
 
-  const loadTaskHistory = async (tok?: string) => {
-    try {
-      const headers: any = {}
-      if (tok || authTokenRef.current) headers['X-Agent-Auth-Token'] = tok || authTokenRef.current
-      const res = await fetch('http://localhost:8000/api/tasks', { headers })
-      if (res.ok) {
-        const data = await res.json()
-        setHistoryTasks(data.tasks || [])
-      }
-    } catch (e) {}
-  }
+  const setupWebSocket = useCallback((token?: string) => {
+    if (reconnectTimerRef.current) {
+      window.clearTimeout(reconnectTimerRef.current)
+      reconnectTimerRef.current = null
+    }
 
-  const fetchDiff = async () => {
+    if (wsRef.current) {
+      wsRef.current.onclose = null
+      wsRef.current.onerror = null
+      wsRef.current.onmessage = null
+      wsRef.current.close()
+      wsRef.current = null
+    }
+
+    setWsStatus('connecting')
+    const tok = token || authTokenRef.current
+    const wsUrl = `ws://${window.location.hostname || 'localhost'}:8000/ws?token=${encodeURIComponent(tok)}`
+    
     try {
-      const res = await authFetch('http://localhost:8000/api/diff')
-      if (res.ok) {
-        const data = await res.json()
-        setGitDiff(data.diff || '')
+      const ws = new WebSocket(wsUrl)
+      wsRef.current = ws
+
+      ws.onopen = () => {
+        setWsStatus('connected')
       }
-    } catch (e) {}
-  }
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data)
+          handleSocketEvent(msg.type, msg.data)
+        } catch (err) {
+          console.error('WebSocket parse error:', err)
+        }
+      }
+
+      ws.onerror = () => {
+        setWsStatus('error')
+      }
+
+      ws.onclose = () => {
+        setWsStatus('disconnected')
+        reconnectTimerRef.current = window.setTimeout(() => {
+          setupWebSocketRef.current?.()
+        }, 3000)
+      }
+    } catch {
+      setWsStatus('error')
+      reconnectTimerRef.current = window.setTimeout(() => {
+        setupWebSocketRef.current?.()
+      }, 4000)
+    }
+  }, [handleSocketEvent])
+
+  useEffect(() => {
+    setupWebSocketRef.current = setupWebSocket
+  }, [setupWebSocket])
+
+  // Initialize Auth & Data
+  useEffect(() => {
+    const initAuthAndData = async () => {
+      try {
+        const tokenRes = await fetch('http://localhost:8000/api/auth/token')
+        if (tokenRes.ok) {
+          const { token } = await tokenRes.json()
+          authTokenRef.current = token
+          await loadSettings(token)
+          await loadWorkspaces(token)
+          await loadTaskHistory(token)
+          setupWebSocket(token)
+        }
+      } catch (err) {
+        console.warn('Initial session auth failed or server offline', err)
+        setWsStatus('disconnected')
+      }
+    }
+
+    initAuthAndData()
+
+    return () => {
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current)
+      }
+      if (wsRef.current) {
+        wsRef.current.onclose = null
+        wsRef.current.close()
+      }
+    }
+  }, [loadSettings, loadWorkspaces, loadTaskHistory, setupWebSocket])
+
+  // Auto-scroll timeline
+  useEffect(() => {
+    timelineEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [timeline])
+
+  // Keyboard shortcut listener for approvals and closing modals
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setShowSettings(false)
+        setShowWorkspaceModal(false)
+      }
+      if (pendingApproval) {
+        if (e.altKey && e.key.toLowerCase() === 'a') {
+          resolveApproval(true)
+        } else if (e.altKey && e.key.toLowerCase() === 'd') {
+          resolveApproval(false)
+        }
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [pendingApproval, resolveApproval])
 
   const startTask = async () => {
     if (!goal.trim()) return
@@ -323,19 +483,9 @@ export default function App() {
     try {
       await authFetch(`http://localhost:8000/api/tasks/${currentTaskId}/cancel`, { method: 'POST' })
       setTaskStatus('CANCELLED')
-    } catch (e) {}
-  }
-
-  const resolveApproval = async (approved: boolean) => {
-    if (!pendingApproval) return
-    try {
-      await authFetch(`http://localhost:8000/api/approvals/${pendingApproval.approval_id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ approved }),
-      })
-      setPendingApproval(null)
-    } catch (e) {}
+    } catch {
+      // Ignore cancellation error
+    }
   }
 
   const saveSettingsToServer = async () => {
@@ -360,17 +510,38 @@ export default function App() {
       setInputApiKey('')
       setShowSettings(false)
       loadSettings()
-    } catch (e) {}
+    } catch {
+      // Ignore settings save error
+    }
+  }
+
+  const applyWorkspaceChange = async () => {
+    if (!workspaceInput.trim()) return
+    setCurrentWorkspace(workspaceInput.trim())
+    setShowWorkspaceModal(false)
+    try {
+      await authFetch('http://localhost:8000/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ current_workspace: workspaceInput.trim() }),
+      })
+    } catch {
+      // Ignore workspace save error
+    }
   }
 
   const isRunning = ['PLANNING', 'EXECUTING', 'PENDING_APPROVAL', 'VERIFYING'].includes(taskStatus)
+  const diffFiles = parseGitDiff(gitDiff)
 
   return (
     <div className="app-container">
       {/* Top Header */}
-      <header className="app-header glass-panel">
+      <header className="app-header glass-panel" role="banner">
         <div className="brand-badge">
-          <div className="pulse-indicator" style={{ width: 10, height: 10, borderRadius: '50%', background: '#6366f1' }}></div>
+          <div
+            className="pulse-indicator"
+            style={{ width: 10, height: 10, borderRadius: '50%', background: '#6366f1' }}
+          />
           <div>
             <span className="brand-title">Antigravity Execution Agent</span>
             <span className="brand-tag" style={{ marginLeft: 8 }}>Local-First</span>
@@ -378,16 +549,24 @@ export default function App() {
         </div>
 
         <div className="header-controls">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-muted)', fontSize: '0.85rem' }}>
-            <FolderOpen size={16} />
-            <span style={{ maxWidth: 260, textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }} title={currentWorkspace}>
+          {/* Workspace Pill */}
+          <button
+            className="btn-ghost"
+            style={{ padding: '6px 12px', fontSize: '0.82rem', gap: 8 }}
+            onClick={() => setShowWorkspaceModal(true)}
+            title="Click to switch workspace directory"
+            aria-label="Current Workspace"
+          >
+            <FolderOpen size={16} color="#818cf8" />
+            <span style={{ maxWidth: 220, textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
               {currentWorkspace || 'Default Workspace'}
             </span>
-          </div>
+          </button>
 
           {/* Model Selector */}
           <select
             className="select-pill"
+            aria-label="Model Provider Selection"
             value={`${provider}:${model}`}
             onChange={(e) => {
               const [p, m] = e.target.value.split(':')
@@ -403,43 +582,101 @@ export default function App() {
             <option value="ollama:qwen2.5-coder:latest">Ollama (Local Qwen2.5 Coder)</option>
           </select>
 
-          <button className="btn-ghost" onClick={() => setShowSettings(true)} title="Settings & Credentials">
+          {/* WebSocket Status Indicator */}
+          <button
+            className={`conn-badge conn-${wsStatus}`}
+            onClick={() => setupWebSocket()}
+            title={wsStatus === 'connected' ? 'WebSocket Connected' : 'WebSocket Disconnected - Click to reconnect'}
+            aria-label="Connection Status"
+          >
+            {wsStatus === 'connected' ? <Wifi size={14} /> : <WifiOff size={14} />}
+            <span>{wsStatus === 'connected' ? 'Live' : wsStatus === 'connecting' ? 'Connecting...' : 'Offline'}</span>
+          </button>
+
+          <button
+            className="btn-ghost"
+            onClick={() => setShowSettings(true)}
+            title="Settings & Credentials"
+            aria-label="Open Settings"
+          >
             <SettingsIcon size={16} />
             Settings
           </button>
         </div>
       </header>
 
+      {/* Urgent Persistent Approval Banner */}
+      {pendingApproval && (
+        <div className="urgent-approval-banner" role="alert" aria-live="assertive">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <ShieldAlert size={24} color="#fff" />
+            <div>
+              <strong style={{ color: '#fff', fontSize: '0.95rem' }}>
+                ACTION REQUIRED: Elevated Permission Requested
+              </strong>
+              <div style={{ fontSize: '0.82rem', color: '#ffe4e6' }}>
+                Tool <code style={{ background: 'rgba(0,0,0,0.3)', padding: '2px 6px', borderRadius: 4 }}>{pendingApproval.tool_name}</code> ({pendingApproval.permission_level}) needs authorization.
+              </div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn-danger" style={{ padding: '6px 14px', fontSize: '0.82rem' }} onClick={() => resolveApproval(false)}>
+              <X size={15} /> Deny
+            </button>
+            <button className="btn-success" style={{ padding: '6px 14px', fontSize: '0.82rem' }} onClick={() => resolveApproval(true)}>
+              <Check size={15} /> Approve
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Main Workspace Layout */}
       <main className="main-content">
         {/* Left Side: Task Configuration & Launch */}
-        <aside className="task-panel glass-panel">
+        <aside className="task-panel glass-panel" aria-label="Task Composer">
           <div>
-            <div className="section-label">Task Assignment</div>
+            <div className="section-label" style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span>Task Assignment</span>
+              <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)' }}>{goal.length} chars</span>
+            </div>
             <textarea
               className="task-textarea"
               placeholder="e.g. Inspect this repository, add a new validation function in auth.py, run tests with pytest, and verify the outcome."
               value={goal}
               onChange={(e) => setGoal(e.target.value)}
               disabled={isRunning}
+              aria-label="Task Goal Input"
             />
           </div>
 
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button
-              className="btn-ghost"
-              style={{ fontSize: '0.75rem', padding: '4px 8px' }}
-              onClick={() => setGoal('Inspect the workspace structure, list key directories, and report codebase summary.')}
-            >
-              Inspect Architecture
-            </button>
-            <button
-              className="btn-ghost"
-              style={{ fontSize: '0.75rem', padding: '4px 8px' }}
-              onClick={() => setGoal('Add a test case in tests/ for input sanitization, execute pytest via run_verification, and report evidence.')}
-            >
-              Add Test & Verify
-            </button>
+          <div>
+            <div className="section-label">Quick Presets</div>
+            <div className="preset-tags">
+              <button
+                className="preset-chip"
+                onClick={() => setGoal('Inspect repository architecture, list key modules, and summarize technical design.')}
+              >
+                Audit Architecture
+              </button>
+              <button
+                className="preset-chip"
+                onClick={() => setGoal('Run test suite with run_verification tool, report JUnit XML evidence, and verify all tests pass.')}
+              >
+                Verify Test Suite
+              </button>
+              <button
+                className="preset-chip"
+                onClick={() => setGoal('Identify failing edge cases in unit tests, implement a surgical fix, and verify with pytest.')}
+              >
+                Bugfix & Verify
+              </button>
+              <button
+                className="preset-chip"
+                onClick={() => setGoal('Audit code against injection vulnerabilities and harden sensitive input boundaries.')}
+              >
+                Security Audit
+              </button>
+            </div>
           </div>
 
           <div>
@@ -455,18 +692,30 @@ export default function App() {
               onChange={(e) => setMaxSteps(Number(e.target.value))}
               disabled={isRunning}
               style={{ width: '100%', accentColor: 'var(--primary)' }}
+              aria-label="Max Step Limit Slider"
             />
           </div>
 
           {/* Action Trigger */}
           <div style={{ marginTop: 'auto', display: 'flex', gap: 10 }}>
             {!isRunning ? (
-              <button className="btn-primary" style={{ flex: 1 }} onClick={startTask} disabled={!goal.trim()}>
+              <button
+                className="btn-primary"
+                style={{ flex: 1 }}
+                onClick={startTask}
+                disabled={!goal.trim()}
+                aria-label="Delegate Task"
+              >
                 <Play size={18} fill="#fff" />
                 Delegate Task
               </button>
             ) : (
-              <button className="btn-danger" style={{ flex: 1 }} onClick={cancelTask}>
+              <button
+                className="btn-danger"
+                style={{ flex: 1 }}
+                onClick={cancelTask}
+                aria-label="Stop Execution"
+              >
                 <Square size={18} fill="currentColor" />
                 Stop Execution
               </button>
@@ -475,11 +724,13 @@ export default function App() {
         </aside>
 
         {/* Right Side: Tabbed Work View */}
-        <section className="work-panel glass-panel">
+        <section className="work-panel glass-panel" aria-label="Task Execution Workspace">
           {/* Tab Navigation Header */}
           <div className="tab-bar">
-            <div className="tabs-group">
+            <div className="tabs-group" role="tablist">
               <button
+                role="tab"
+                aria-selected={activeTab === 'timeline'}
                 className={`tab-btn ${activeTab === 'timeline' ? 'active' : ''}`}
                 onClick={() => setActiveTab('timeline')}
               >
@@ -487,6 +738,8 @@ export default function App() {
                 Execution Feed
               </button>
               <button
+                role="tab"
+                aria-selected={activeTab === 'diff'}
                 className={`tab-btn ${activeTab === 'diff' ? 'active' : ''}`}
                 onClick={() => {
                   fetchDiff()
@@ -494,9 +747,11 @@ export default function App() {
                 }}
               >
                 <GitBranch size={16} />
-                Git Changes
+                Git Changes {diffFiles.length > 0 ? `(${diffFiles.length})` : ''}
               </button>
               <button
+                role="tab"
+                aria-selected={activeTab === 'verification'}
                 className={`tab-btn ${activeTab === 'verification' ? 'active' : ''}`}
                 onClick={() => setActiveTab('verification')}
               >
@@ -504,6 +759,8 @@ export default function App() {
                 Verification & Report
               </button>
               <button
+                role="tab"
+                aria-selected={activeTab === 'history'}
                 className={`tab-btn ${activeTab === 'history' ? 'active' : ''}`}
                 onClick={() => {
                   loadTaskHistory()
@@ -531,7 +788,7 @@ export default function App() {
 
           {/* Tab 1: Live Timeline Feed */}
           {activeTab === 'timeline' && (
-            <div className="timeline-content">
+            <div className="timeline-content" role="log" aria-live="polite">
               {timeline.length === 0 ? (
                 <div style={{ margin: 'auto', textAlign: 'center', color: 'var(--text-muted)' }}>
                   <Sparkles size={36} style={{ marginBottom: 12, opacity: 0.4 }} />
@@ -568,31 +825,72 @@ export default function App() {
             </div>
           )}
 
-          {/* Tab 2: Git Diff Viewer */}
+          {/* Tab 2: Enhanced Multi-File Git Diff Viewer */}
           {activeTab === 'diff' && (
-            <div className="diff-container">
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 12 }}>
-                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>Repository Working Tree Changes</span>
-                <button className="btn-ghost" style={{ padding: '2px 8px' }} onClick={fetchDiff}>
+            <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', padding: '12px 20px', borderBottom: '1px solid var(--border-color)' }}>
+                <span style={{ fontWeight: 600, color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <Code2 size={16} color="#818cf8" /> Working Tree Unified Diffs ({diffFiles.length} file{diffFiles.length === 1 ? '' : 's'})
+                </span>
+                <button className="btn-ghost" style={{ padding: '4px 10px', fontSize: '0.78rem' }} onClick={fetchDiff}>
                   <RefreshCw size={14} /> Refresh Diff
                 </button>
               </div>
 
-              {!gitDiff ? (
-                <div style={{ color: 'var(--text-muted)', padding: '20px 0' }}>
-                  No uncommitted changes in current repository working tree.
+              {diffFiles.length === 0 ? (
+                <div style={{ color: 'var(--text-muted)', padding: '40px 20px', textAlign: 'center', margin: 'auto' }}>
+                  <GitBranch size={32} style={{ opacity: 0.3, marginBottom: 8 }} />
+                  <p>No uncommitted changes in current repository working tree.</p>
                 </div>
               ) : (
-                gitDiff.split('\n').map((line, idx) => {
-                  let cls = 'diff-line-normal'
-                  if (line.startsWith('+') && !line.startsWith('+++')) cls = 'diff-line-add'
-                  if (line.startsWith('-') && !line.startsWith('---')) cls = 'diff-line-remove'
-                  return (
-                    <span key={idx} className={cls}>
-                      {line}
-                    </span>
-                  )
-                })
+                <div className="diff-view-layout">
+                  {/* Diff File List Sidebar */}
+                  <div className="diff-sidebar">
+                    <div className="section-label">Modified Files</div>
+                    {diffFiles.map((f, idx) => (
+                      <div
+                        key={idx}
+                        className={`diff-file-item ${selectedDiffFile === idx ? 'selected' : ''}`}
+                        onClick={() => setSelectedDiffFile(idx)}
+                      >
+                        <span style={{ textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }} title={f.filename}>
+                          {f.filename}
+                        </span>
+                        <div className="diff-file-stats">
+                          {f.additions > 0 && <span className="stat-add">+{f.additions}</span>}
+                          {f.deletions > 0 && <span className="stat-del">-{f.deletions}</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Diff Code Container */}
+                  <div className="diff-container">
+                    {diffFiles[selectedDiffFile] ? (
+                      <div>
+                        <div className="diff-file-header">
+                          <span>{diffFiles[selectedDiffFile].filename}</span>
+                          <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>
+                            +{diffFiles[selectedDiffFile].additions} / -{diffFiles[selectedDiffFile].deletions} lines
+                          </span>
+                        </div>
+                        {diffFiles[selectedDiffFile].lines.map((l, lIdx) => {
+                          let cls = 'diff-line-normal'
+                          if (l.type === 'add') cls = 'diff-line-add'
+                          if (l.type === 'delete') cls = 'diff-line-remove'
+                          if (l.type === 'chunk') cls = 'diff-line-chunk'
+                          return (
+                            <span key={lIdx} className={cls}>
+                              {l.text}
+                            </span>
+                          )
+                        })}
+                      </div>
+                    ) : (
+                      <div style={{ color: 'var(--text-muted)' }}>Select a file to inspect diff.</div>
+                    )}
+                  </div>
+                </div>
               )}
             </div>
           )}
@@ -605,7 +903,7 @@ export default function App() {
                   <ShieldAlert size={36} style={{ marginBottom: 12, opacity: 0.4 }} />
                   <p>No verification evidence recorded for the active run yet.</p>
                   <p style={{ fontSize: '0.8rem', marginTop: 4 }}>
-                    Automated tests, builds, and verification checks will be presented here.
+                    Automated tests, builds, and cryptographic verification checks will be presented here.
                   </p>
                 </div>
               ) : (
@@ -627,6 +925,9 @@ export default function App() {
                     <p style={{ color: 'var(--text-secondary)', marginTop: 6, fontSize: '0.9rem' }}>
                       Goal: {finalReport.goal}
                     </p>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 10, fontSize: '0.8rem', color: '#818cf8' }}>
+                      <ShieldCheck size={16} /> Cryptographically Signed Verification Record (RFC 8785 canonical serialization)
+                    </div>
                   </div>
 
                   {/* Executed Checks */}
@@ -738,32 +1039,80 @@ export default function App() {
 
       {/* Human-in-the-Loop Approval Modal */}
       {pendingApproval && (
-        <div className="modal-overlay">
+        <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="approval-title">
           <div className="modal-dialog">
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: '#fb7185' }}>
               <ShieldAlert size={28} />
-              <h3 style={{ fontSize: '1.2rem', color: '#fff' }}>Authorization Required</h3>
+              <h3 id="approval-title" style={{ fontSize: '1.2rem', color: '#fff' }}>Authorization Required</h3>
             </div>
 
             <p style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
-              The agent has requested to execute a sensitive action requiring explicit permission:
+              The agent has requested to execute a sensitive action requiring explicit human permission:
             </p>
 
             <div style={{ background: '#090d16', padding: 14, borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)' }}>
-              <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: 4 }}>
-                TOOL: <strong style={{ color: '#818cf8' }}>{pendingApproval.tool_name}</strong> | LEVEL:{' '}
+              <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: 6 }}>
+                TOOL: <strong style={{ color: '#818cf8' }}>{pendingApproval.tool_name}</strong> | PERMISSION LEVEL:{' '}
                 <strong style={{ color: '#fbbf24' }}>{pendingApproval.permission_level}</strong>
               </div>
-              <div style={{ fontSize: '0.85rem', marginBottom: 8 }}>{pendingApproval.reason}</div>
+              <div style={{ fontSize: '0.85rem', marginBottom: 10, color: '#f1f5f9' }}>{pendingApproval.reason}</div>
+              
+              <div className="section-label">Arguments & Payload</div>
               <pre className="code-output">{JSON.stringify(pendingApproval.arguments, null, 2)}</pre>
             </div>
 
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 12, marginTop: 10 }}>
-              <button className="btn-danger" onClick={() => resolveApproval(false)}>
-                Deny Action
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 10 }}>
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+                Hotkeys: <kbd>Alt+A</kbd> Approve | <kbd>Alt+D</kbd> Deny
+              </span>
+              <div style={{ display: 'flex', gap: 12 }}>
+                <button className="btn-danger" onClick={() => resolveApproval(false)}>
+                  Deny Action
+                </button>
+                <button className="btn-primary" onClick={() => resolveApproval(true)}>
+                  Approve Action
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Workspace Switcher Modal */}
+      {showWorkspaceModal && (
+        <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="workspace-modal-title">
+          <div className="modal-dialog">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 id="workspace-modal-title" style={{ fontSize: '1.2rem', display: 'flex', alignItems: 'center', gap: 8 }}>
+                <FolderOpen size={20} color="#818cf8" /> Workspace Configuration
+              </h3>
+              <button className="btn-ghost" onClick={() => setShowWorkspaceModal(false)} aria-label="Close">
+                ✕
               </button>
-              <button className="btn-primary" onClick={() => resolveApproval(true)}>
-                Approve Action
+            </div>
+
+            <div>
+              <div className="section-label">Active Workspace Root Path</div>
+              <input
+                type="text"
+                className="select-pill"
+                style={{ width: '100%', boxSizing: 'border-box' }}
+                placeholder="Enter absolute directory path (e.g. C:\projects\myapp or /home/user/repo)"
+                value={workspaceInput}
+                onChange={(e) => setWorkspaceInput(e.target.value)}
+                aria-label="Workspace Root Directory Path"
+              />
+              <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'block', marginTop: 6 }}>
+                All tool execution, file reading, code editing, and Git tracking remain strictly confined to this directory.
+              </span>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 12 }}>
+              <button className="btn-ghost" onClick={() => setShowWorkspaceModal(false)}>
+                Cancel
+              </button>
+              <button className="btn-primary" onClick={applyWorkspaceChange}>
+                Set Active Workspace
               </button>
             </div>
           </div>
@@ -772,11 +1121,11 @@ export default function App() {
 
       {/* Settings Modal */}
       {showSettings && (
-        <div className="modal-overlay">
-          <div className="modal-dialog" style={{ width: 600 }}>
+        <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="settings-modal-title">
+          <div className="modal-dialog">
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <h3 style={{ fontSize: '1.2rem' }}>Settings & Credentials</h3>
-              <button className="btn-ghost" onClick={() => setShowSettings(false)}>
+              <h3 id="settings-modal-title" style={{ fontSize: '1.2rem' }}>Settings & Credentials</h3>
+              <button className="btn-ghost" onClick={() => setShowSettings(false)} aria-label="Close">
                 ✕
               </button>
             </div>
@@ -787,7 +1136,7 @@ export default function App() {
               <input
                 type="password"
                 className="select-pill"
-                style={{ width: '100%', marginBottom: 6 }}
+                style={{ width: '100%', marginBottom: 6, boxSizing: 'border-box' }}
                 placeholder={
                   provider === 'gemini'
                     ? settings.gemini_api_key_set ? '••••••••  (Saved)' : 'Enter Gemini API key'
@@ -799,9 +1148,10 @@ export default function App() {
                 }
                 value={inputApiKey}
                 onChange={(e) => setInputApiKey(e.target.value)}
+                aria-label="Provider API Key"
               />
               <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                Credentials are saved to local SQLite database and redacted from logs and tool contexts.
+                Credentials are encrypted using OS-native DPAPI / protected vault and redacted from logs.
               </span>
             </div>
 
@@ -811,9 +1161,10 @@ export default function App() {
               <input
                 type="text"
                 className="select-pill"
-                style={{ width: '100%' }}
+                style={{ width: '100%', boxSizing: 'border-box' }}
                 value={settings.ollama_base_url}
                 onChange={(e) => setSettings({ ...settings, ollama_base_url: e.target.value })}
+                aria-label="Ollama Host URL"
               />
             </div>
 

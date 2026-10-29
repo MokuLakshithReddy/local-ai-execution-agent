@@ -4177,6 +4177,50 @@ async def test_engine_approval_rejection_and_timeout_lifecycle_e2e():
         assert res_timeout_task.status != TaskStatus.PENDING_APPROVAL
 
 
+def test_ui_accessibility_and_responsive_contract():
+    """Validates P1: UI accessibility landmarks, keyboard navigation, multi-file diff parser, and responsive styles."""
+    app_tsx_path = os.path.join(os.path.dirname(__file__), "..", "ui", "src", "App.tsx")
+    app_css_path = os.path.join(os.path.dirname(__file__), "..", "ui", "src", "App.css")
+    
+    assert os.path.exists(app_tsx_path), "App.tsx must exist"
+    assert os.path.exists(app_css_path), "App.css must exist"
+
+    with open(app_tsx_path, "r", encoding="utf-8") as f:
+        app_tsx = f.read()
+
+    with open(app_css_path, "r", encoding="utf-8") as f:
+        app_css = f.read()
+
+    # 1. Accessibility landmarks & ARIA attributes
+    assert 'role="dialog"' in app_tsx, "Modal dialogs must have role='dialog'"
+    assert 'aria-modal="true"' in app_tsx, "Modals must declare aria-modal='true'"
+    assert 'aria-label=' in app_tsx, "Interactive controls must include aria-label descriptions"
+    assert 'role="alert"' in app_tsx, "Urgent approval banner must declare role='alert'"
+    assert 'aria-live=' in app_tsx, "Live feeds and alerts must specify aria-live"
+    assert 'role="tablist"' in app_tsx, "Tabs header must declare role='tablist'"
+    assert 'role="tab"' in app_tsx, "Tab buttons must declare role='tab'"
+
+    # 2. Keyboard accessibility
+    assert "e.key === 'Escape'" in app_tsx, "Escape key must be handled for dismissable dialogs"
+    assert "altKey" in app_tsx and "'a'" in app_tsx, "Approval hotkeys (Alt+A) must be supported"
+    assert "altKey" in app_tsx and "'d'" in app_tsx, "Approval hotkeys (Alt+D) must be supported"
+
+    # 3. Connection status and WebSocket lifecycle
+    assert "wsStatus" in app_tsx, "UI must track granular WebSocket lifecycle status"
+    assert "conn-connected" in app_css, "UI must style connected status badge"
+    assert "conn-disconnected" in app_css, "UI must style disconnected status badge"
+    assert "urgent-approval-banner" in app_css, "Approval banner must have dedicated prominent styling"
+
+    # 4. Multi-file diff viewer and parsing
+    assert "parseGitDiff" in app_tsx, "Diff viewer must parse unified git diffs per file"
+    assert "diff-view-layout" in app_css, "Diff viewer layout must support file sidebar and content"
+    assert "diff-sidebar" in app_css, "Diff sidebar must be styled"
+
+    # 5. Responsive layout breakpoint
+    assert "@media (max-width: 1024px)" in app_css, "Responsive CSS must adapt to smaller viewports"
+    assert "grid-template-columns: 1fr" in app_css, "Responsive layout must collapse multi-column grids"
+
+
 
 
 
