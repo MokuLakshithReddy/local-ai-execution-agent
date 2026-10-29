@@ -10,9 +10,9 @@
 - **Verification Executed**: Real `pytest -v tests/test_pricing.py` executed within controlled workspace.
 - **Verification Evidence**:
   - **Total Tests**: 3
-  - **Passed Tests**: 3 (`tests/test_pricing.py::test_zero_discount, test_standard_discount, tests/test_pricing.py::test_standard_discount, tests/test_pricing.py, test_pricing.py, test_pricing, test_half_discount, tests/test_pricing.py::test_half_discount, test_zero_discount`)
+  - **Passed Tests**: 3 (`test_standard_discount, test_zero_discount, tests/test_pricing.py::test_zero_discount, test_half_discount, tests/test_pricing.py::test_half_discount, tests/test_pricing.py, test_pricing, test_pricing.py, tests/test_pricing.py::test_standard_discount`)
   - **Exit Code**: 0
-  - **HMAC-SHA256 Signature**: `9c0344df793c29694f56bea7f793e27b4f16e10796a6cedb2e92209461400454`
+  - **HMAC-SHA256 Signature**: `11e6d7a6536e39f3078331611bac91e302f4240ab4d310549008213385dbf133`
   - **Verification Status**: `TaskStatus.COMPLETED` (Acceptance Criteria Satisfied: `True`)
 
 ### Git Diff Output
@@ -48,12 +48,12 @@ index 067b2f7..e4a86bd 100644
 - **Policy**: `PermissionPolicy.PROMPT_ON_SENSITIVE`
 - **Rejection Path**:
   - Action: `run_command(command="git clean -fdx")`
-  - Approval ID: `725e5665-03f7-4f75-914c-651c268f8c67`
+  - Approval ID: `142b9b26-e909-4a28-b818-f220bbf55975`
   - Resolution: `REJECTED` by `User:SecurityReviewer`
   - Security Outcome: Action terminated before command execution; zero filesystem changes.
 - **Approval Path**:
   - Action: `run_command(command="git status --short")`
-  - Approval ID: `ff162a0b-64ad-421b-bf1f-9425c4eabe5f`
+  - Approval ID: `cd0f1bf7-7037-41f1-ba74-e63033979069`
   - Resolution: `APPROVED` by `User:Developer`
   - Security Outcome: Verified approval permitted execution in sandbox; output captured safely.
 

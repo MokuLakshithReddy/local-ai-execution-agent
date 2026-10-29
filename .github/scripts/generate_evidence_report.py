@@ -155,7 +155,12 @@ def main():
     # Detect sandbox mode
     is_docker = False
     try:
-        res = subprocess.run(["docker", "info"], capture_output=True, timeout=5)
+        res = subprocess.run(
+            ["docker", "run", "--rm", "python:3.12-slim", "echo", "ok"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
         is_docker = (res.returncode == 0)
     except Exception:
         pass

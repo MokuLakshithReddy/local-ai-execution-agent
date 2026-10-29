@@ -40,9 +40,16 @@ from agent.security.provenance import (
 
 
 def is_docker_running() -> bool:
-    """Checks whether Docker daemon is active and responsive."""
+    """Checks whether Docker daemon is active and able to execute python containers."""
+    if not shutil.which("docker"):
+        return False
     try:
-        res = subprocess.run(["docker", "info"], capture_output=True, timeout=5)
+        res = subprocess.run(
+            ["docker", "run", "--rm", "python:3.12-slim", "echo", "ok"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
         return res.returncode == 0
     except Exception:
         return False
@@ -137,8 +144,8 @@ class EndToEndDemonstrator:
         if not require_sandbox:
             os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
 
-        python_exe = sys.executable
-        verif_cmd = f'"{python_exe}" -m pytest -v tests/test_pricing.py'
+        cmd_runner = "pytest" if sandbox_mode == "container" else f'"{sys.executable}" -m pytest'
+        verif_cmd = f"{cmd_runner} -v tests/test_pricing.py"
         verif_res = await verif_tool.execute(
             repo_dir,
             command=verif_cmd,
@@ -223,8 +230,8 @@ class EndToEndDemonstrator:
         if not require_sandbox:
             os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
 
-        python_exe = sys.executable
-        verif_cmd = f'"{python_exe}" -m pytest -v tests/test_pricing.py'
+        cmd_runner = "pytest" if sandbox_mode == "container" else f'"{sys.executable}" -m pytest'
+        verif_cmd = f"{cmd_runner} -v tests/test_pricing.py"
         verif_res = await verif_tool.execute(
             repo_dir,
             command=verif_cmd,
