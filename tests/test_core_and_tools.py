@@ -4242,23 +4242,6 @@ def test_ui_accessibility_and_responsive_contract():
     assert "approvalError" in app_tsx, "Approval errors must be rendered in UI"
 
 
-def _worker_stale_lock_reclaim(key_dir: str, stale_sec: float, timeout_sec: float, out_queue):
-    """Subprocess worker that races to acquire/reclaim lock."""
-    import sys
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from agent.persistence.credentials import CredentialVault
-    try:
-        vault = CredentialVault.__new__(CredentialVault)
-        vault._key_dir = key_dir
-        lock_dir = vault._acquire_init_lock(timeout_sec=timeout_sec, poll_sec=0.02, stale_sec=stale_sec)
-        # Hold briefly to simulate key work
-        time.sleep(0.05)
-        vault._release_init_lock(lock_dir)
-        out_queue.put({"success": True, "pid": os.getpid()})
-    except Exception as e:
-        out_queue.put({"success": False, "pid": os.getpid(), "error": str(e)})
-
-
 def test_vault_init_lock_adversarial_multiprocess_recovery_and_ownership():
     """Validates Issue 4:
     Adversarial multiprocess validation of vault initialization lock:
@@ -4266,7 +4249,6 @@ def test_vault_init_lock_adversarial_multiprocess_recovery_and_ownership():
     2. Heartbeat refresh (_refresh_init_lock) extends lock validity.
     3. Multiple concurrent processes racing to reclaim an expired stale lock
        recover deterministically via atomic directory rename without deadlocks or crashes."""
-    import multiprocessing
     from agent.persistence.credentials import CredentialVault
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -4299,28 +4281,43 @@ def test_vault_init_lock_adversarial_multiprocess_recovery_and_ownership():
         os.utime(lock_dir, (past_time, past_time))
 
         # 4. Spawn 6 concurrent worker processes racing to reclaim the stale lock (stale_sec=1.0)
-        ctx = multiprocessing.get_context("spawn")
-        out_queue = ctx.Queue()
-        workers = []
-        for _ in range(6):
-            p = ctx.Process(
-                target=_worker_stale_lock_reclaim,
-                args=(key_dir, 1.0, 5.0, out_queue),
+        worker_script = (
+            "import os, sys, time\n"
+            "sys.path.insert(0, os.path.abspath('.'))\n"
+            "from agent.persistence.credentials import CredentialVault\n"
+            "key_dir = sys.argv[1]\n"
+            "stale_sec = float(sys.argv[2])\n"
+            "timeout_sec = float(sys.argv[3])\n"
+            "v = CredentialVault.__new__(CredentialVault)\n"
+            "v._key_dir = key_dir\n"
+            "try:\n"
+            "    lk = v._acquire_init_lock(timeout_sec=timeout_sec, poll_sec=0.02, stale_sec=stale_sec)\n"
+            "    time.sleep(0.05)\n"
+            "    v._release_init_lock(lk)\n"
+            "    sys.stdout.write('OK')\n"
+            "except Exception as e:\n"
+            "    sys.stderr.write(str(e))\n"
+            "    sys.exit(1)\n"
+        )
+
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", worker_script, key_dir, "1.0", "10.0"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
-            workers.append(p)
-            p.start()
+            for _ in range(6)
+        ]
 
-        results = []
-        for _ in range(6):
-            results.append(out_queue.get(timeout=10.0))
+        outputs = []
+        for p in procs:
+            stdout, stderr = p.communicate(timeout=15.0)
+            assert p.returncode == 0, f"Worker process failed (returncode {p.returncode}): {stderr}"
+            outputs.append(stdout.strip())
 
-        for p in workers:
-            p.join(timeout=5.0)
-
-        # All 6 racing processes must succeed in acquiring, executing, and releasing cleanly
-        assert len(results) == 6
-        for r in results:
-            assert r["success"] is True, f"Worker process failed: {r}"
+        assert len(outputs) == 6
+        assert all(out == "OK" for out in outputs)
 
 
 @pytest.mark.asyncio

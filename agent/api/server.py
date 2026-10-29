@@ -90,7 +90,6 @@ def _get_or_create_session_token() -> str:
             with open(TOKEN_FILE, "r", encoding="utf-8") as f:
                 t = f.read().strip()
                 if len(t) >= 32:
-                    _lock_down_token_file(TOKEN_FILE)
                     return t
         except Exception as e:
             if "Security Failure" in str(e):
