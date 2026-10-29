@@ -39,6 +39,26 @@ SAFE_ENV_ALLOWLIST = {
 }
 
 
+def get_isolated_environment(allow_network: bool = False) -> Dict[str, str]:
+    """Builds isolated process environment using strict allowlist (scrubs host API keys, tokens, and secrets)."""
+    env = {}
+    for key in SAFE_ENV_ALLOWLIST:
+        if key in os.environ:
+            env[key] = os.environ[key]
+
+    if not allow_network:
+        env["HTTP_PROXY"] = "http://127.0.0.1:0"
+        env["HTTPS_PROXY"] = "http://127.0.0.1:0"
+        env["ALL_PROXY"] = "http://127.0.0.1:0"
+        env["NO_PROXY"] = ""
+
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+_get_isolated_environment = get_isolated_environment
+
+
 class SandboxViolationError(PermissionError):
     """Raised when a command violates workspace filesystem containment or network restrictions."""
     pass
@@ -650,20 +670,7 @@ class RunCommandTool(BaseTool):
             )
 
         # Build isolated environment using strict allowlist (scrubs all API keys and host secrets)
-        isolated_env = {}
-        for key in SAFE_ENV_ALLOWLIST:
-            if key in os.environ:
-                isolated_env[key] = os.environ[key]
-
-        # Block network via proxy blackholes if network access is not permitted
-        if not allow_network:
-            isolated_env["HTTP_PROXY"] = "http://127.0.0.1:0"
-            isolated_env["HTTPS_PROXY"] = "http://127.0.0.1:0"
-            isolated_env["ALL_PROXY"] = "http://127.0.0.1:0"
-            isolated_env["NO_PROXY"] = ""
-
-        # Set clean python unbuffered output
-        isolated_env["PYTHONUNBUFFERED"] = "1"
+        isolated_env = get_isolated_environment(allow_network=allow_network)
 
         # Default execution mode is strictly isolated container
         sandbox_mode = kwargs.get("sandbox_mode", "container")  # "container" or "host"

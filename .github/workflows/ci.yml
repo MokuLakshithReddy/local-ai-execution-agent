@@ -46,7 +46,7 @@ jobs:
 
     - name: Run Unit & Adversarial Test Suite
       run: |
-        pytest tests/ -v --durations=10 -k "not test_real_docker"
+        pytest tests/ -v --durations=10 -k "not test_real_docker" --junitxml=junit-results.xml
 
     - name: Run Live Docker Container Security Boundaries Integration Test
       if: matrix.os == 'ubuntu-latest'
@@ -54,6 +54,21 @@ jobs:
         REQUIRE_DOCKER: "1"
       run: |
         pytest tests/ -v -k "test_real_docker or test_run_verification_tool_structured_record_e2e"
+
+    - name: Generate Authoritative Evidence Report
+      if: always()
+      run: |
+        python .github/scripts/generate_evidence_report.py junit-results.xml EVIDENCE.md
+
+    - name: Upload Verification & Demo Artifacts
+      if: matrix.os == 'ubuntu-latest' && always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: execution-evidence-reports
+        path: |
+          EVIDENCE.md
+          DEMO_RUN.md
+          junit-results.xml
 
     - name: Report Commit Status
       if: always()

@@ -10,3 +10,4 @@ agent_state.db
 .agent_session_token
 .agent_vault.key
 *.key
+junit*.xml
