@@ -183,12 +183,16 @@ class ExecutionEngine:
                     "max_steps": task.max_steps,
                 })
 
-                # Call Model
+                # Call Model with strict wall-clock timeout
                 try:
-                    response = await adapter.chat_completion(
-                        messages=messages,
-                        tools=tool_schemas,
-                        temperature=0.2,
+                    t_rem = max(0.1, overall_deadline - (time.monotonic() - task_start_time))
+                    response = await asyncio.wait_for(
+                        adapter.chat_completion(
+                            messages=messages,
+                            tools=tool_schemas,
+                            temperature=0.2,
+                        ),
+                        timeout=t_rem,
                     )
                 except Exception as e:
                     task.status = TaskStatus.FAILED
@@ -282,6 +286,15 @@ class ExecutionEngine:
                                 await asyncio.sleep(1.0)
 
                             if not approved:
+                                # Expire pending approval in manager and broadcast resolution
+                                expired_req = self.permission_manager.expire_approval(approval_req.approval_id)
+                                if expired_req:
+                                    await self.emit("approval_resolved", {
+                                        "approval_id": approval_req.approval_id,
+                                        "task_id": task.id,
+                                        "status": "EXPIRED",
+                                    })
+
                                 # Revert status from PENDING_APPROVAL back to EXECUTING as engine processes rejection
                                 task.status = TaskStatus.EXECUTING
                                 await self.db.save_task(task)
@@ -335,6 +348,14 @@ class ExecutionEngine:
                         "arguments": tool_args,
                     })
 
+                    # Strictly sanitize model-supplied arguments: strip any unauthorized host/container overrides
+                    for bad_arg in (
+                        "extra_mounts", "allowed_paths", "container_user", "container_image",
+                        "image", "memory_limit", "pids_limit", "sandbox_mode", "require_sandbox",
+                        "untrusted_workload", "trusted_development_only"
+                    ):
+                        tool_args.pop(bad_arg, None)
+
                     # Enforce container sandboxing for all automated task executions.
                     # Automated code and model tool calls can NEVER execute on the host even if host flags are set.
                     if tool_name in ("run_command", "run_verification"):
@@ -342,14 +363,26 @@ class ExecutionEngine:
                         tool_args["sandbox_mode"] = "container"
                         tool_args["require_sandbox"] = True
                         tool_args["untrusted_workload"] = True
-                        tool_args.pop("trusted_development_only", None)
 
-                    result = await self.tool_registry.execute_tool(
-                        name=tool_name,
-                        workspace_path=task.workspace_path,
-                        call_id=tool_call.id,
-                        **tool_args,
-                    )
+                    # Strict wall-clock deadline bounding for tool execution
+                    t_rem = max(0.1, overall_deadline - (time.monotonic() - task_start_time))
+                    try:
+                        result = await asyncio.wait_for(
+                            self.tool_registry.execute_tool(
+                                name=tool_name,
+                                workspace_path=task.workspace_path,
+                                call_id=tool_call.id,
+                                **tool_args,
+                            ),
+                            timeout=min(t_rem, 300.0),
+                        )
+                    except asyncio.TimeoutError:
+                        from agent.tools.terminal import terminate_task_processes
+                        terminate_task_processes(task.id)
+                        task.status = TaskStatus.FAILED
+                        task.error = f"Task exceeded overall execution deadline of {overall_deadline:.0f} seconds during tool execution."
+                        await self.emit("task_error", {"task_id": task.id, "error": task.error})
+                        break
 
                     # Record actions and modified files
                     action_desc = f"Executed {tool_name} with arguments {json.dumps(tool_args)[:120]}"

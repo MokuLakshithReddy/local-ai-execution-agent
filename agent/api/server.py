@@ -89,6 +89,10 @@ def _lock_down_token_file(filepath: str):
 
 def _get_or_create_session_token() -> str:
     if os.path.exists(TOKEN_FILE):
+        if os.path.islink(TOKEN_FILE):
+            raise RuntimeError("Security Failure: Session token file is an unauthorized symlink.")
+        # Strictly re-validate and audit file permissions / ACLs on existing token
+        _lock_down_token_file(TOKEN_FILE)
         try:
             with open(TOKEN_FILE, "r", encoding="utf-8") as f:
                 t = f.read().strip()
@@ -324,6 +328,23 @@ class SaveSettingsRequest(BaseModel):
     current_workspace: Optional[str] = None
 
 
+async def validate_approved_workspace(workspace_path: str) -> str:
+    """Validates that a workspace path exists, is a directory, and has been explicitly approved."""
+    if not workspace_path:
+        raise HTTPException(status_code=400, detail="Workspace path is required.")
+    real_ws = os.path.realpath(workspace_path)
+    if not os.path.exists(real_ws) or not os.path.isdir(real_ws):
+        raise HTTPException(status_code=400, detail=f"Workspace directory does not exist: {workspace_path}")
+
+    approved_workspaces = await db.get_setting("approved_workspaces", [])
+    if real_ws not in approved_workspaces and not permission_manager.is_workspace_approved(real_ws):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Forbidden: Workspace '{real_ws}' has not been approved in the workspace registry. Approve it via /api/workspaces/approve first.",
+        )
+    return real_ws
+
+
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok", "app": "Local-First AI Execution Agent", "version": "1.1.0"}
@@ -433,14 +454,7 @@ async def save_settings(req: SaveSettingsRequest):
             detail=f"Security Error: Failed to encrypt credentials safely ({str(e)}). Plaintext persistence rejected.",
         )
     if req.current_workspace:
-        real_ws = os.path.realpath(req.current_workspace)
-        if not os.path.exists(real_ws) or not os.path.isdir(real_ws):
-            raise HTTPException(status_code=400, detail="Specified workspace directory does not exist.")
-        permission_manager.approve_workspace(real_ws)
-        approved = await db.get_setting("approved_workspaces", [])
-        if real_ws not in approved:
-            approved.append(real_ws)
-            await db.save_setting("approved_workspaces", approved)
+        real_ws = await validate_approved_workspace(req.current_workspace)
         await db.save_setting("current_workspace", real_ws)
 
     return {"status": "saved"}
@@ -453,19 +467,14 @@ async def create_task(req: CreateTaskRequest):
             status_code=400,
             detail=f"Invalid max_steps ({req.max_steps}). Must be an integer bounded between 1 and 100.",
         )
-    target_ws = req.workspace_path or await db.get_setting("current_workspace", os.getcwd())
-    real_ws = os.path.realpath(target_ws)
-
-    if not os.path.exists(real_ws) or not os.path.isdir(real_ws):
-        raise HTTPException(status_code=400, detail=f"Workspace path does not exist: {target_ws}")
-
-    # Validate against Approved Workspace Registry
-    approved_workspaces = await db.get_setting("approved_workspaces", [])
-    if real_ws not in approved_workspaces:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Forbidden: Workspace '{real_ws}' has not been approved in the workspace registry.",
-        )
+    target_ws = req.workspace_path
+    if not target_ws:
+        curr_ws = await db.get_setting("current_workspace")
+        if curr_ws and os.path.exists(curr_ws) and os.path.isdir(curr_ws):
+            target_ws = curr_ws
+        else:
+            target_ws = os.path.realpath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+    real_ws = await validate_approved_workspace(target_ws)
 
     # Resolve API key securely
     settings = await db.get_setting("app_settings", {})
@@ -502,12 +511,22 @@ async def create_task(req: CreateTaskRequest):
         max_steps=req.max_steps,
     )
 
+    provider_lower = req.model_provider.lower()
+    if provider_lower in ("ollama", "local"):
+        resolved_base_url = req.custom_base_url or settings.get("ollama_base_url") or "http://localhost:11434/v1"
+    else:
+        resolved_base_url = req.custom_base_url
+        if resolved_base_url:
+            parsed_u = urllib.parse.urlparse(resolved_base_url)
+            if parsed_u.scheme not in ("http", "https") or not parsed_u.netloc:
+                raise HTTPException(status_code=400, detail="Invalid custom_base_url: must be a valid HTTP or HTTPS URL.")
+
     # Launch in background and register with execution engine for prompt cancellation
     bg_task = asyncio.create_task(
         engine.run_task(
             task=task,
             api_key=api_key or "",
-            custom_base_url=req.custom_base_url or settings.get("ollama_base_url"),
+            custom_base_url=resolved_base_url,
         )
     )
     engine.register_running_task(task_id, bg_task)
@@ -578,7 +597,7 @@ async def resolve_approval(approval_id: str, req: ResolveApprovalRequest):
 @app.get("/api/diff", dependencies=[Depends(verify_auth)])
 async def get_workspace_diff(workspace_path: Optional[str] = None):
     ws = workspace_path or await db.get_setting("current_workspace", os.getcwd())
-    real_ws = os.path.realpath(ws)
+    real_ws = await validate_approved_workspace(ws)
     res = await tool_registry.execute_tool("git_diff", workspace_path=real_ws)
     return {"diff": res.output if res.success else "", "error": res.error}
 

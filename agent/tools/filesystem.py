@@ -218,12 +218,17 @@ class ReadFileTool(BaseTool):
                         line = raw_chunk[:MAX_LINE_CHARS] + " ... [LINE TRUNCATED AT 10,000 CHARACTERS]\n"
                         # Drain until newline to keep line numbers accurate without storing
                         while True:
+                            if scanned_bytes > MAX_SCAN_BYTES:
+                                truncated = True
+                                break
                             drain = f.readline(65536)
                             if not drain:
                                 break
                             scanned_bytes += len(drain.encode("utf-8", errors="replace"))
                             if drain.endswith("\n"):
                                 break
+                        if truncated:
+                            break
                     else:
                         line = raw_chunk
 
@@ -439,10 +444,31 @@ class SearchFilesTool(BaseTool):
         }
 
     async def execute(self, workspace_path: str, **kwargs) -> ActionResult:
+        import asyncio
         t0 = time.time()
         call_id = kwargs.get("call_id", "search_files")
-        query = kwargs.get("query", "")
+        query = (kwargs.get("query") or "").strip()
         ext = kwargs.get("file_extension", "")
+
+        if not query:
+            return ActionResult(
+                call_id=call_id,
+                tool_name=self.name,
+                success=False,
+                output="",
+                error="Search query must not be empty.",
+                execution_time_ms=(time.time() - t0) * 1000,
+            )
+
+        if len(query) > 200:
+            return ActionResult(
+                call_id=call_id,
+                tool_name=self.name,
+                success=False,
+                output="",
+                error=f"Search query exceeds maximum length ({len(query)} > 200 characters).",
+                execution_time_ms=(time.time() - t0) * 1000,
+            )
 
         try:
             workspace_real = os.path.realpath(workspace_path)
@@ -456,59 +482,84 @@ class SearchFilesTool(BaseTool):
                     execution_time_ms=(time.time() - t0) * 1000,
                 )
 
-            pattern = re.compile(query, re.IGNORECASE)
-            matches = []
-            max_matches = 50
+            def _sync_search() -> tuple[list[str], bool]:
+                try:
+                    pattern = re.compile(query, re.IGNORECASE)
+                except re.error:
+                    pattern = re.compile(re.escape(query), re.IGNORECASE)
 
-            for root, dirs, files in os.walk(workspace_real, followlinks=False):
-                # Filter directories: remove ignored dirs and any symlinks/out-of-workspace dirs
-                safe_dirs = []
-                for d in dirs:
-                    if d in IGNORED_DIRS:
-                        continue
-                    d_path = os.path.join(root, d)
-                    try:
-                        # Reject symlink directories or directory escaping outside workspace
-                        if os.path.islink(d_path):
+                matches = []
+                max_matches = 50
+                max_file_bytes = 500 * 1024  # 500 KB per file scan limit
+                max_total_bytes = 5 * 1024 * 1024  # 5 MB total workspace scan budget
+                scanned_total_bytes = 0
+                truncated = False
+
+                for root, dirs, files in os.walk(workspace_real, followlinks=False):
+                    safe_dirs = []
+                    for d in dirs:
+                        if d in IGNORED_DIRS:
                             continue
-                        resolve_safe_path(workspace_real, d_path)
-                        safe_dirs.append(d)
-                    except Exception:
-                        continue
-                dirs[:] = safe_dirs
-
-                for file in files:
-                    if ext and not file.endswith(ext):
-                        continue
-                    full_p = os.path.join(root, file)
-                    try:
-                        # Validate that file resolves strictly within workspace and reject out-of-workspace symlinks
-                        safe_file = resolve_safe_path(workspace_real, full_p)
-                        if not os.path.isfile(safe_file):
+                        d_path = os.path.join(root, d)
+                        try:
+                            if os.path.islink(d_path):
+                                continue
+                            resolve_safe_path(workspace_real, d_path)
+                            safe_dirs.append(d)
+                        except Exception:
                             continue
-                    except Exception:
-                        continue
+                    dirs[:] = safe_dirs
 
-                    rel_p = os.path.relpath(safe_file, workspace_real)
-                    try:
-                        with open(safe_file, "r", encoding="utf-8", errors="ignore") as f:
-                            for idx, line in enumerate(f, start=1):
-                                if pattern.search(line):
-                                    matches.append(f"{rel_p}:{idx}: {line.strip()[:160]}")
-                                    if len(matches) >= max_matches:
+                    for file in files:
+                        if ext and not file.endswith(ext):
+                            continue
+                        full_p = os.path.join(root, file)
+                        try:
+                            safe_file = resolve_safe_path(workspace_real, full_p)
+                            if not os.path.isfile(safe_file):
+                                continue
+                            f_size = os.path.getsize(safe_file)
+                            if f_size > max_file_bytes:
+                                continue
+                        except Exception:
+                            continue
+
+                        rel_p = os.path.relpath(safe_file, workspace_real)
+                        try:
+                            with open(safe_file, "r", encoding="utf-8", errors="ignore") as f:
+                                for idx, line in enumerate(f, start=1):
+                                    line_bytes = len(line.encode("utf-8", errors="ignore"))
+                                    scanned_total_bytes += line_bytes
+                                    if scanned_total_bytes > max_total_bytes:
+                                        truncated = True
                                         break
-                    except Exception:
-                        continue
-                if len(matches) >= max_matches:
-                    break
+                                    line_sample = line[:1000]
+                                    if pattern.search(line_sample):
+                                        matches.append(f"{rel_p}:{idx}: {line.strip()[:160]}")
+                                        if len(matches) >= max_matches:
+                                            break
+                        except Exception:
+                            continue
+
+                        if len(matches) >= max_matches or truncated:
+                            break
+                    if len(matches) >= max_matches or truncated:
+                        break
+
+                return matches, truncated
+
+            matches, is_truncated = await asyncio.to_thread(_sync_search)
 
             output = "\n".join(matches) if matches else "No matching files found."
+            if is_truncated:
+                output += "\n[SEARCH TRUNCATED: Exceeded 5 MB search budget. Narrow search with file_extension or subpath]."
+
             return ActionResult(
                 call_id=call_id,
                 tool_name=self.name,
                 success=True,
                 output=output,
-                artifacts={"match_count": len(matches)},
+                artifacts={"match_count": len(matches), "truncated": is_truncated},
                 execution_time_ms=(time.time() - t0) * 1000,
             )
         except Exception as e:

@@ -524,7 +524,29 @@ class RunCommandTool(BaseTool):
         timeout = min(kwargs.get("timeout_seconds", 60), 300)
         allow_network = kwargs.get("allow_network", False)
         allowed_paths = kwargs.get("allowed_paths")
-        extra_mounts = kwargs.get("extra_mounts")
+        raw_mounts = kwargs.get("extra_mounts")
+        extra_mounts = []
+
+        # Validate that any extra_mounts are strictly contained within workspace or authorized verification evidence tempdirs
+        if raw_mounts:
+            real_ws = os.path.realpath(workspace_path)
+            for em in raw_mounts:
+                parts = em.split(":")
+                host_p = parts[0]
+                real_hp = os.path.realpath(host_p)
+                is_ws = (real_hp == real_ws) or real_hp.startswith(real_ws + os.sep)
+                is_ev = (".agent_verification_evidence_" in real_hp)
+                if not (is_ws or is_ev):
+                    return ActionResult(
+                        call_id=call_id,
+                        tool_name=self.name,
+                        success=False,
+                        output="",
+                        error=f"Sandbox Violation: Host mount escape detected: '{host_p}' is outside authorized workspace and evidence directories.",
+                        artifacts={"tampering_detected": True},
+                        execution_time_ms=(time.time() - t0) * 1000,
+                    )
+                extra_mounts.append(em)
 
         # Enforce canonical workspace path
         real_workspace = os.path.realpath(workspace_path)

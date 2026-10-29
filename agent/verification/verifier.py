@@ -76,10 +76,14 @@ def _is_legitimate_and_relevant_check(
     if any(fake in cmd for fake in ("python -c", "python3 -c", "node -e", "print(", "printf ", "echo ")):
         return False
 
-    # 2. Must invoke a recognized test/build/lint runner or custom script
-    is_valid_runner = any(runner in cmd for runner in VALID_CHECK_RUNNERS) or (
-        check.check_type in ("test", "build", "lint", "typecheck") and len(cmd) > 3
+    # 2. Must invoke a recognized test/build/lint runner, cryptographically signed execution records,
+    # or execution of a test/verification script file (e.g. `python script.py`, `node script.js`)
+    is_script_run = (
+        check.check_type in ("test", "build", "lint", "typecheck")
+        and any(cmd.startswith(prefix) for prefix in ("python ", "python3 ", "node ", "bash ", "sh ", "./"))
+        and any(arg.endswith((".py", ".js", ".ts", ".sh", ".bash")) for arg in cmd.split())
     )
+    is_valid_runner = any(runner in cmd for runner in VALID_CHECK_RUNNERS) or bool(check.trusted_execution_record) or is_script_run
     if not is_valid_runner:
         return False
 
@@ -239,7 +243,7 @@ class VerificationEngine:
         Guarantees that CANCELLED, BLOCKED, or FAILED tasks never report false success.
         """
         if require_structured_evidence is None:
-            require_structured_evidence = (task_type == TaskType.CODE_MODIFICATION)
+            require_structured_evidence = (task_type in (TaskType.CODE_MODIFICATION, TaskType.TEST_AND_VERIFY))
 
         # Determine the latest outcome for each verification command/check
         latest_checks = {}
@@ -526,8 +530,21 @@ class VerificationEngine:
 
         # 2. Criteria Evaluation based on TaskType
         elif task_type == TaskType.INFORMATIONAL:
-            # Informational tasks (inspect architecture, search, explain) do not require code changes
-            if unresolved_failed_checks or any_undemonstrated:
+            # Informational tasks (inspect architecture, search, explain) require concrete inspection actions
+            genuine_inspection_actions = [
+                a for a in actions_taken
+                if not a.startswith("Model provided final summary")
+                and any(p in a for p in (
+                    "read_file", "list_dir", "search_files", "git_status", "git_diff", "run_command"
+                ))
+            ]
+            if not genuine_inspection_actions:
+                final_status = TaskStatus.PARTIALLY_COMPLETED
+                criteria_satisfied = False
+                risks.append(
+                    "No Inspection Actions Performed: Task requested inspection or analysis, but no workspace inspection actions were executed."
+                )
+            elif unresolved_failed_checks or any_undemonstrated:
                 final_status = TaskStatus.PARTIALLY_COMPLETED
                 criteria_satisfied = False
             else:
@@ -583,6 +600,16 @@ class VerificationEngine:
                 final_status = TaskStatus.PARTIALLY_COMPLETED
                 criteria_satisfied = False
                 risks.append("No valid verification check was executed for a verification-specific goal.")
+            elif require_structured_evidence and any(
+                ((c.check_type == "test") or any(runner in (c.command or "").lower() for runner in ("pytest", "unittest", "vitest", "jest")))
+                and not bool(c.trusted_execution_record and verify_trusted_execution_record(c.trusted_execution_record, expected_run_id=task_id))
+                for c in relevant_passed_checks
+            ):
+                final_status = TaskStatus.PARTIALLY_COMPLETED
+                criteria_satisfied = False
+                risks.append(
+                    "Unstructured Test Evidence Rejected: Verification tests lacked cryptographically signed structured runner evidence (trusted_execution_record)."
+                )
             elif unresolved_failed_checks or any_undemonstrated or skipped_or_failed:
                 final_status = TaskStatus.PARTIALLY_COMPLETED
                 criteria_satisfied = False

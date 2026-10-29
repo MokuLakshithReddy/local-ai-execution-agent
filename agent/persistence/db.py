@@ -117,6 +117,7 @@ class Database:
 
     async def save_task(self, task: Task):
         async with aiosqlite.connect(self.db_path) as db:
+            clean_goal = sanitizer.redact_secrets(task.goal or "")
             plan_clean = [sanitizer.redact_secrets(p) for p in task.plan]
             plan_str = json.dumps(plan_clean)
             report_str = sanitizer.redact_secrets(task.final_report.model_dump_json()) if task.final_report else None
@@ -129,6 +130,7 @@ class Database:
                     current_step, max_steps, plan_json, report_json, error, task_type, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
+                    goal=excluded.goal,
                     status=excluded.status,
                     current_step=excluded.current_step,
                     plan_json=excluded.plan_json,
@@ -137,7 +139,7 @@ class Database:
                     task_type=excluded.task_type,
                     updated_at=excluded.updated_at
             """, (
-                task.id, task.goal, task.workspace_path, task.model_provider, task.model_name,
+                task.id, clean_goal, task.workspace_path, task.model_provider, task.model_name,
                 task.status.value, task.current_step, task.max_steps, plan_str, report_str,
                 error_clean, task_type_str, task.created_at, time.time()
             ))

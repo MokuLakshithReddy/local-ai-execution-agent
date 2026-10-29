@@ -5061,3 +5061,351 @@ async def test_cancellation_api_contract_and_rejection():
     res = client.post("/api/tasks/definitely_unknown_task_id_8971/cancel", headers=headers)
     assert res.status_code == 404
     assert "not found" in res.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_terminal_and_engine_reject_model_controlled_host_mounts():
+    """Validates P1:
+    1. RunCommandTool rejects unauthorized extra_mounts outside the workspace/evidence directories.
+    2. ExecutionEngine strips extra_mounts, container_user, and container_image from model tool calls."""
+    from agent.tools.terminal import RunCommandTool
+    from agent.core.engine import ExecutionEngine
+    from agent.core.models import Task, TaskStatus, TaskType, ActionResult
+    from agent.persistence.db import Database
+    from agent.tools.registry import ToolRegistry
+    from agent.security.permissions import PermissionManager, PermissionPolicy
+    from agent.providers.base import ProviderResponse, LLMToolCall
+    from unittest.mock import patch, MagicMock, AsyncMock
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tool = RunCommandTool()
+
+        # Host mount pointing outside workspace and outside evidence dir is rejected immediately
+        res_escape = await tool.execute(
+            workspace_path=temp_dir,
+            command="echo test",
+            sandbox_mode="container",
+            extra_mounts=["C:\\Windows:/windows:ro" if sys.platform == "win32" else "/etc:/etc:ro"],
+        )
+        assert res_escape.success is False
+        assert "Host mount escape detected" in res_escape.error
+
+        # Engine strips model-injected mounts
+        db = Database(db_path=os.path.join(temp_dir, "test.db"))
+        await db.init()
+        pm = PermissionManager(policy=PermissionPolicy(auto_approve_routine=True, auto_approve_sensitive=True))
+        registry = ToolRegistry()
+
+        task = Task(
+            id="task_mount_injection",
+            goal="Try mounting host root",
+            workspace_path=temp_dir,
+            model_provider="anthropic",
+            model_name="claude-3-7-sonnet",
+        )
+
+        malicious_call = LLMToolCall(
+            id="call_mount_1",
+            name="run_command",
+            arguments={
+                "command": "ls /host_root",
+                "extra_mounts": ["C:\\:/host_root:rw" if sys.platform == "win32" else "/:/host_root:rw"],
+                "container_user": "root",
+            },
+        )
+        mock_adapter = MagicMock()
+        mock_adapter.chat_completion = AsyncMock(side_effect=[
+            ProviderResponse(content="Running tool", tool_calls=[malicious_call]),
+            ProviderResponse(content="Done", tool_calls=[]),
+        ])
+
+        with patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter):
+            engine = ExecutionEngine(db=db, tool_registry=registry, permission_manager=pm)
+            with patch.object(registry, "execute_tool", AsyncMock(return_value=ActionResult(call_id="call_mount_1", tool_name="run_command", success=True, output=""))) as mock_exec:
+                await engine.run_task(task, api_key="sk-test")
+                # Confirm extra_mounts and container_user were stripped
+                called_kwargs = mock_exec.call_args[1]
+                assert "extra_mounts" not in called_kwargs
+                assert "container_user" not in called_kwargs
+
+
+@pytest.mark.asyncio
+async def test_verification_evidence_identity_mismatch_and_fail_closed():
+    """Validates P1:
+    1. Mismatch between test identities in JUnit XML and runner console stdout is detected as tampering.
+    2. When verification produces no trusted record, ActionResult.success is False (fails closed)."""
+    from agent.tools.verification import RunVerificationCheckTool
+    from agent.core.models import ActionResult
+    from unittest.mock import patch
+
+    tool = RunVerificationCheckTool()
+
+    # XML claims test_malicious_exploit passed, but runner console only ran test_benign
+    mock_xml = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" tests="1" errors="0" failures="0" skipped="0">
+    <testcase classname="test_malicious" name="test_exploit" file="tests/test_malicious.py" />
+  </testsuite>
+</testsuites>"""
+
+    fake_console = """
+tests/test_benign.py::test_benign PASSED [100%]
+============================== 1 passed in 0.05s ==============================
+"""
+
+    async def fake_cmd(**kwargs):
+        cmd = kwargs.get("command", "")
+        for part in cmd.split():
+            if "--junitxml=" in part:
+                p = part.split("=")[1].strip('"')
+                with open(p, "w", encoding="utf-8") as xf:
+                    xf.write(mock_xml)
+        return ActionResult(
+            call_id="c1",
+            tool_name="run_command",
+            success=True,
+            output=fake_console,
+            artifacts={"exit_code": 0},
+        )
+
+    with patch.object(tool._command_tool, "execute", side_effect=fake_cmd):
+        res = await tool.execute(
+            workspace_path=os.getcwd(),
+            call_id="c_identity_tamper",
+            check_name="Identity Tamper Test",
+            command="pytest tests/",
+            sandbox_mode="host",
+        )
+        assert res.success is False
+        assert res.artifacts.get("tampering_detected") is True
+        assert res.artifacts.get("trusted_execution_record") is None
+        assert "Tampering detected" in (res.artifacts.get("discrepancy") or "")
+
+
+@pytest.mark.asyncio
+async def test_cloud_providers_not_routed_to_ollama_base_url():
+    """Validates P1:
+    Cloud providers (openai, gemini, anthropic) NEVER inherit settings.ollama_base_url,
+    preventing cloud credentials from being sent to local Ollama endpoints."""
+    from fastapi.testclient import TestClient
+    from agent.api.server import app, SESSION_TOKEN
+    from unittest.mock import patch, MagicMock
+
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {SESSION_TOKEN}"}
+
+    # Save ollama_base_url in settings
+    client.post(
+        "/api/settings",
+        json={"ollama_base_url": "http://localhost:11434/v1"},
+        headers=headers,
+    )
+
+    with tempfile.TemporaryDirectory() as test_ws:
+        client.post(
+            "/api/workspaces/approve",
+            json={"workspace_path": test_ws},
+            headers=headers,
+        )
+
+        # Launch OpenAI task
+        with patch("agent.api.server.engine.run_task") as mock_run:
+            res = client.post(
+                "/api/tasks",
+                json={
+                    "goal": "Test OpenAI isolation",
+                    "workspace_path": test_ws,
+                    "model_provider": "openai",
+                    "model_name": "gpt-4o",
+                    "api_key": "sk-real-secret-key-12345",
+                },
+                headers=headers,
+            )
+            assert res.status_code == 200
+            # Verify custom_base_url passed to engine was None, NOT the ollama_base_url
+            assert mock_run.call_args[1].get("custom_base_url") is None
+
+        # Launch Ollama task: verify it DOES receive the ollama_base_url
+        with patch("agent.api.server.engine.run_task") as mock_run_ollama:
+            res_o = client.post(
+                "/api/tasks",
+                json={
+                    "goal": "Test Ollama usage",
+                    "workspace_path": test_ws,
+                    "model_provider": "ollama",
+                    "model_name": "llama3.2",
+                },
+                headers=headers,
+            )
+            assert res_o.status_code == 200
+            assert mock_run_ollama.call_args[1].get("custom_base_url") == "http://localhost:11434/v1"
+
+
+@pytest.mark.asyncio
+async def test_session_token_permission_and_symlink_revalidation():
+    """Validates P2:
+    _get_or_create_session_token revalidates existing token file permissions and rejects symlinks."""
+    from agent.api.server import _get_or_create_session_token, TOKEN_FILE
+    from unittest.mock import patch
+
+    with patch("os.path.exists", return_value=True),          patch("os.path.islink", return_value=True):
+        with pytest.raises(RuntimeError, match="unauthorized symlink"):
+            _get_or_create_session_token()
+
+
+@pytest.mark.asyncio
+async def test_task_goal_secret_redaction_persisted():
+    """Validates P2:
+    Secrets in task.goal are redacted before being stored in the database."""
+    from agent.security.sanitizer import register_global_secret
+    from agent.persistence.db import Database
+    from agent.core.models import Task, TaskStatus
+
+    secret_str = "ConfidentialPromptSecret_88219"
+    register_global_secret(secret_str)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db = Database(db_path=os.path.join(temp_dir, "test.db"))
+        await db.init()
+
+        task = Task(
+            id="task_secret_goal",
+            goal=f"Analyze data for key: {secret_str}",
+            workspace_path=temp_dir,
+            model_provider="gemini",
+            model_name="gemini-2.5-flash",
+        )
+        await db.save_task(task)
+
+        retrieved = await db.get_task(task.id)
+        assert retrieved is not None
+        assert secret_str not in retrieved.goal
+        assert "[REDACTED_SECRET]" in retrieved.goal
+
+
+@pytest.mark.asyncio
+async def test_file_search_bounded_query_length_and_limits():
+    """Validates P2:
+    SearchFilesTool rejects queries > 200 chars and enforces byte budgets without blocking event loop."""
+    from agent.tools.filesystem import SearchFilesTool
+
+    tool = SearchFilesTool()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Long query rejected
+        res_long = await tool.execute(workspace_path=temp_dir, query="A" * 205)
+        assert res_long.success is False
+        assert "exceeds maximum length" in res_long.error
+
+
+@pytest.mark.asyncio
+async def test_approval_timeout_expires_pending_approvals():
+    """Validates P2:
+    Approval timeout calls expire_approval and clears pending_approvals map."""
+    from agent.core.engine import ExecutionEngine
+    from agent.core.models import Task, TaskType, TaskStatus, ActionResult, PermissionLevel
+    from agent.persistence.db import Database
+    from agent.tools.registry import ToolRegistry
+    from agent.tools.base import BaseTool
+    from agent.security.permissions import PermissionManager, PermissionPolicy
+    from agent.providers.base import ProviderResponse, LLMToolCall
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    class DummySensitiveTool(BaseTool):
+        name = "sens_tool"
+        description = "Sensitive"
+        permission_level = PermissionLevel.SENSITIVE_OPERATION
+        def get_parameters_schema(self):
+            return {"type": "object", "properties": {}}
+        async def execute(self, workspace_path, **kwargs):
+            return ActionResult(call_id="c1", tool_name=self.name, success=True)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db = Database(db_path=os.path.join(temp_dir, "test.db"))
+        await db.init()
+        pm = PermissionManager(policy=PermissionPolicy(auto_approve_routine=True, auto_approve_sensitive=False))
+        reg = ToolRegistry()
+        reg.register(DummySensitiveTool())
+
+        task = Task(
+            id="task_timeout_clear",
+            goal="Run sensitive tool",
+            workspace_path=temp_dir,
+            model_provider="anthropic",
+            model_name="claude-3-7-sonnet",
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.chat_completion = AsyncMock(side_effect=[
+            ProviderResponse(content="Run", tool_calls=[LLMToolCall(id="c1", name="sens_tool", arguments={})]),
+            ProviderResponse(content="Done", tool_calls=[]),
+        ])
+
+        with patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter):
+            engine = ExecutionEngine(db=db, tool_registry=reg, permission_manager=pm)
+            t_val = [100.0]
+            def fake_time():
+                cur = t_val[0]
+                t_val[0] += 100.0
+                return cur
+            with patch("time.time", side_effect=fake_time), patch("asyncio.sleep", AsyncMock()):
+                await engine.run_task(task, api_key="sk-test")
+
+            # Verify pending_approvals is empty (pruned by expire_approval)
+            assert len(pm.pending_approvals) == 0
+            assert any(req.status == "EXPIRED" for req in pm.approval_history.values())
+
+
+@pytest.mark.asyncio
+async def test_workspace_authorization_enforced_across_api_routes():
+    """Validates P2:
+    /api/diff and /api/settings enforce workspace approval and reject unapproved directories."""
+    from fastapi.testclient import TestClient
+    from agent.api.server import app, SESSION_TOKEN
+
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {SESSION_TOKEN}"}
+
+    with tempfile.TemporaryDirectory() as unapproved_ws:
+        # /api/diff rejects unapproved workspace with 403 Forbidden
+        res_diff = client.get(f"/api/diff?workspace_path={unapproved_ws}", headers=headers)
+        assert res_diff.status_code == 403
+        assert "not been approved" in res_diff.json()["detail"].lower()
+
+        # /api/settings rejects unapproved workspace with 403 Forbidden
+        res_settings = client.post("/api/settings", json={"current_workspace": unapproved_ws}, headers=headers)
+        assert res_settings.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_informational_task_requires_genuine_inspection():
+    """Validates P2:
+    Informational task without actual inspection actions cannot be marked COMPLETED."""
+    from agent.verification.verifier import VerificationEngine
+    from agent.core.models import TaskType, TaskStatus
+
+    verifier = VerificationEngine()
+
+    # Case A: Model only returns a summary without tool calls -> PARTIALLY_COMPLETED
+    report_no_tools = verifier.evaluate_completion(
+        task_id="t_info_1",
+        goal="Inspect the authentication system and explain its design",
+        actions_taken=["Model provided final summary without additional tool actions."],
+        modified_files=[],
+        task_type=TaskType.INFORMATIONAL,
+        task_current_status=TaskStatus.EXECUTING,
+    )
+    assert report_no_tools.status == TaskStatus.PARTIALLY_COMPLETED
+    assert report_no_tools.acceptance_criteria_satisfied is False
+    assert any("No Inspection Actions Performed" in r for r in report_no_tools.unresolved_risks_or_limitations)
+
+    # Case B: Model executes read_file tool -> COMPLETED
+    report_with_read = verifier.evaluate_completion(
+        task_id="t_info_2",
+        goal="Inspect the authentication system and explain its design",
+        actions_taken=["Executed read_file with arguments {'file_path': 'auth.py'}"],
+        modified_files=[],
+        task_type=TaskType.INFORMATIONAL,
+        task_current_status=TaskStatus.EXECUTING,
+    )
+    assert report_with_read.status == TaskStatus.COMPLETED
+    assert report_with_read.acceptance_criteria_satisfied is True

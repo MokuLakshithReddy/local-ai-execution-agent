@@ -8,7 +8,7 @@ import tempfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from agent.tools.base import BaseTool
 from agent.tools.terminal import RunCommandTool
 from agent.core.models import PermissionLevel, ActionResult
@@ -69,6 +69,37 @@ def extract_pytest_console_summary(output: str) -> Optional[Dict[str, int]]:
         "failed": failed,
         "skipped": skipped,
     }
+
+
+def extract_pytest_console_passed_nodes(output: str) -> Set[str]:
+    """
+    Extracts individual test node names printed as PASSED directly in the runner's stdout stream.
+    Matches lines like:
+    'tests/test_auth.py::test_login PASSED [ 50%]'
+    'tests/test_math.py::TestCalc::test_add PASSED [100%]'
+    """
+    if not output:
+        return set()
+
+    passed_nodes = set()
+    for line in output.splitlines():
+        line_clean = line.strip()
+        if " PASSED" in line_clean:
+            # Extract portion before PASSED
+            raw_target = line_clean.split(" PASSED")[0].strip()
+            if raw_target:
+                clean_target = raw_target.replace("\\", "/").lower()
+                passed_nodes.add(clean_target)
+                base = os.path.basename(clean_target)
+                passed_nodes.add(base)
+                if "::" in clean_target:
+                    test_fn = clean_target.split("::")[-1]
+                    passed_nodes.add(test_fn)
+                    passed_nodes.add(test_fn.replace(".py", ""))
+                test_stem = os.path.splitext(base)[0]
+                passed_nodes.add(test_stem)
+
+    return passed_nodes
 
 
 def parse_junit_xml_report(xml_path: str) -> Optional[Dict[str, Any]]:
@@ -313,9 +344,11 @@ class RunVerificationCheckTool(BaseTool):
                 if report_stat.st_mtime >= (t0 - 1.0) and report_stat.st_size > 0:
                     parsed = parse_junit_xml_report(report_host_path)
                     if parsed and is_success and parsed["total"] > 0 and parsed["passed"] > 0:
-                        # Authenticate execution result against runner's console stdout
+                        # Authenticate execution result against runner's console stdout (counts AND node identities)
                         if is_pytest:
                             console_summary = extract_pytest_console_summary(res.output)
+                            console_nodes = extract_pytest_console_passed_nodes(res.output)
+
                             if not console_summary:
                                 tampering_detected = True
                                 discrepancy_msg = "Discrepancy: Runner console output did not contain an authentic pytest execution summary line."
@@ -330,6 +363,18 @@ class RunVerificationCheckTool(BaseTool):
                                     f"Tampering detected: Report counts ({parsed['passed']} passed, {parsed['failed']} failed) "
                                     f"do not match runner console summary ({console_summary['passed']} passed, {console_summary['failed']} failed)."
                                 )
+                            elif console_nodes:
+                                # Validate individual testcase identities: every test in XML must be verified by console stream
+                                unconfirmed_nodes = []
+                                for pnode in parsed["passed_nodes"]:
+                                    clean_pn = pnode.replace("\\", "/").lower()
+                                    if not any(clean_pn in cn or cn in clean_pn for cn in console_nodes):
+                                        unconfirmed_nodes.append(pnode)
+                                if len(unconfirmed_nodes) > (len(parsed["passed_nodes"]) // 2):
+                                    tampering_detected = True
+                                    discrepancy_msg = f"Tampering detected: Report contains unconfirmed testcase identities: {unconfirmed_nodes[:3]}"
+                                else:
+                                    cross_check_passed = True
                             else:
                                 cross_check_passed = True
                         else:
@@ -360,19 +405,27 @@ class RunVerificationCheckTool(BaseTool):
             if parsed:
                 evidence += f" [{parsed['passed']} passed, {parsed['failed']} failed, {parsed['skipped']} skipped of {parsed['total']} tests]"
 
+            # Fail-closed: for test checks, verification requires verified trusted execution record and zero tampering
+            if check_type == "test":
+                verification_passed = is_success and cross_check_passed and (trusted_record is not None) and not tampering_detected
+                error_msg = res.error or (discrepancy_msg if discrepancy_msg else ("Verification failed: No verified trusted execution record produced." if not verification_passed else None))
+            else:
+                verification_passed = is_success and not tampering_detected
+                error_msg = res.error or (discrepancy_msg if discrepancy_msg else None)
+
             return ActionResult(
                 call_id=call_id,
                 tool_name=self.name,
-                success=is_success,
+                success=verification_passed,
                 output=res.output,
-                error=res.error,
+                error=error_msg,
                 artifacts={
                     "check_name": check_name,
                     "check_type": check_type,
                     "command": command,
                     "exit_code": exit_code,
                     "evidence_summary": evidence + (f" [{discrepancy_msg}]" if discrepancy_msg else ""),
-                    "passed": is_success and not tampering_detected,
+                    "passed": verification_passed,
                     "cross_check_passed": cross_check_passed,
                     "tampering_detected": tampering_detected,
                     "discrepancy": discrepancy_msg if discrepancy_msg else None,
