@@ -4658,7 +4658,14 @@ async def test_cancellation_terminates_active_processes_and_propagates_state():
     terminate_task_processes(task_id)
     cancelled_ids = pm.cancel_task_approvals(task_id)
 
+    # Allow subprocess to be reaped
+    try:
+        proc.wait(timeout=2.0)
+    except Exception:
+        pass
+
     # Confirm process was terminated
+    import psutil
     assert proc.poll() is not None or not psutil.pid_exists(proc.pid)
     # Confirm approval was cancelled and pruned
     assert req.approval_id not in pm.pending_approvals
