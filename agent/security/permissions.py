@@ -29,6 +29,7 @@ class PermissionManager:
         self.policy = policy or PermissionPolicy()
         self.pending_approvals: Dict[str, ApprovalRequest] = {}
         self.approval_history: Dict[str, ApprovalRequest] = {}
+        self._global_sequence_id: int = 0
 
     def evaluate_action(
         self,
@@ -98,6 +99,7 @@ class PermissionManager:
         reason: str,
     ) -> Tuple[bool, str, ApprovalRequest]:
         approval_id = str(uuid.uuid4())
+        self._global_sequence_id += 1
         req = ApprovalRequest(
             approval_id=approval_id,
             task_id=task_id,
@@ -106,19 +108,31 @@ class PermissionManager:
             permission_level=permission_level,
             reason=reason,
             status="PENDING",
+            sequence_id=self._global_sequence_id,
         )
         self.pending_approvals[approval_id] = req
         return False, f"Pending User Approval: {reason}", req
 
-    def resolve_approval(self, approval_id: str, approved: bool) -> ApprovalRequest | None:
+    def resolve_approval(self, approval_id: str, approved: bool) -> Tuple[ApprovalRequest | None, str]:
+        """
+        Resolves a pending approval request.
+        Returns (approval_request, resolution_code) where resolution_code is:
+        - "RESOLVED": successfully resolved now
+        - "ALREADY_RESOLVED": approval ID was previously resolved
+        - "NOT_FOUND": approval ID is unknown
+        """
+        if approval_id in self.approval_history:
+            return self.approval_history[approval_id], "ALREADY_RESOLVED"
+
         if approval_id not in self.pending_approvals:
-            return None
+            return None, "NOT_FOUND"
+
         req = self.pending_approvals.pop(approval_id)
         req.status = "APPROVED" if approved else "REJECTED"
         import time
         req.resolved_at = time.time()
         self.approval_history[approval_id] = req
-        return req
+        return req, "RESOLVED"
 
     @staticmethod
     def _is_path_within_workspace(path: str, workspace_path: str) -> bool:

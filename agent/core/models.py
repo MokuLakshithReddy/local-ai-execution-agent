@@ -78,6 +78,7 @@ class ApprovalRequest(BaseModel):
     permission_level: PermissionLevel
     reason: str
     status: str = "PENDING"  # PENDING, APPROVED, REJECTED
+    sequence_id: int = 0
     requested_at: float = Field(default_factory=time.time)
     resolved_at: Optional[float] = None
 
