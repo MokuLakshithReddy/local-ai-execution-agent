@@ -43,35 +43,78 @@ class CredentialVault:
                     raise
                 raise CredentialEncryptionError(f"Failed to initialize Fernet with vault key: {e}") from e
 
-    def _acquire_init_lock(self, timeout_sec: float = 10.0, poll_sec: float = 0.05) -> str:
-        """Acquires an atomic directory-based initialization lock with stale lock reclamation."""
+    @staticmethod
+    def _cleanup_dir(path: str) -> None:
+        try:
+            if os.path.exists(path):
+                for entry in os.listdir(path):
+                    try:
+                        os.remove(os.path.join(path, entry))
+                    except Exception:
+                        pass
+                os.rmdir(path)
+        except Exception:
+            pass
+
+    def _refresh_init_lock(self, lock_dir: str) -> None:
+        """Refreshes the lock timestamp for long-running initialization tasks."""
+        try:
+            owner_file = os.path.join(lock_dir, "owner.info")
+            now = time.time()
+            if os.path.exists(owner_file):
+                os.utime(owner_file, (now, now))
+            os.utime(lock_dir, (now, now))
+        except Exception:
+            pass
+
+    def _acquire_init_lock(self, timeout_sec: float = 10.0, poll_sec: float = 0.05, stale_sec: float = 10.0) -> str:
+        """Acquires an atomic directory-based initialization lock with explicit ownership and deterministic stale lock reclamation."""
         lock_dir = os.path.join(self._key_dir, ".vault_key_init.lock")
         deadline = time.time() + timeout_sec
+        pid = os.getpid()
+
         while time.time() < deadline:
             try:
                 os.mkdir(lock_dir)
+                # Record lock ownership and timestamp
+                owner_file = os.path.join(lock_dir, "owner.info")
+                try:
+                    with open(owner_file, "w", encoding="utf-8") as f:
+                        f.write(f"pid={pid}\ntime={time.time()}\n")
+                except Exception:
+                    pass
                 return lock_dir
             except FileExistsError:
-                # Check for stale lock (older than 10 seconds)
+                # Inspect for stale lock
                 try:
                     mtime = os.path.getmtime(lock_dir)
-                    if time.time() - mtime > 10.0:
+                    owner_file = os.path.join(lock_dir, "owner.info")
+                    if os.path.exists(owner_file):
                         try:
-                            os.rmdir(lock_dir)
-                            continue
+                            mtime = max(mtime, os.path.getmtime(owner_file))
                         except Exception:
+                            pass
+
+                    if time.time() - mtime > stale_sec:
+                        # Adversarial reclamation race: atomically rename stale lock dir to reclaim it
+                        reclaim_dir = os.path.join(self._key_dir, f".vault_key_reclaim.{pid}.{secrets.token_hex(4)}")
+                        try:
+                            os.rename(lock_dir, reclaim_dir)
+                            # Only the single winning process reaches here!
+                            self._cleanup_dir(reclaim_dir)
+                            continue
+                        except (FileNotFoundError, OSError):
+                            # Another racing process already reclaimed it or holder released it
                             pass
                 except Exception:
                     pass
+
                 time.sleep(poll_sec)
+
         raise CredentialEncryptionError(f"Timed out waiting for vault initialization lock '{lock_dir}'.")
 
     def _release_init_lock(self, lock_dir: str) -> None:
-        try:
-            if os.path.exists(lock_dir):
-                os.rmdir(lock_dir)
-        except Exception:
-            pass
+        self._cleanup_dir(lock_dir)
 
     @staticmethod
     def _safe_file_size(path: str) -> int:

@@ -22,6 +22,7 @@ import {
   X,
   Code2
 } from 'lucide-react'
+import { API_BASE, WS_BASE } from './config'
 import './App.css'
 
 interface TaskStep {
@@ -71,6 +72,9 @@ interface DiffFile {
   newPath: string
   additions: number
   deletions: number
+  isNew?: boolean
+  isDeleted?: boolean
+  isRenamed?: boolean
   lines: { type: 'add' | 'delete' | 'normal' | 'chunk' | 'header'; text: string }[]
 }
 
@@ -90,10 +94,29 @@ function parseGitDiff(rawDiff: string): DiffFile[] {
 
     let additions = 0
     let deletions = 0
+    let isNew = false
+    let isDeleted = false
+    let isRenamed = false
     const parsedLines: { type: 'add' | 'delete' | 'normal' | 'chunk' | 'header'; text: string }[] = []
 
     for (const line of lines) {
-      if (line.startsWith('diff --git') || line.startsWith('index ') || line.startsWith('---') || line.startsWith('+++')) {
+      if (line.startsWith('new file mode') || line.startsWith('--- /dev/null')) {
+        isNew = true
+      } else if (line.startsWith('deleted file mode') || line.startsWith('+++ /dev/null')) {
+        isDeleted = true
+        if (headerMatch) filename = headerMatch[1]
+      } else if (line.startsWith('rename from ') || line.startsWith('rename to ')) {
+        isRenamed = true
+      }
+
+      if (
+        line.startsWith('diff --git') ||
+        line.startsWith('index ') ||
+        line.startsWith('---') ||
+        line.startsWith('+++') ||
+        line.startsWith('similarity ') ||
+        line.startsWith('rename ')
+      ) {
         parsedLines.push({ type: 'header', text: line })
       } else if (line.startsWith('@@')) {
         parsedLines.push({ type: 'chunk', text: line })
@@ -114,6 +137,9 @@ function parseGitDiff(rawDiff: string): DiffFile[] {
       newPath: headerMatch ? headerMatch[2] : filename,
       additions,
       deletions,
+      isNew,
+      isDeleted,
+      isRenamed,
       lines: parsedLines,
     })
   }
@@ -130,6 +156,11 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'timeline' | 'diff' | 'verification' | 'history'>('timeline')
 
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null)
+  const currentTaskIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    currentTaskIdRef.current = currentTaskId
+  }, [currentTaskId])
+
   const [taskStatus, setTaskStatus] = useState<string>('IDLE')
   const [currentStep, setCurrentStep] = useState<number>(0)
   const [timeline, setTimeline] = useState<TaskStep[]>([])
@@ -137,11 +168,20 @@ export default function App() {
   const [selectedDiffFile, setSelectedDiffFile] = useState<number>(0)
   const [finalReport, setFinalReport] = useState<TaskReport | null>(null)
 
+  // Approval state & error handling
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null)
+  const [approvalResolving, setApprovalResolving] = useState(false)
+  const [approvalError, setApprovalError] = useState<string | null>(null)
+
+  // Modals
   const [showSettings, setShowSettings] = useState(false)
   const [showWorkspaceModal, setShowWorkspaceModal] = useState(false)
   const [workspaceInput, setWorkspaceInput] = useState('')
   const [historyTasks, setHistoryTasks] = useState<any[]>([])
+
+  // Accessibility refs for focus management
+  const approveBtnRef = useRef<HTMLButtonElement | null>(null)
+  const approvalModalRef = useRef<HTMLDivElement | null>(null)
 
   // WebSocket Connection State
   const [wsStatus, setWsStatus] = useState<'connected' | 'connecting' | 'disconnected' | 'error'>('connecting')
@@ -176,7 +216,7 @@ export default function App() {
       const headers: Record<string, string> = {}
       const token = tok || authTokenRef.current
       if (token) headers['X-Agent-Auth-Token'] = token
-      const res = await fetch('http://localhost:8000/api/settings', { headers })
+      const res = await fetch(`${API_BASE}/api/settings`, { headers })
       if (res.ok) {
         const data = await res.json()
         setSettings(data)
@@ -195,7 +235,7 @@ export default function App() {
       const headers: Record<string, string> = {}
       const token = tok || authTokenRef.current
       if (token) headers['X-Agent-Auth-Token'] = token
-      const res = await fetch('http://localhost:8000/api/workspaces', { headers })
+      const res = await fetch(`${API_BASE}/api/workspaces`, { headers })
       if (res.ok) {
         const data = await res.json()
         if (data.current) {
@@ -213,7 +253,7 @@ export default function App() {
       const headers: Record<string, string> = {}
       const token = tok || authTokenRef.current
       if (token) headers['X-Agent-Auth-Token'] = token
-      const res = await fetch('http://localhost:8000/api/tasks', { headers })
+      const res = await fetch(`${API_BASE}/api/tasks`, { headers })
       if (res.ok) {
         const data = await res.json()
         setHistoryTasks(data.tasks || [])
@@ -223,9 +263,11 @@ export default function App() {
     }
   }, [])
 
-  const fetchDiff = useCallback(async () => {
+  const fetchDiff = useCallback(async (workspace?: string) => {
     try {
-      const res = await authFetch('http://localhost:8000/api/diff')
+      const ws = workspace || currentWorkspace
+      const url = ws ? `${API_BASE}/api/diff?workspace_path=${encodeURIComponent(ws)}` : `${API_BASE}/api/diff`
+      const res = await authFetch(url)
       if (res.ok) {
         const data = await res.json()
         setGitDiff(data.diff || '')
@@ -233,12 +275,15 @@ export default function App() {
     } catch {
       // Ignore diff fetch error
     }
-  }, [authFetch])
+  }, [authFetch, currentWorkspace])
 
   const handleSocketEvent = useCallback((type: string, data: any) => {
     const timestamp = new Date().toLocaleTimeString()
 
     if (type === 'task_status') {
+      if (data.task_id && currentTaskIdRef.current && data.task_id !== currentTaskIdRef.current) {
+        return
+      }
       setTaskStatus(data.status)
     } else if (type === 'step_start') {
       setCurrentStep(data.step)
@@ -290,14 +335,23 @@ export default function App() {
     } else if (type === 'approval_required') {
       setTaskStatus('PENDING_APPROVAL')
       setPendingApproval(data.approval)
+      setApprovalError(null)
     } else if (type === 'approval_resolved') {
       setPendingApproval(null)
+      setApprovalError(null)
     } else if (type === 'task_completed') {
+      // Ensure the report belongs to the currently displayed task run
+      if (data.task_id && currentTaskIdRef.current && data.task_id !== currentTaskIdRef.current) {
+        return
+      }
       setTaskStatus(data.status)
       setFinalReport(data.report)
       fetchDiff()
       loadTaskHistory()
     } else if (type === 'task_error') {
+      if (data.task_id && currentTaskIdRef.current && data.task_id !== currentTaskIdRef.current) {
+        return
+      }
       setTaskStatus('FAILED')
       setTimeline((prev) => [
         ...prev,
@@ -313,18 +367,37 @@ export default function App() {
   }, [currentStep, fetchDiff, loadTaskHistory])
 
   const resolveApproval = useCallback(async (approved: boolean) => {
-    if (!pendingApproval) return
+    if (!pendingApproval || approvalResolving) return
+    setApprovalResolving(true)
+    setApprovalError(null)
+
     try {
-      await authFetch(`http://localhost:8000/api/approvals/${pendingApproval.approval_id}`, {
+      const res = await authFetch(`${API_BASE}/api/approvals/${pendingApproval.approval_id}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ approved }),
       })
+
+      if (!res.ok) {
+        let errMsg = `Failed to resolve approval (HTTP ${res.status})`
+        try {
+          const data = await res.json()
+          if (data && data.detail) errMsg = data.detail
+        } catch {}
+        setApprovalError(errMsg)
+        // Keep pendingApproval intact on server error
+        return
+      }
+
+      // Confirmed success:
       setPendingApproval(null)
-    } catch {
-      // Ignore approval resolution error
+      setApprovalError(null)
+    } catch (err: any) {
+      setApprovalError(err?.message || 'Network error while submitting approval resolution.')
+    } finally {
+      setApprovalResolving(false)
     }
-  }, [pendingApproval, authFetch])
+  }, [pendingApproval, approvalResolving, authFetch])
 
   const setupWebSocketRef = useRef<((tok?: string) => void) | null>(null)
 
@@ -344,7 +417,7 @@ export default function App() {
 
     setWsStatus('connecting')
     const tok = token || authTokenRef.current
-    const wsUrl = `ws://${window.location.hostname || 'localhost'}:8000/ws?token=${encodeURIComponent(tok)}`
+    const wsUrl = `${WS_BASE}/ws?token=${encodeURIComponent(tok)}`
     
     try {
       const ws = new WebSocket(wsUrl)
@@ -389,7 +462,7 @@ export default function App() {
   useEffect(() => {
     const initAuthAndData = async () => {
       try {
-        const tokenRes = await fetch('http://localhost:8000/api/auth/token')
+        const tokenRes = await fetch(`${API_BASE}/api/auth/token`)
         if (tokenRes.ok) {
           const { token } = await tokenRes.json()
           authTokenRef.current = token
@@ -422,14 +495,23 @@ export default function App() {
     timelineEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [timeline])
 
+  // Focus management when approval modal opens
+  useEffect(() => {
+    if (pendingApproval) {
+      setTimeout(() => {
+        approveBtnRef.current?.focus()
+      }, 50)
+    }
+  }, [pendingApproval])
+
   // Keyboard shortcut listener for approvals and closing modals
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        setShowSettings(false)
-        setShowWorkspaceModal(false)
+        if (showSettings) setShowSettings(false)
+        if (showWorkspaceModal) setShowWorkspaceModal(false)
       }
-      if (pendingApproval) {
+      if (pendingApproval && !approvalResolving) {
         if (e.altKey && e.key.toLowerCase() === 'a') {
           resolveApproval(true)
         } else if (e.altKey && e.key.toLowerCase() === 'd') {
@@ -439,19 +521,45 @@ export default function App() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [pendingApproval, resolveApproval])
+  }, [pendingApproval, approvalResolving, resolveApproval, showSettings, showWorkspaceModal])
+
+  // Modal keyboard tab-trap helper
+  const handleModalKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Tab') {
+      const modal = approvalModalRef.current
+      if (!modal) return
+      const focusable = modal.querySelectorAll<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+      )
+      if (focusable.length === 0) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (e.shiftKey && document.activeElement === first) {
+        last.focus()
+        e.preventDefault()
+      } else if (!e.shiftKey && document.activeElement === last) {
+        first.focus()
+        e.preventDefault()
+      }
+    }
+  }
 
   const startTask = async () => {
     if (!goal.trim()) return
 
+    // Clean state transition: clear previous diff, report and timeline
     setTimeline([])
     setFinalReport(null)
+    setGitDiff('')
+    setSelectedDiffFile(0)
+    setCurrentTaskId(null)
+    currentTaskIdRef.current = null
     setTaskStatus('PLANNING')
     setCurrentStep(0)
     setActiveTab('timeline')
 
     try {
-      const res = await authFetch('http://localhost:8000/api/tasks', {
+      const res = await authFetch(`${API_BASE}/api/tasks`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -472,6 +580,7 @@ export default function App() {
 
       const data = await res.json()
       setCurrentTaskId(data.task_id)
+      currentTaskIdRef.current = data.task_id
     } catch (e: any) {
       alert(`Error starting task: ${e.message}`)
       setTaskStatus('IDLE')
@@ -481,8 +590,9 @@ export default function App() {
   const cancelTask = async () => {
     if (!currentTaskId) return
     try {
-      await authFetch(`http://localhost:8000/api/tasks/${currentTaskId}/cancel`, { method: 'POST' })
+      await authFetch(`${API_BASE}/api/tasks/${currentTaskId}/cancel`, { method: 'POST' })
       setTaskStatus('CANCELLED')
+      fetchDiff()
     } catch {
       // Ignore cancellation error
     }
@@ -502,7 +612,7 @@ export default function App() {
         if (provider === 'anthropic') payload.anthropic_api_key = inputApiKey.trim()
       }
 
-      await authFetch('http://localhost:8000/api/settings', {
+      await authFetch(`${API_BASE}/api/settings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -517,13 +627,15 @@ export default function App() {
 
   const applyWorkspaceChange = async () => {
     if (!workspaceInput.trim()) return
-    setCurrentWorkspace(workspaceInput.trim())
+    const newWs = workspaceInput.trim()
+    setCurrentWorkspace(newWs)
     setShowWorkspaceModal(false)
+    fetchDiff(newWs)
     try {
-      await authFetch('http://localhost:8000/api/settings', {
+      await authFetch(`${API_BASE}/api/settings`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ current_workspace: workspaceInput.trim() }),
+        body: JSON.stringify({ current_workspace: newWs }),
       })
     } catch {
       // Ignore workspace save error
@@ -617,14 +729,31 @@ export default function App() {
               <div style={{ fontSize: '0.82rem', color: '#ffe4e6' }}>
                 Tool <code style={{ background: 'rgba(0,0,0,0.3)', padding: '2px 6px', borderRadius: 4 }}>{pendingApproval.tool_name}</code> ({pendingApproval.permission_level}) needs authorization.
               </div>
+              {approvalError && (
+                <div style={{ color: '#fecdd3', fontSize: '0.78rem', marginTop: 4, fontWeight: 600 }}>
+                  ⚠️ Error: {approvalError}
+                </div>
+              )}
             </div>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
-            <button className="btn-danger" style={{ padding: '6px 14px', fontSize: '0.82rem' }} onClick={() => resolveApproval(false)}>
+            <button
+              className="btn-danger"
+              style={{ padding: '6px 14px', fontSize: '0.82rem' }}
+              onClick={() => resolveApproval(false)}
+              disabled={approvalResolving}
+              aria-label="Deny Action"
+            >
               <X size={15} /> Deny
             </button>
-            <button className="btn-success" style={{ padding: '6px 14px', fontSize: '0.82rem' }} onClick={() => resolveApproval(true)}>
-              <Check size={15} /> Approve
+            <button
+              className="btn-success"
+              style={{ padding: '6px 14px', fontSize: '0.82rem' }}
+              onClick={() => resolveApproval(true)}
+              disabled={approvalResolving}
+              aria-label="Approve Action"
+            >
+              <Check size={15} /> {approvalResolving ? 'Submitting...' : 'Approve'}
             </button>
           </div>
         </div>
@@ -832,7 +961,7 @@ export default function App() {
                 <span style={{ fontWeight: 600, color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: 8 }}>
                   <Code2 size={16} color="#818cf8" /> Working Tree Unified Diffs ({diffFiles.length} file{diffFiles.length === 1 ? '' : 's'})
                 </span>
-                <button className="btn-ghost" style={{ padding: '4px 10px', fontSize: '0.78rem' }} onClick={fetchDiff}>
+                <button className="btn-ghost" style={{ padding: '4px 10px', fontSize: '0.78rem' }} onClick={() => fetchDiff()}>
                   <RefreshCw size={14} /> Refresh Diff
                 </button>
               </div>
@@ -853,9 +982,14 @@ export default function App() {
                         className={`diff-file-item ${selectedDiffFile === idx ? 'selected' : ''}`}
                         onClick={() => setSelectedDiffFile(idx)}
                       >
-                        <span style={{ textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }} title={f.filename}>
-                          {f.filename}
-                        </span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                          {f.isDeleted && <span className="diff-badge-del">DEL</span>}
+                          {f.isNew && <span className="diff-badge-new">NEW</span>}
+                          {f.isRenamed && <span className="diff-badge-ren">REN</span>}
+                          <span style={{ textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }} title={f.filename}>
+                            {f.filename}
+                          </span>
+                        </div>
                         <div className="diff-file-stats">
                           {f.additions > 0 && <span className="stat-add">+{f.additions}</span>}
                           {f.deletions > 0 && <span className="stat-del">-{f.deletions}</span>}
@@ -869,7 +1003,12 @@ export default function App() {
                     {diffFiles[selectedDiffFile] ? (
                       <div>
                         <div className="diff-file-header">
-                          <span>{diffFiles[selectedDiffFile].filename}</span>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <span>{diffFiles[selectedDiffFile].filename}</span>
+                            {diffFiles[selectedDiffFile].isDeleted && <span className="diff-badge-del">DELETED</span>}
+                            {diffFiles[selectedDiffFile].isNew && <span className="diff-badge-new">NEW FILE</span>}
+                            {diffFiles[selectedDiffFile].isRenamed && <span className="diff-badge-ren">RENAMED</span>}
+                          </div>
                           <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>
                             +{diffFiles[selectedDiffFile].additions} / -{diffFiles[selectedDiffFile].deletions} lines
                           </span>
@@ -1039,8 +1178,14 @@ export default function App() {
 
       {/* Human-in-the-Loop Approval Modal */}
       {pendingApproval && (
-        <div className="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="approval-title">
-          <div className="modal-dialog">
+        <div
+          className="modal-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="approval-title"
+          onKeyDown={handleModalKeyDown}
+        >
+          <div className="modal-dialog" ref={approvalModalRef}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: '#fb7185' }}>
               <ShieldAlert size={28} />
               <h3 id="approval-title" style={{ fontSize: '1.2rem', color: '#fff' }}>Authorization Required</h3>
@@ -1049,6 +1194,13 @@ export default function App() {
             <p style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
               The agent has requested to execute a sensitive action requiring explicit human permission:
             </p>
+
+            {approvalError && (
+              <div className="approval-error-msg" role="alert">
+                <AlertTriangle size={18} />
+                <span>{approvalError}</span>
+              </div>
+            )}
 
             <div style={{ background: '#090d16', padding: 14, borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)' }}>
               <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: 6 }}>
@@ -1066,11 +1218,22 @@ export default function App() {
                 Hotkeys: <kbd>Alt+A</kbd> Approve | <kbd>Alt+D</kbd> Deny
               </span>
               <div style={{ display: 'flex', gap: 12 }}>
-                <button className="btn-danger" onClick={() => resolveApproval(false)}>
+                <button
+                  className="btn-danger"
+                  onClick={() => resolveApproval(false)}
+                  disabled={approvalResolving}
+                  aria-label="Deny Action"
+                >
                   Deny Action
                 </button>
-                <button className="btn-primary" onClick={() => resolveApproval(true)}>
-                  Approve Action
+                <button
+                  ref={approveBtnRef}
+                  className="btn-primary"
+                  onClick={() => resolveApproval(true)}
+                  disabled={approvalResolving}
+                  aria-label="Approve Action"
+                >
+                  {approvalResolving ? 'Submitting...' : 'Approve Action'}
                 </button>
               </div>
             </div>

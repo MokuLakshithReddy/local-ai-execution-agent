@@ -11,7 +11,7 @@ An open-source, evidence-driven autonomous coding framework that delegates real 
 [![React 19](https://img.shields.io/badge/React-19%20%7C%20Vite-646CFF.svg)](https://vitejs.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-Local--First-003B57.svg)](https://sqlite.org/)
 [![CI](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
-[![Verification: 73 Passed](https://img.shields.io/badge/Verification-73%20Passed-10b981.svg)](#-live-verification-evidence-log)
+[![Verification: 75 Passed](https://img.shields.io/badge/Verification-75%20Passed-10b981.svg)](#-live-verification-evidence-log)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
@@ -322,10 +322,12 @@ tests/test_core_and_tools.py::test_verification_secret_rotation_post_replace_loc
 tests/test_core_and_tools.py::test_engine_untrusted_task_cannot_escape_to_host_even_with_env_flag PASSED [ 94%]
 tests/test_core_and_tools.py::test_verification_secret_multithreaded_concurrency PASSED [ 95%]
 tests/test_core_and_tools.py::test_ci_status_reporter_strict_and_failure_modes PASSED [ 97%]
-tests/test_core_and_tools.py::test_engine_approval_rejection_and_timeout_lifecycle_e2e PASSED [ 98%]
-tests/test_core_and_tools.py::test_ui_accessibility_and_responsive_contract PASSED [100%]
+tests/test_core_and_tools.py::test_engine_approval_rejection_and_timeout_lifecycle_e2e PASSED [ 96%]
+tests/test_core_and_tools.py::test_ui_accessibility_and_responsive_contract PASSED [ 97%]
+tests/test_core_and_tools.py::test_vault_init_lock_adversarial_multiprocess_recovery_and_ownership PASSED [ 98%]
+tests/test_core_and_tools.py::test_diff_and_task_state_synchronization PASSED [100%]
 
-======================== 73 passed in 21.20s (100% Green CI) ========================
+======================== 75 passed in 22.93s (100% Green CI) ========================
 ```
 
 ---

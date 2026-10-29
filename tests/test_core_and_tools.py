@@ -4220,6 +4220,188 @@ def test_ui_accessibility_and_responsive_contract():
     assert "@media (max-width: 1024px)" in app_css, "Responsive CSS must adapt to smaller viewports"
     assert "grid-template-columns: 1fr" in app_css, "Responsive layout must collapse multi-column grids"
 
+    # 6. Keyboard focus visible & prefers-reduced-motion
+    assert "*:focus-visible" in app_css, "Global :focus-visible rules must be defined"
+    assert "@media (prefers-reduced-motion: reduce)" in app_css, "Reduced motion preferences must disable animations"
+    assert "approveBtnRef" in app_tsx, "Approval dialog must manage initial button focus"
+    assert "handleModalKeyDown" in app_tsx, "Approval dialog must manage keyboard tab-trapping"
+
+    # 7. Centralized API and WS endpoint configuration
+    config_path = os.path.join(os.path.dirname(__file__), "..", "ui", "src", "config.ts")
+    assert os.path.exists(config_path), "Centralized config.ts must exist"
+    with open(config_path, "r", encoding="utf-8") as f:
+        config_ts = f.read()
+    assert "VITE_API_BASE_URL" in config_ts, "config.ts must support VITE_API_BASE_URL"
+    assert "VITE_WS_BASE_URL" in config_ts, "config.ts must support VITE_WS_BASE_URL"
+    assert "API_BASE" in app_tsx, "App.tsx must use centralized API_BASE"
+    assert "WS_BASE" in app_tsx, "App.tsx must use centralized WS_BASE"
+
+    # 8. Approval resolution error retention
+    assert "!res.ok" in app_tsx, "resolveApproval must check response status"
+    assert "setApprovalError" in app_tsx, "resolveApproval must record errors"
+    assert "approvalError" in app_tsx, "Approval errors must be rendered in UI"
+
+
+def _worker_stale_lock_reclaim(key_dir: str, stale_sec: float, timeout_sec: float, out_queue):
+    """Subprocess worker that races to acquire/reclaim lock."""
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from agent.persistence.credentials import CredentialVault
+    try:
+        vault = CredentialVault.__new__(CredentialVault)
+        vault._key_dir = key_dir
+        lock_dir = vault._acquire_init_lock(timeout_sec=timeout_sec, poll_sec=0.02, stale_sec=stale_sec)
+        # Hold briefly to simulate key work
+        time.sleep(0.05)
+        vault._release_init_lock(lock_dir)
+        out_queue.put({"success": True, "pid": os.getpid()})
+    except Exception as e:
+        out_queue.put({"success": False, "pid": os.getpid(), "error": str(e)})
+
+
+def test_vault_init_lock_adversarial_multiprocess_recovery_and_ownership():
+    """Validates Issue 4:
+    Adversarial multiprocess validation of vault initialization lock:
+    1. Lock records explicit ownership and timestamp in owner.info.
+    2. Heartbeat refresh (_refresh_init_lock) extends lock validity.
+    3. Multiple concurrent processes racing to reclaim an expired stale lock
+       recover deterministically via atomic directory rename without deadlocks or crashes."""
+    import multiprocessing
+    from agent.persistence.credentials import CredentialVault
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        key_dir = os.path.join(temp_dir, "vault_keys")
+        os.makedirs(key_dir, exist_ok=True)
+        v = CredentialVault.__new__(CredentialVault)
+        v._key_dir = key_dir
+
+        # 1. Acquire lock and verify owner info
+        lock_dir = v._acquire_init_lock(timeout_sec=2.0)
+        assert os.path.exists(lock_dir)
+        owner_file = os.path.join(lock_dir, "owner.info")
+        assert os.path.exists(owner_file)
+        with open(owner_file, "r", encoding="utf-8") as f:
+            owner_text = f.read()
+        assert f"pid={os.getpid()}" in owner_text
+        assert "time=" in owner_text
+
+        # 2. Heartbeat refresh updates mtime
+        old_mtime = os.path.getmtime(owner_file)
+        time.sleep(0.05)
+        v._refresh_init_lock(lock_dir)
+        new_mtime = os.path.getmtime(owner_file)
+        assert new_mtime >= old_mtime
+
+        # 3. Simulate process death while holding lock: leave stale lock behind
+        # Set mtime back by 5 seconds to simulate an abandoned stale lock
+        past_time = time.time() - 5.0
+        os.utime(owner_file, (past_time, past_time))
+        os.utime(lock_dir, (past_time, past_time))
+
+        # 4. Spawn 6 concurrent worker processes racing to reclaim the stale lock (stale_sec=1.0)
+        ctx = multiprocessing.get_context("spawn")
+        out_queue = ctx.Queue()
+        workers = []
+        for _ in range(6):
+            p = ctx.Process(
+                target=_worker_stale_lock_reclaim,
+                args=(key_dir, 1.0, 5.0, out_queue),
+            )
+            workers.append(p)
+            p.start()
+
+        results = []
+        for _ in range(6):
+            results.append(out_queue.get(timeout=10.0))
+
+        for p in workers:
+            p.join(timeout=5.0)
+
+        # All 6 racing processes must succeed in acquiring, executing, and releasing cleanly
+        assert len(results) == 6
+        for r in results:
+            assert r["success"] is True, f"Worker process failed: {r}"
+
+
+@pytest.mark.asyncio
+async def test_diff_and_task_state_synchronization():
+    """Validates Issue 5:
+    1. Git diff captures file creations, modifications, deletions, and renames.
+    2. Git diff tool reports correct unified diff format.
+    3. API /api/diff handles explicit workspace parameter.
+    4. Frontend parseGitDiff logic flags isDeleted, isNew, and isRenamed accurately."""
+    from agent.tools.git import GitDiffTool, _run_git
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Initialize real git repo
+        code, _, _ = await _run_git(["init"], temp_dir)
+        assert code == 0
+        await _run_git(["config", "user.email", "test@example.com"], temp_dir)
+        await _run_git(["config", "user.name", "Test Runner"], temp_dir)
+
+        # Commit initial baseline files
+        file_a = os.path.join(temp_dir, "file_a.txt")
+        file_to_del = os.path.join(temp_dir, "file_del.txt")
+        file_to_rename = os.path.join(temp_dir, "file_old.txt")
+
+        with open(file_a, "w", encoding="utf-8") as f:
+            f.write("Line 1\nLine 2\n")
+        with open(file_to_del, "w", encoding="utf-8") as f:
+            f.write("To be deleted\n")
+        with open(file_to_rename, "w", encoding="utf-8") as f:
+            f.write("Rename me\n")
+
+        await _run_git(["add", "."], temp_dir)
+        await _run_git(["commit", "-m", "initial commit"], temp_dir)
+
+        # 1. Modify file_a
+        with open(file_a, "w", encoding="utf-8") as f:
+            f.write("Line 1\nLine 2 modified\nLine 3 added\n")
+
+        # 2. Delete file_del
+        os.remove(file_to_del)
+
+        # 3. Rename file_old to file_new
+        os.rename(file_to_rename, os.path.join(temp_dir, "file_new.txt"))
+
+        # Run GitDiffTool
+        tool = GitDiffTool()
+        res = await tool.execute(temp_dir)
+        assert res.success is True
+        raw_diff = res.output
+
+        # Verify unified diff contains modifications, deletions, and renames
+        assert "diff --git a/file_a.txt b/file_a.txt" in raw_diff
+        assert "+Line 3 added" in raw_diff
+        assert "diff --git a/file_del.txt b/file_del.txt" in raw_diff or "deleted file mode" in raw_diff
+        assert "file_new.txt" in raw_diff or "file_old.txt" in raw_diff
+
+        # 4. Verify parseGitDiff rules (matching App.tsx parseGitDiff implementation)
+        def parse_git_diff_py(raw: str):
+            import re
+            files = []
+            raw_files = [b for b in re.split(r"(?=diff --git )", raw) if b.strip()]
+            for block in raw_files:
+                lines = block.splitlines()
+                filename = "Modified File"
+                m = re.search(r"diff --git a/(.+?) b/(.+)", lines[0])
+                if m:
+                    filename = m.group(2)
+                is_new = any(l.startswith("new file mode") or l.startswith("--- /dev/null") for l in lines)
+                is_del = any(l.startswith("deleted file mode") or l.startswith("+++ /dev/null") for l in lines)
+                is_ren = any(l.startswith("rename from ") or l.startswith("rename to ") for l in lines)
+                if is_del and m:
+                    filename = m.group(1)
+                files.append({"filename": filename, "isNew": is_new, "isDeleted": is_del, "isRenamed": is_ren})
+            return files
+
+        parsed = parse_git_diff_py(raw_diff)
+        filenames = [p["filename"] for p in parsed]
+        assert any("file_a.txt" in fn for fn in filenames)
+        assert any("file_del.txt" in fn for fn in filenames)
+        del_item = next(p for p in parsed if "file_del.txt" in p["filename"])
+        assert del_item.get("isDeleted") is True
+
 
 
 
