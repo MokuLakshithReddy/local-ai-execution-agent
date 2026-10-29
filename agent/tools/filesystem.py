@@ -10,6 +10,8 @@ from agent.core.models import PermissionLevel, ActionResult
 
 IGNORED_DIRS = {".git", "node_modules", "venv", "__pycache__", ".venv", ".idea", ".vscode", "dist", "build"}
 MAX_READ_BYTES = 100_000  # 100 KB safety limit per read
+MAX_LINE_CHARS = 10_000  # Max characters per line to guard against giant un-newline minified blobs
+MAX_SCAN_BYTES = 5 * 1024 * 1024  # 5 MB maximum bytes scanned during slicing
 
 
 def resolve_safe_path(workspace_path: str, sub_path: str) -> str:
@@ -189,35 +191,73 @@ class ReadFileTool(BaseTool):
 
             selected = []
             returned_bytes = 0
+            scanned_bytes = 0
             truncated = False
-            total_lines = 0
+            line_idx = 0
 
-            # Stream line-by-line without buffering entire file in memory
+            # Bounded streaming reader: bounds lines, individual line lengths, and scanned bytes
             with open(target_file, "r", encoding="utf-8", errors="replace") as f:
-                for line_idx, line in enumerate(f, start=1):
-                    total_lines = line_idx
+                while True:
+                    line_idx += 1
+                    # Stop immediately once the requested range is complete
+                    if line_idx > end_line:
+                        line_idx -= 1
+                        break
+
+                    # Bound individual line memory using chunked readline
+                    raw_chunk = f.readline(MAX_LINE_CHARS + 1)
+                    if not raw_chunk:
+                        # End of file reached
+                        line_idx -= 1
+                        break
+
+                    scanned_bytes += len(raw_chunk.encode("utf-8", errors="replace"))
+
+                    # If line exceeds MAX_LINE_CHARS, truncate line and drain remaining chars up to newline
+                    if len(raw_chunk) > MAX_LINE_CHARS:
+                        line = raw_chunk[:MAX_LINE_CHARS] + " ... [LINE TRUNCATED AT 10,000 CHARACTERS]\n"
+                        # Drain until newline to keep line numbers accurate without storing
+                        while True:
+                            drain = f.readline(65536)
+                            if not drain:
+                                break
+                            scanned_bytes += len(drain.encode("utf-8", errors="replace"))
+                            if drain.endswith("\n"):
+                                break
+                    else:
+                        line = raw_chunk
+
+                    # Check overall scan budget
+                    if scanned_bytes > MAX_SCAN_BYTES:
+                        truncated = True
+                        break
+
                     if line_idx < start_line:
                         continue
-                    if line_idx > end_line:
-                        continue
+
+                    # Ensure line ends with newline for consistent formatting
+                    if not line.endswith("\n"):
+                        line = line + "\n"
+
                     formatted = f"{line_idx}: {line}"
                     f_bytes = len(formatted.encode("utf-8", errors="replace"))
                     if returned_bytes + f_bytes > MAX_READ_BYTES:
                         truncated = True
                         break
+
                     selected.append(formatted)
                     returned_bytes += f_bytes
 
             output_content = "".join(selected)
             if truncated:
-                output_content += f"\n[OUTPUT TRUNCATED: Reached {MAX_READ_BYTES} byte limit. Specify narrower start_line and end_line]."
+                output_content += f"\n[OUTPUT TRUNCATED: Reached safety limit ({MAX_READ_BYTES} output bytes or {MAX_SCAN_BYTES} scan bytes). Specify narrower start_line and end_line]."
 
             return ActionResult(
                 call_id=call_id,
                 tool_name=self.name,
                 success=True,
                 output=output_content,
-                artifacts={"total_lines": total_lines, "returned_lines": len(selected), "truncated": truncated},
+                artifacts={"scanned_lines": line_idx, "returned_lines": len(selected), "truncated": truncated},
                 execution_time_ms=(time.time() - t0) * 1000,
             )
         except Exception as e:

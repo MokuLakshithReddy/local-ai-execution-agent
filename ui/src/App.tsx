@@ -187,6 +187,7 @@ export default function App() {
   const [settingsError, setSettingsError] = useState<string | null>(null)
   const [workspaceError, setWorkspaceError] = useState<string | null>(null)
   const [isCancelling, setIsCancelling] = useState(false)
+  const [cancelError, setCancelError] = useState<string | null>(null)
 
   // Accessibility refs for focus management
   const approveBtnRef = useRef<HTMLButtonElement | null>(null)
@@ -330,6 +331,10 @@ export default function App() {
 
     if (type === 'task_status') {
       setTaskStatus(data.status)
+      if (['CANCELLED', 'FAILED', 'COMPLETED', 'PARTIALLY_COMPLETED'].includes(data.status)) {
+        setIsCancelling(false)
+        setCancelError(null)
+      }
     } else if (type === 'step_start') {
       setCurrentStep(data.step)
       setTimeline((prev) => [
@@ -408,6 +413,8 @@ export default function App() {
       setApprovalError(null)
     } else if (type === 'task_completed') {
       setTaskStatus(data.status)
+      setIsCancelling(false)
+      setCancelError(null)
       setFinalReport(data.report)
       fetchDiff()
       loadTaskHistory()
@@ -657,14 +664,27 @@ export default function App() {
   const cancelTask = async () => {
     if (!currentTaskId || isCancelling) return
     setIsCancelling(true)
+    setCancelError(null)
     setTaskStatus('CANCELLING...')
     try {
-      await authFetch(`${API_BASE}/api/tasks/${currentTaskId}/cancel`, { method: 'POST' })
-      setTaskStatus('CANCELLED')
+      const res = await authFetch(`${API_BASE}/api/tasks/${currentTaskId}/cancel`, { method: 'POST' })
+      if (!res.ok) {
+        let errDetail = `Server returned status ${res.status}`
+        try {
+          const body = await res.json()
+          if (body.detail) errDetail = body.detail
+        } catch {
+          // fallback to status code
+        }
+        setCancelError(`Cancellation failed: ${errDetail}`)
+        setIsCancelling(false)
+        loadTaskHistory()
+        return
+      }
+      // Cancellation request accepted; retain CANCELLING... until backend emits confirmed status
       fetchDiff()
-    } catch {
-      setTaskStatus('CANCELLED')
-    } finally {
+    } catch (err: any) {
+      setCancelError(err?.message || 'Network error while requesting task cancellation.')
       setIsCancelling(false)
     }
   }
@@ -978,6 +998,21 @@ export default function App() {
                 <Square size={18} fill="currentColor" />
                 {isCancelling ? 'Cancelling...' : 'Stop Execution'}
               </button>
+            )}
+            {cancelError && (
+              <div
+                style={{
+                  color: '#fb7185',
+                  fontSize: '0.8rem',
+                  marginTop: 8,
+                  fontWeight: 600,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                }}
+              >
+                <span>⚠️ {cancelError}</span>
+              </div>
             )}
           </div>
         </aside>

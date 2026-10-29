@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header, Request, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agent.core.models import Task, TaskStatus, TaskType
 from agent.core.engine import ExecutionEngine
@@ -21,6 +21,7 @@ from agent.persistence.db import Database
 from agent.security.permissions import PermissionManager, PermissionPolicy
 from agent.tools.registry import ToolRegistry
 from agent.verification.verifier import infer_task_type
+from agent.security.sanitizer import SecuritySanitizer, register_global_secret
 
 import urllib.parse
 
@@ -300,7 +301,7 @@ class CreateTaskRequest(BaseModel):
     task_type: Optional[TaskType] = None
     model_provider: str = "gemini"
     model_name: str = "gemini-2.5-flash"
-    max_steps: int = 30
+    max_steps: int = Field(default=30, ge=1, le=100, description='Execution step budget bounded between 1 and 100')
     api_key: Optional[str] = None
     custom_base_url: Optional[str] = None
 
@@ -447,6 +448,11 @@ async def save_settings(req: SaveSettingsRequest):
 
 @app.post("/api/tasks", dependencies=[Depends(verify_auth)])
 async def create_task(req: CreateTaskRequest):
+    if req.max_steps < 1 or req.max_steps > 100:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid max_steps ({req.max_steps}). Must be an integer bounded between 1 and 100.",
+        )
     target_ws = req.workspace_path or await db.get_setting("current_workspace", os.getcwd())
     real_ws = os.path.realpath(target_ws)
 
@@ -474,6 +480,9 @@ async def create_task(req: CreateTaskRequest):
             api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
         elif "ollama" in provider:
             api_key = "ollama"
+
+    if api_key:
+        register_global_secret(api_key)
 
     if not api_key and req.model_provider not in ("ollama", "local"):
         raise HTTPException(
@@ -523,6 +532,9 @@ async def get_task_details(task_id: str):
 
 @app.post("/api/tasks/{task_id}/cancel", dependencies=[Depends(verify_auth)])
 async def cancel_task(task_id: str):
+    task = await db.get_task(task_id)
+    if not task and task_id not in engine._active_tasks:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
     engine.cancel_task(task_id)
     return {"status": "cancellation_requested", "task_id": task_id}
 

@@ -144,7 +144,7 @@ class Task(BaseModel):
     task_type: TaskType = TaskType.CODE_MODIFICATION
     status: TaskStatus = TaskStatus.IDLE
     current_step: int = 0
-    max_steps: int = 30
+    max_steps: int = Field(default=30, ge=1, le=100)
     timeout_seconds: int = 600
     plan: List[str] = Field(default_factory=list)
     acceptance_criteria: List[str] = Field(default_factory=list)

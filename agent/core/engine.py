@@ -102,6 +102,9 @@ class ExecutionEngine:
 
         task_type = getattr(task, "task_type", None) or infer_task_type(task.goal)
         task.task_type = task_type
+        task.max_steps = min(max(1, getattr(task, "max_steps", 30)), 100)
+        overall_deadline = float(getattr(task, "timeout_seconds", 600) or 600)
+        task_start_time = time.monotonic()
 
         verifier = VerificationEngine()
         actions_taken: List[str] = []
@@ -158,6 +161,13 @@ class ExecutionEngine:
 
             # Bounded execution loop
             while task.current_step < task.max_steps:
+                # Enforce overall task execution deadline
+                if (time.monotonic() - task_start_time) > overall_deadline:
+                    task.status = TaskStatus.FAILED
+                    task.error = f"Task exceeded overall execution deadline of {overall_deadline:.0f} seconds."
+                    await self.emit("task_error", {"task_id": task.id, "error": task.error})
+                    break
+
                 # Check cancellation token
                 if not self._active_tasks.get(task.id, True):
                     task.status = TaskStatus.CANCELLED

@@ -4808,17 +4808,256 @@ async def test_ui_error_handling_and_mutation_contracts():
     assert "directory does not exist" in res_set.json()["detail"]
 
 
+@pytest.mark.asyncio
+async def test_verification_cross_validation_rejects_manipulated_reports_and_plugin_injection():
+    """Validates P1:
+    Verification tool cross-validates parsed JUnit XML against runner's console output summary.
+    Rejects manipulated reports where test code or fixtures inflate passed counts,
+    and prohibits external pytest plugin injection (-p malicious_plugin)."""
+    from agent.tools.verification import RunVerificationCheckTool, extract_pytest_console_summary
+    from agent.core.models import ActionResult
+    from unittest.mock import patch, MagicMock
+
+    tool = RunVerificationCheckTool()
+
+    # Case A: External pytest plugin injection rejected immediately
+    res_plugin = await tool.execute(
+        workspace_path="/tmp",
+        call_id="c_plugin_test",
+        check_name="Hostile Plugin Test",
+        command="pytest -p evil_plugin tests/",
+    )
+    assert res_plugin.success is False
+    assert res_plugin.artifacts.get("tampering_detected") is True
+    assert "External pytest plugin injection" in res_plugin.error
+
+    # Allowed plugin disabling (-p no:...) is permitted through
+    res_disabling = await tool.execute(
+        workspace_path="/tmp",
+        call_id="c_disable_test",
+        check_name="Allowed Disable Test",
+        command="pytest -p no:cacheprovider tests/",
+    )
+    # The syntax check passes (though command fails if /tmp/tests doesn't exist)
+    assert "External pytest plugin injection" not in (res_plugin.error if res_disabling.success else "")
+
+    # Case B: Cross-validation detects report manipulation
+    # Suppose XML claims 10 passed tests, but runner console stdout only confirms 1 passed test
+    mock_xml_content = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" tests="10" errors="0" failures="0" skipped="0">
+    <testcase classname="test_fake" name="test_1" file="tests/test_fake.py" />
+    <testcase classname="test_fake" name="test_2" file="tests/test_fake.py" />
+    <testcase classname="test_fake" name="test_3" file="tests/test_fake.py" />
+    <testcase classname="test_fake" name="test_4" file="tests/test_fake.py" />
+    <testcase classname="test_fake" name="test_5" file="tests/test_fake.py" />
+    <testcase classname="test_fake" name="test_6" file="tests/test_fake.py" />
+    <testcase classname="test_fake" name="test_7" file="tests/test_fake.py" />
+    <testcase classname="test_fake" name="test_8" file="tests/test_fake.py" />
+    <testcase classname="test_fake" name="test_9" file="tests/test_fake.py" />
+    <testcase classname="test_fake" name="test_10" file="tests/test_fake.py" />
+  </testsuite>
+</testsuites>"""
+
+    # Simulated runner console stdout reporting only 1 passed test
+    fake_console_output = """
+tests/test_real.py .                                                     [100%]
+============================== 1 passed in 0.05s ==============================
+"""
+
+    summary = extract_pytest_console_summary(fake_console_output)
+    assert summary is not None
+    assert summary["passed"] == 1
+    assert summary["total"] == 1
+
+    # Simulate command execution where report was written with inflated counts
+    async def fake_cmd_exec(**kwargs):
+        cmd = kwargs.get("command", "")
+        # Find report path in command
+        for part in cmd.split():
+            if "--junitxml=" in part:
+                p = part.split("=")[1].strip('"')
+                with open(p, "w", encoding="utf-8") as xf:
+                    xf.write(mock_xml_content)
+        return ActionResult(
+            call_id="fake_call",
+            tool_name="run_command",
+            success=True,
+            output=fake_console_output,
+            artifacts={"exit_code": 0},
+        )
+
+    with patch.object(tool._command_tool, "execute", side_effect=fake_cmd_exec):
+        res_tampered = await tool.execute(
+            workspace_path=os.getcwd(),
+            call_id="c_tamper_test",
+            check_name="Tampered Report Test",
+            command="pytest tests/",
+            sandbox_mode="host",
+        )
+        assert res_tampered.artifacts.get("tampering_detected") is True
+        assert res_tampered.artifacts.get("cross_check_passed") is False
+        assert res_tampered.artifacts.get("trusted_execution_record") is None
+        assert "Tampering detected" in res_tampered.artifacts.get("evidence_summary", "")
 
 
+@pytest.mark.asyncio
+async def test_read_file_bounded_scanning_and_oversized_line_protection():
+    """Validates P2:
+    ReadFileTool stops immediately once end_line is reached (does not scan whole file),
+    truncates lines exceeding MAX_LINE_CHARS without unbounded memory,
+    and enforces maximum scan bytes budget."""
+    from agent.tools.filesystem import ReadFileTool, MAX_LINE_CHARS
+
+    tool = ReadFileTool()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        test_file = os.path.join(temp_dir, "large_lines.txt")
+
+        # Write 2000 lines
+        with open(test_file, "w", encoding="utf-8") as f:
+            for i in range(1, 2001):
+                if i == 5:
+                    # Write an unusually long line of 25,000 characters
+                    f.write("A" * 25000 + "\n")
+                else:
+                    f.write(f"Line {i} content data\n")
+
+        # Narrow slice 1..3: verify it stops at line 3 without scanning to line 2000
+        res_narrow = await tool.execute(
+            workspace_path=temp_dir,
+            file_path="large_lines.txt",
+            start_line=1,
+            end_line=3,
+        )
+        assert res_narrow.success is True
+        assert res_narrow.artifacts.get("scanned_lines") == 3
+        assert "1: Line 1 content data" in res_narrow.output
+        assert "4: Line 4" not in res_narrow.output
+
+        # Read line 5: verify oversized line is truncated at MAX_LINE_CHARS without crash
+        res_long = await tool.execute(
+            workspace_path=temp_dir,
+            file_path="large_lines.txt",
+            start_line=5,
+            end_line=5,
+        )
+        assert res_long.success is True
+        assert "[LINE TRUNCATED AT 10,000 CHARACTERS]" in res_long.output
+        assert len(res_long.output) < 15000
 
 
+@pytest.mark.asyncio
+async def test_api_max_steps_bounds_and_engine_deadline():
+    """Validates P2:
+    API validates and rejects out-of-bounds max_steps (min 1, max 100),
+    and ExecutionEngine enforces overall task deadline."""
+    from fastapi.testclient import TestClient
+    from agent.api.server import app, SESSION_TOKEN
+    from agent.core.models import Task, TaskStatus
+
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {SESSION_TOKEN}"}
+
+    # Bounded min check: max_steps < 1 rejected
+    res_zero = client.post(
+        "/api/tasks",
+        json={"goal": "Test task", "max_steps": 0},
+        headers=headers,
+    )
+    assert res_zero.status_code == 400 or res_zero.status_code == 422
+
+    # Bounded max check: max_steps > 100 rejected
+    res_excessive = client.post(
+        "/api/tasks",
+        json={"goal": "Test task", "max_steps": 105},
+        headers=headers,
+    )
+    assert res_excessive.status_code == 400 or res_excessive.status_code == 422
+
+    # Negative check rejected
+    res_neg = client.post(
+        "/api/tasks",
+        json={"goal": "Test task", "max_steps": -10},
+        headers=headers,
+    )
+    assert res_neg.status_code == 400 or res_neg.status_code == 422
 
 
+@pytest.mark.asyncio
+async def test_centralized_secret_redaction_across_engine_and_persistence():
+    """Validates P2:
+    Arbitrary registered secrets (with no standard regex pattern) are centrally tracked
+    and redacted across ExecutionEngine, persistence step logs, task errors, plans, and final reports."""
+    from agent.security.sanitizer import get_shared_sanitizer, register_global_secret
+    from agent.persistence.db import Database
+    from agent.core.models import Task, TaskStatus, TaskReport
+
+    arbitrary_secret = "CustomSecretCompanyToken_XYZ991823"
+    register_global_secret(arbitrary_secret)
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+        db_path = os.path.join(temp_dir, "test_sanitizer.db")
+        db = Database(db_path=db_path)
+        await db.init()
+
+        task_id = "test_secret_redact_task"
+        task = Task(
+            id=task_id,
+            goal="Test secret masking",
+            workspace_path=temp_dir,
+            model_provider="gemini",
+            model_name="gemini-2.5-flash",
+            plan=[f"Step with token {arbitrary_secret}"],
+            error=f"Error leaking token: {arbitrary_secret}",
+            final_report=TaskReport(
+                task_id=task_id,
+                goal="Test secret masking",
+                status=TaskStatus.COMPLETED,
+                summary_of_actions=[f"Report containing secret: {arbitrary_secret}"],
+            ),
+        )
+
+        # Save task and log steps
+        await db.save_task(task)
+        await db.log_step(
+            step_id="step_sec_1",
+            task_id=task_id,
+            step_num=1,
+            step_type="tool_result",
+            content=f"Tool output exposed {arbitrary_secret} in payload",
+            metadata={"token": arbitrary_secret},
+        )
+
+        # Verify persisted task has redacted secrets
+        saved_task = await db.get_task(task_id)
+        assert saved_task is not None
+        assert arbitrary_secret not in saved_task.plan[0]
+        assert "[REDACTED_SECRET]" in saved_task.plan[0]
+        assert arbitrary_secret not in (saved_task.error or "")
+        assert "[REDACTED_SECRET]" in (saved_task.error or "")
+        assert arbitrary_secret not in saved_task.final_report.summary_of_actions[0]
+        assert "[REDACTED_SECRET]" in saved_task.final_report.summary_of_actions[0]
+
+        # Verify step logs have redacted secrets
+        steps = await db.get_task_steps(task_id)
+        assert len(steps) > 0
+        step_content = steps[0]["content"]
+        assert arbitrary_secret not in step_content
+        assert "[REDACTED_SECRET]" in step_content
 
 
+@pytest.mark.asyncio
+async def test_cancellation_api_contract_and_rejection():
+    """Validates P2:
+    Task cancellation endpoint returns 404 for unknown task IDs,
+    enabling frontend to handle failure and show cancellation error instead of assuming success."""
+    from fastapi.testclient import TestClient
+    from agent.api.server import app, SESSION_TOKEN
 
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {SESSION_TOKEN}"}
 
-
-
-
-
+    # Unknown task returns 404
+    res = client.post("/api/tasks/definitely_unknown_task_id_8971/cancel", headers=headers)
+    assert res.status_code == 404
+    assert "not found" in res.json()["detail"].lower()

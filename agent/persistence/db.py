@@ -10,10 +10,10 @@ import time
 from typing import Any, Dict, List, Optional
 from agent.core.models import Task, TaskStatus, TaskType, TaskReport
 from agent.persistence.credentials import vault
-from agent.security.sanitizer import SecuritySanitizer
+from agent.security.sanitizer import SecuritySanitizer, get_shared_sanitizer
 
 DB_PATH = "agent_state.db"
-sanitizer = SecuritySanitizer()
+sanitizer = get_shared_sanitizer()
 
 
 class DatabaseWriteError(RuntimeError):
