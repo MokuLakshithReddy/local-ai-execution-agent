@@ -162,7 +162,8 @@ def test_permission_manager_levels():
         assert req2 is not None
 
         # Resolving approval
-        resolved = pm.resolve_approval(req.approval_id, approved=True)
+        resolved, code = pm.resolve_approval(req.approval_id, approved=True)
+        assert code == "RESOLVED"
         assert resolved.status == "APPROVED"
 
 
@@ -242,7 +243,7 @@ def test_criteria_driven_verification():
 
     # Case 3: Code modification with modified files AND passing tests -> COMPLETED
     auth_record = issue_trusted_execution_record(
-        run_id="run_auth_case3",
+        run_id="t3",
         runner="pytest",
         command="pytest tests/test_login.py",
         exit_code=0,
@@ -533,7 +534,7 @@ def test_verifier_relevance_and_anti_overstating():
     # 3. Explicitly requested criteria (e.g. linting) skipped -> PARTIALLY_COMPLETED
     ve3 = VerificationEngine()
     checkout_record = issue_trusted_execution_record(
-        run_id="run_checkout_legit",
+        run_id="t_lint",
         runner="pytest",
         command="pytest tests/test_checkout.py",
         exit_code=0,
@@ -567,7 +568,26 @@ def test_verifier_relevance_and_anti_overstating():
 
     # 4. Legitimate relevant test satisfies criteria
     ve4 = VerificationEngine()
-    ve4.record_check(relevant_test)
+    relevant_test_legit = VerificationCheck(
+        check_name="Checkout Tests",
+        check_type="test",
+        command="pytest tests/test_checkout.py",
+        success=True,
+        exit_code=0,
+        output="5 passed",
+        evidence_summary="Checkout tests passed.",
+        trusted_execution_record=issue_trusted_execution_record(
+            run_id="t_legit",
+            runner="pytest",
+            command="pytest tests/test_checkout.py",
+            exit_code=0,
+            total=5,
+            passed=5,
+            failed=0,
+            passed_nodes=["tests/test_checkout.py", "checkout"],
+        ),
+    )
+    ve4.record_check(relevant_test_legit)
     report_legit = ve4.evaluate_completion(
         task_id="t_legit",
         goal="Fix checkout bug in checkout.py",
@@ -596,14 +616,16 @@ def test_approval_race_conditions():
         assert req.approval_id in pm.pending_approvals
 
         # First resolution succeeds
-        resolved_first = pm.resolve_approval(req.approval_id, approved=True)
+        resolved_first, code_first = pm.resolve_approval(req.approval_id, approved=True)
         assert resolved_first is not None
+        assert code_first == "RESOLVED"
         assert resolved_first.status == "APPROVED"
         assert req.approval_id not in pm.pending_approvals
 
-        # Second duplicate/concurrent resolution returns None (already resolved)
-        resolved_second = pm.resolve_approval(req.approval_id, approved=True)
-        assert resolved_second is None
+        # Second duplicate/concurrent resolution returns ALREADY_RESOLVED
+        resolved_second, code_second = pm.resolve_approval(req.approval_id, approved=True)
+        assert code_second == "ALREADY_RESOLVED"
+        assert resolved_second.status == "APPROVED"
 
 
 @pytest.mark.asyncio
@@ -1798,13 +1820,18 @@ def test_verifier_rejects_exit_zero_generic_word_without_test_execution():
 
 
 def is_docker_daemon_available() -> bool:
-    """Checks whether the Docker CLI and daemon are operational."""
+    """Checks whether the Docker CLI and daemon are operational and able to run containers."""
     import shutil
     import subprocess
     if not shutil.which("docker"):
         return False
     try:
-        res = subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        res = subprocess.run(
+            ["docker", "run", "--rm", "python:3.12-slim", "echo", "ok"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
         return res.returncode == 0
     except Exception:
         return False
@@ -2087,7 +2114,20 @@ def test_credential_vault_stress_slow_writes_interrupted_and_permissions():
 def test_verifier_rejects_forged_execution_record():
     """Validates Finding 2:
     The verifier must reject any trusted_execution_record dictionary or record that lacks
-    valid cryptographic provenance from the verification subsystem, keeping the criterion UNVERIFIED."""
+    valid cryptographic provenance or is replayed from a different task/run_id, keeping the criterion UNVERIFIED."""
+    # Replay protection test: valid record issued for task_A cannot verify for task_B
+    record_task_a = issue_trusted_execution_record(
+        run_id="task_A",
+        runner="pytest",
+        command="pytest tests/test_auth.py",
+        exit_code=0,
+        total=1,
+        passed=1,
+        failed=0,
+        passed_nodes=["tests/test_auth.py::test_login"],
+    )
+    assert verify_trusted_execution_record(record_task_a, expected_run_id="task_A") is True
+    assert verify_trusted_execution_record(record_task_a, expected_run_id="task_B") is False
     ve = VerificationEngine()
     criteria = ["User authentication security"]
 
@@ -2122,7 +2162,7 @@ def test_verifier_rejects_forged_execution_record():
     # 2. Genuine record issued by verification subsystem with valid cryptographic provenance
     ve2 = VerificationEngine()
     genuine_record = issue_trusted_execution_record(
-        run_id="run_legit_1",
+        run_id="t_forge_2",
         runner="pytest",
         command="pytest tests/test_auth.py",
         exit_code=0,
@@ -2581,7 +2621,7 @@ def test_junit_xml_report_skipped_tests_handling_and_verification_rejection():
         assert parsed_pass["skipped"] == 1
 
         rec = issue_trusted_execution_record(
-            run_id="run_mixed",
+            run_id="t_skipped_verification",
             runner="pytest",
             command="pytest tests/test_auth.py",
             exit_code=0,
@@ -3307,7 +3347,7 @@ async def test_execution_engine_e2e_enforces_structured_evidence_for_code_modifi
         )
 
         genuine_record = issue_trusted_execution_record(
-            run_id="run_auth_e2e_genuine",
+                run_id="task_e2e_structured",
             runner="pytest",
             command="pytest tests/test_auth.py",
             exit_code=0,

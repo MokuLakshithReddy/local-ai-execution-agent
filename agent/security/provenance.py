@@ -774,10 +774,14 @@ def issue_trusted_execution_record(
     )
 
 
-def verify_trusted_execution_record(record: Any, secret: Optional[bytes] = None) -> bool:
+def verify_trusted_execution_record(
+    record: Any,
+    secret: Optional[bytes] = None,
+    expected_run_id: Optional[str] = None,
+) -> bool:
     """
-    Validates provenance, cryptographic integrity, and count consistency of a verification execution record.
-    Returns True only if the record was authentic, issued by the runtime, and untampered.
+    Validates provenance, cryptographic integrity, task/run identity binding, and count consistency of a verification execution record.
+    Returns True only if the record was authentic, bound to the correct run_id/task_id if specified, issued by the runtime, and untampered.
     """
     if record is None:
         return False
@@ -788,6 +792,10 @@ def verify_trusted_execution_record(record: Any, secret: Optional[bytes] = None)
         except Exception:
             return False
     elif not isinstance(record, TrustedExecutionRecord):
+        return False
+
+    if expected_run_id and record.run_id.strip() != expected_run_id.strip():
+        # Replay attempt: record belongs to a different task or run_id
         return False
 
     if record.exit_code != 0:

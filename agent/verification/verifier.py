@@ -123,7 +123,10 @@ def _is_legitimate_and_relevant_check(
     return False
 
 
-def _extract_executed_passed_test_nodes(check: VerificationCheck) -> List[str]:
+def _extract_executed_passed_test_nodes(
+    check: VerificationCheck,
+    expected_run_id: Optional[str] = None,
+) -> List[str]:
     """
     Extracts test node IDs, file targets, and test functions that were demonstrably EXECUTED and PASSED by a runner.
     Only valid if check exited with exit_code == 0 and check.success is True.
@@ -133,16 +136,16 @@ def _extract_executed_passed_test_nodes(check: VerificationCheck) -> List[str]:
     if check.exit_code != 0 or not check.success:
         return []
 
-    # 1. Validate cryptographic provenance of trusted execution record
+    # 1. Validate cryptographic provenance and task identity binding of trusted execution record
     if check.trusted_execution_record:
-        if verify_trusted_execution_record(check.trusted_execution_record):
+        if verify_trusted_execution_record(check.trusted_execution_record, expected_run_id=expected_run_id):
             if isinstance(check.trusted_execution_record, dict):
                 nodes = check.trusted_execution_record.get("passed_nodes", [])
             else:
                 nodes = getattr(check.trusted_execution_record, "passed_nodes", [])
             return [str(n).lower() for n in nodes]
         else:
-            # Forged or tampered execution record detected: refuse immediately
+            # Forged, tampered, or replayed execution record detected: refuse immediately
             return []
 
     # 2. Reject commands that are not direct executions of recognized test runners
@@ -309,7 +312,7 @@ class VerificationEngine:
                         target_test_stem = os.path.splitext(os.path.basename(target_test_clean))[0]
 
                     for check in relevant_passed_checks:
-                        passed_nodes = _extract_executed_passed_test_nodes(check)
+                        passed_nodes = _extract_executed_passed_test_nodes(check, expected_run_id=task_id)
 
                         # Extract skipped / failed nodes from trusted execution record if present
                         skipped_or_failed_nodes = set()
@@ -356,7 +359,7 @@ class VerificationEngine:
 
                         if node_matched:
                             matching_check = check
-                            has_structured = bool(check.trusted_execution_record and verify_trusted_execution_record(check.trusted_execution_record))
+                            has_structured = bool(check.trusted_execution_record and verify_trusted_execution_record(check.trusted_execution_record, expected_run_id=task_id))
                             if require_structured_evidence and not has_structured:
                                 matched_proof = f"Test node '{target_test}' matched console output, but lacks cryptographically signed structured runner evidence (trusted_execution_record)."
                                 matched_artifact = None
@@ -370,7 +373,7 @@ class VerificationEngine:
                 # Check 2: Structured verification assertion on check model
                 if not matching_check:
                     for check in relevant_passed_checks:
-                        passed_nodes = _extract_executed_passed_test_nodes(check)
+                        passed_nodes = _extract_executed_passed_test_nodes(check, expected_run_id=task_id)
 
                         for sa in getattr(check, "structured_assertions", []):
                             if sa.criterion.strip().lower() == criterion.strip().lower():
@@ -469,7 +472,7 @@ class VerificationEngine:
             ]
             if matching_checks:
                 best = matching_checks[0]
-                has_structured = bool(best.trusted_execution_record and verify_trusted_execution_record(best.trusted_execution_record))
+                has_structured = bool(best.trusted_execution_record and verify_trusted_execution_record(best.trusted_execution_record, expected_run_id=task_id))
                 if require_structured_evidence and ev_type == "test_execution" and not has_structured:
                     criteria_evidence.append(
                         CriterionEvidence(
@@ -558,7 +561,7 @@ class VerificationEngine:
                     )
             elif require_structured_evidence and any(
                 ((c.check_type == "test") or any(runner in (c.command or "").lower() for runner in ("pytest", "unittest", "vitest", "jest")))
-                and not bool(c.trusted_execution_record and verify_trusted_execution_record(c.trusted_execution_record))
+                and not bool(c.trusted_execution_record and verify_trusted_execution_record(c.trusted_execution_record, expected_run_id=task_id))
                 for c in relevant_passed_checks
             ):
                 final_status = TaskStatus.PARTIALLY_COMPLETED

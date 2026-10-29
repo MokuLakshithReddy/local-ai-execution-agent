@@ -30,6 +30,7 @@ class PermissionManager:
         self.pending_approvals: Dict[str, ApprovalRequest] = {}
         self.approval_history: Dict[str, ApprovalRequest] = {}
         self.approved_workspaces: set[str] = set()
+        self._global_sequence_id: int = 0
 
     def approve_workspace(self, workspace_path: str):
         """Registers a workspace directory as explicitly approved."""
@@ -111,6 +112,7 @@ class PermissionManager:
         reason: str,
     ) -> Tuple[bool, str, ApprovalRequest]:
         approval_id = str(uuid.uuid4())
+        self._global_sequence_id += 1
         req = ApprovalRequest(
             approval_id=approval_id,
             task_id=task_id,
@@ -119,19 +121,31 @@ class PermissionManager:
             permission_level=permission_level,
             reason=reason,
             status="PENDING",
+            sequence_id=self._global_sequence_id,
         )
         self.pending_approvals[approval_id] = req
         return False, f"Pending User Approval: {reason}", req
 
-    def resolve_approval(self, approval_id: str, approved: bool) -> ApprovalRequest | None:
+    def resolve_approval(self, approval_id: str, approved: bool) -> Tuple[ApprovalRequest | None, str]:
+        """
+        Resolves a pending approval request.
+        Returns (approval_request, resolution_code) where resolution_code is:
+        - "RESOLVED": successfully resolved now
+        - "ALREADY_RESOLVED": approval ID was previously resolved
+        - "NOT_FOUND": approval ID is unknown
+        """
+        if approval_id in self.approval_history:
+            return self.approval_history[approval_id], "ALREADY_RESOLVED"
+
         if approval_id not in self.pending_approvals:
-            return None
+            return None, "NOT_FOUND"
+
         req = self.pending_approvals.pop(approval_id)
         req.status = "APPROVED" if approved else "REJECTED"
         import time
         req.resolved_at = time.time()
         self.approval_history[approval_id] = req
-        return req
+        return req, "RESOLVED"
 
     def cancel_task_approvals(self, task_id: str) -> list[str]:
         """Prunes all pending approvals for a cancelled task and marks them CANCELLED in history."""

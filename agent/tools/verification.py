@@ -238,7 +238,7 @@ class RunVerificationCheckTool(BaseTool):
                     if parsed and is_success and parsed["total"] > 0 and parsed["passed"] > 0:
                         try:
                             trusted_record = issue_trusted_execution_record(
-                                run_id=call_id,
+                                run_id=kwargs.get("task_id") or kwargs.get("run_id") or call_id,
                                 runner="pytest",
                                 command=command,
                                 exit_code=exit_code if exit_code is not None else -1,

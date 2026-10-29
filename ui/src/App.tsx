@@ -64,6 +64,7 @@ interface ApprovalRequest {
   arguments: any
   permission_level: string
   reason: string
+  sequence_id?: number
 }
 
 interface DiffFile {
@@ -170,6 +171,11 @@ export default function App() {
 
   // Approval state & error handling
   const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null)
+  const pendingApprovalRef = useRef<ApprovalRequest | null>(null)
+  useEffect(() => {
+    pendingApprovalRef.current = pendingApproval
+  }, [pendingApproval])
+
   const [approvalResolving, setApprovalResolving] = useState(false)
   const [approvalError, setApprovalError] = useState<string | null>(null)
 
@@ -251,6 +257,34 @@ export default function App() {
     }
   }, [])
 
+  const fetchPendingApprovals = useCallback(async (tok?: string) => {
+    try {
+      const headers: Record<string, string> = {}
+      const token = tok || authTokenRef.current
+      if (token) headers['X-Agent-Auth-Token'] = token
+      const res = await fetch(`${API_BASE}/api/approvals/pending`, { headers })
+      if (res.ok) {
+        const data = await res.json()
+        const list: ApprovalRequest[] = data.approvals || []
+        if (list.length > 0) {
+          // Select the latest pending approval or active run's approval
+          const activeRunApproval = currentTaskIdRef.current
+            ? list.find((a) => a.task_id === currentTaskIdRef.current)
+            : list[list.length - 1]
+          const target = activeRunApproval || list[list.length - 1]
+          setPendingApproval(target)
+          setApprovalError(null)
+          setTaskStatus('PENDING_APPROVAL')
+        } else {
+          setPendingApproval(null)
+          setApprovalError(null)
+        }
+      }
+    } catch {
+      // Ignore pending approvals fetch error
+    }
+  }, [])
+
   const loadTaskHistory = useCallback(async (tok?: string) => {
     try {
       const headers: Record<string, string> = {}
@@ -283,10 +317,18 @@ export default function App() {
   const handleSocketEvent = useCallback((type: string, data: any) => {
     const timestamp = new Date().toLocaleTimeString()
 
+    // Validate task_id for task-scoped events if task_id is present in event data
+    if (
+      data &&
+      data.task_id &&
+      currentTaskIdRef.current &&
+      data.task_id !== currentTaskIdRef.current
+    ) {
+      // Ignore stale event belonging to another or previous task run
+      return
+    }
+
     if (type === 'task_status') {
-      if (data.task_id && currentTaskIdRef.current && data.task_id !== currentTaskIdRef.current) {
-        return
-      }
       setTaskStatus(data.status)
     } else if (type === 'step_start') {
       setCurrentStep(data.step)
@@ -336,25 +378,40 @@ export default function App() {
       ])
       fetchDiff()
     } else if (type === 'approval_required') {
-      setTaskStatus('PENDING_APPROVAL')
-      setPendingApproval(data.approval)
-      setApprovalError(null)
+      // Sequence and task_id validation
+      const currentPending = pendingApprovalRef.current
+      if (data.approval) {
+        if (
+          currentPending &&
+          data.approval.sequence_id !== undefined &&
+          currentPending.sequence_id !== undefined &&
+          data.approval.sequence_id < currentPending.sequence_id
+        ) {
+          // Reject older / stale approval event
+          return
+        }
+        setTaskStatus('PENDING_APPROVAL')
+        setPendingApproval(data.approval)
+        setApprovalError(null)
+      }
     } else if (type === 'approval_resolved') {
+      const currentPending = pendingApprovalRef.current
+      if (
+        currentPending &&
+        data.approval_id &&
+        currentPending.approval_id !== data.approval_id
+      ) {
+        // Unrelated or old approval resolution; ignore
+        return
+      }
       setPendingApproval(null)
       setApprovalError(null)
     } else if (type === 'task_completed') {
-      // Ensure the report belongs to the currently displayed task run
-      if (data.task_id && currentTaskIdRef.current && data.task_id !== currentTaskIdRef.current) {
-        return
-      }
       setTaskStatus(data.status)
       setFinalReport(data.report)
       fetchDiff()
       loadTaskHistory()
     } else if (type === 'task_error') {
-      if (data.task_id && currentTaskIdRef.current && data.task_id !== currentTaskIdRef.current) {
-        return
-      }
       setTaskStatus('FAILED')
       setTimeline((prev) => [
         ...prev,
@@ -434,6 +491,7 @@ export default function App() {
 
       ws.onopen = () => {
         setWsStatus('connected')
+        fetchPendingApprovals(tok)
       }
 
       ws.onmessage = (event) => {
@@ -461,7 +519,7 @@ export default function App() {
         setupWebSocketRef.current?.()
       }, 4000)
     }
-  }, [handleSocketEvent])
+  }, [handleSocketEvent, fetchPendingApprovals])
 
   useEffect(() => {
     setupWebSocketRef.current = setupWebSocket
