@@ -439,12 +439,12 @@ async def save_settings(req: SaveSettingsRequest):
         settings["gemini_api_key"] = req.gemini_api_key
     if req.ollama_base_url is not None:
         settings["ollama_base_url"] = req.ollama_base_url
-    if req.auto_approve_routine is not None:
-        settings["auto_approve_routine"] = req.auto_approve_routine
-        permission_manager.policy.auto_approve_routine = req.auto_approve_routine
-    if req.auto_approve_sensitive is not None:
-        settings["auto_approve_sensitive"] = req.auto_approve_sensitive
-        permission_manager.policy.auto_approve_sensitive = req.auto_approve_sensitive
+    new_policy_routine = req.auto_approve_routine
+    new_policy_sensitive = req.auto_approve_sensitive
+    if new_policy_routine is not None:
+        settings["auto_approve_routine"] = new_policy_routine
+    if new_policy_sensitive is not None:
+        settings["auto_approve_sensitive"] = new_policy_sensitive
 
     try:
         await db.save_setting("app_settings", settings)
@@ -453,6 +453,12 @@ async def save_settings(req: SaveSettingsRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Security Error: Failed to encrypt credentials safely ({str(e)}). Plaintext persistence rejected.",
         )
+
+    # Atomically apply updated policies to live permission manager ONLY after successful persistence
+    if new_policy_routine is not None:
+        permission_manager.policy.auto_approve_routine = new_policy_routine
+    if new_policy_sensitive is not None:
+        permission_manager.policy.auto_approve_sensitive = new_policy_sensitive
     if req.current_workspace:
         real_ws = await validate_approved_workspace(req.current_workspace)
         await db.save_setting("current_workspace", real_ws)
@@ -462,6 +468,14 @@ async def save_settings(req: SaveSettingsRequest):
 
 @app.post("/api/tasks", dependencies=[Depends(verify_auth)])
 async def create_task(req: CreateTaskRequest):
+    # Enforce global active concurrency limits
+    active_count = len([t for t, is_active in engine._active_tasks.items() if is_active])
+    if active_count >= 10:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Server capacity reached: Maximum concurrent tasks (10) exceeded. Please wait for active tasks to complete.",
+        )
+
     if req.max_steps < 1 or req.max_steps > 100:
         raise HTTPException(
             status_code=400,
@@ -520,6 +534,13 @@ async def create_task(req: CreateTaskRequest):
             parsed_u = urllib.parse.urlparse(resolved_base_url)
             if parsed_u.scheme not in ("http", "https") or not parsed_u.netloc:
                 raise HTTPException(status_code=400, detail="Invalid custom_base_url: must be a valid HTTP or HTTPS URL.")
+            host_lower = (parsed_u.hostname or "").lower()
+            is_loopback = host_lower in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+            if parsed_u.scheme == "http" and not is_loopback:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Insecure endpoint rejected: Remote custom endpoints must use HTTPS to prevent plaintext transmission of API credentials.",
+                )
 
     # Launch in background and register with execution engine for prompt cancellation
     bg_task = asyncio.create_task(

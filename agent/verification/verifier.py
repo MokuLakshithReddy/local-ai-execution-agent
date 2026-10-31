@@ -553,11 +553,17 @@ class VerificationEngine:
 
         elif task_type == TaskType.CODE_MODIFICATION:
             # Code modifications MUST prove that files were actually changed AND verified
-            if not modified_files:
+            has_working_tree_diff = bool(
+                isinstance(git_diff_summary, str)
+                and git_diff_summary.strip()
+                and git_diff_summary.strip() != "(no git diff available)"
+                and git_diff_summary.strip() != "(clean working tree)"
+            )
+            if not modified_files and not has_working_tree_diff:
                 final_status = TaskStatus.PARTIALLY_COMPLETED
                 criteria_satisfied = False
                 risks.append(
-                    "Unmet Acceptance Criteria: Task requested code modifications, but no files were created or modified in the workspace."
+                    "Unmet Acceptance Criteria: Task requested code modifications, but no files were created or modified in the workspace (all write operations were no-ops or produced zero working tree diffs)."
                 )
             elif unresolved_failed_checks:
                 final_status = TaskStatus.PARTIALLY_COMPLETED

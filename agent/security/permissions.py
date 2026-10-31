@@ -9,6 +9,25 @@ from agent.core.models import PermissionLevel, ApprovalRequest
 
 PATH_ARGUMENT_KEYS = ("path", "target_path", "file_path", "relative_path")
 
+import re
+
+# High-risk patterns that dynamically escalate terminal commands to DESTRUCTIVE_OPERATION
+DESTRUCTIVE_COMMAND_REGEXES = [
+    re.compile(r"\bgit\s+clean\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+reset\s+--hard\b", re.IGNORECASE),
+    re.compile(r"\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-rf|-fr)\b", re.IGNORECASE),
+    re.compile(r"\brd\s+/[sS]\b", re.IGNORECASE),
+    re.compile(r"\brmdir\s+/[sS]\b", re.IGNORECASE),
+    re.compile(r"\bdrop\s+(database|table)\b", re.IGNORECASE),
+    re.compile(r"\btruncate\s+(table\s+)?", re.IGNORECASE),
+    re.compile(r"\bmkfs\b", re.IGNORECASE),
+    re.compile(r"\bformat\s+[a-zA-Z]:", re.IGNORECASE),
+]
+
+
+MAX_PENDING_APPROVALS = 200
+MAX_APPROVAL_HISTORY = 500
+
 
 class PermissionPolicy:
     def __init__(
@@ -67,37 +86,51 @@ class PermissionManager:
                         None,
                     )
 
-        # 2. Check permission level against policy
-        if permission_level == PermissionLevel.READ_ONLY:
+        # 2. Check permission level against policy with dynamic risk escalation for commands
+        effective_level = permission_level
+        destructive_reason = None
+        if tool_name == "run_command" and "command" in arguments:
+            cmd_str = str(arguments.get("command", "")).strip()
+            for pattern in DESTRUCTIVE_COMMAND_REGEXES:
+                if pattern.search(cmd_str):
+                    effective_level = PermissionLevel.DESTRUCTIVE_OPERATION
+                    destructive_reason = f"High risk: Destructive terminal command ('{cmd_str[:60]}...') requires explicit human authorization."
+                    break
+
+        if effective_level == PermissionLevel.READ_ONLY:
             return True, "Permitted: Read-only operation within workspace.", None
 
-        if permission_level == PermissionLevel.ROUTINE_MODIFICATION:
+        if effective_level == PermissionLevel.ROUTINE_MODIFICATION:
             if self.policy.auto_approve_routine:
                 return True, "Permitted: Routine modification within workspace.", None
             else:
                 return self._create_approval_request(
-                    task_id, tool_name, arguments, permission_level, "Routine modification requires review."
+                    task_id, tool_name, arguments, effective_level, "Routine modification requires review."
                 )
 
-        if permission_level == PermissionLevel.SENSITIVE_OPERATION:
+        if effective_level == PermissionLevel.SENSITIVE_OPERATION:
             if self.policy.auto_approve_sensitive:
                 return True, "Permitted: Sensitive operation enabled by policy.", None
             else:
                 return self._create_approval_request(
-                    task_id, tool_name, arguments, permission_level, "Sensitive action requires user authorization."
+                    task_id, tool_name, arguments, effective_level, "Sensitive action requires user authorization."
                 )
 
-        if permission_level == PermissionLevel.DESTRUCTIVE_OPERATION:
+        if effective_level == PermissionLevel.DESTRUCTIVE_OPERATION:
             if self.policy.require_approval_destructive:
                 return self._create_approval_request(
-                    task_id, tool_name, arguments, permission_level, "High risk: Destructive action requires explicit approval."
+                    task_id,
+                    tool_name,
+                    arguments,
+                    effective_level,
+                    destructive_reason or "High risk: Destructive action requires explicit approval.",
                 )
             return True, "Permitted: Destructive action allowed by policy override.", None
 
-        if permission_level == PermissionLevel.EXTERNAL_SIDE_EFFECT:
+        if effective_level == PermissionLevel.EXTERNAL_SIDE_EFFECT:
             if self.policy.require_approval_external:
                 return self._create_approval_request(
-                    task_id, tool_name, arguments, permission_level, "External side effect requires explicit approval."
+                    task_id, tool_name, arguments, effective_level, "External side effect requires explicit approval."
                 )
             return True, "Permitted: External side effect allowed by policy override.", None
 
@@ -111,6 +144,12 @@ class PermissionManager:
         permission_level: PermissionLevel,
         reason: str,
     ) -> Tuple[bool, str, ApprovalRequest]:
+        # Bound pending approvals count to prevent memory leaks / exhaustion
+        if len(self.pending_approvals) >= MAX_PENDING_APPROVALS:
+            # Evict oldest pending approval as expired
+            oldest_id = next(iter(self.pending_approvals))
+            self.expire_approval(oldest_id)
+
         approval_id = str(uuid.uuid4())
         self._global_sequence_id += 1
         req = ApprovalRequest(
@@ -125,6 +164,12 @@ class PermissionManager:
         )
         self.pending_approvals[approval_id] = req
         return False, f"Pending User Approval: {reason}", req
+
+    def _prune_history(self):
+        """Enforces a FIFO retention limit on approval history."""
+        while len(self.approval_history) > MAX_APPROVAL_HISTORY:
+            oldest_key = next(iter(self.approval_history))
+            self.approval_history.pop(oldest_key, None)
 
     def resolve_approval(self, approval_id: str, approved: bool) -> Tuple[ApprovalRequest | None, str]:
         """
@@ -145,6 +190,7 @@ class PermissionManager:
         import time
         req.resolved_at = time.time()
         self.approval_history[approval_id] = req
+        self._prune_history()
         return req, "RESOLVED"
 
     def cancel_task_approvals(self, task_id: str) -> list[str]:

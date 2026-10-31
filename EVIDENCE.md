@@ -4,9 +4,9 @@
 
 ## 1. Provenance & Execution Context
 
-- **Commit SHA**: `a07fc550ba35bd522c41d1b11a2a4076d7bc033c`
+- **Commit SHA**: `8e75c018c642e245b8c5a4064726dd2408ef90b2`
 - **Git Branch**: `main`
-- **Generated At**: `2026-10-29 22:33:18 UTC`
+- **Generated At**: `2026-10-31 16:40:34 UTC`
 - **Operating System**: `Windows 11 (AMD64)`
 - **Python Runtime**: `3.12.10`
 - **Primary Sandbox Mode**: `Kernel Job Object / Local Host Supervisor`
@@ -15,11 +15,11 @@
 
 | Metric | Observed Value | Status |
 |---|---|---|
-| **Total Tests** | `108` | Verified |
-| **Tests Passed** | `108` | Pass |
+| **Total Tests** | `114` | Verified |
+| **Tests Passed** | `114` | Pass |
 | **Tests Failed** | `0` | Pass (0 failures) |
 | **Tests Skipped** | `0` | Deselected / Platform Conditional |
-| **Execution Duration** | `43.46s` | Bounded |
+| **Execution Duration** | `37.44s` | Bounded |
 | **Pass Rate** | `**100.0%**` | 100.0% Pass |
 
 ## 3. Security Boundary Verification Summary

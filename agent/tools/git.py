@@ -1,27 +1,91 @@
 """
 Git inspection and safe checkpoint tools.
+Hardened against repository-configured command execution (fsmonitor, textconv, ext-diff).
+Uses scrubbed environments, strict timeouts, bounded output buffers, and safe git configuration overrides.
 """
 import asyncio
+import os
+import sys
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Tuple
 from agent.tools.base import BaseTool
 from agent.core.models import PermissionLevel, ActionResult
+from agent.tools.terminal import get_isolated_environment, _kill_process_tree
+
+MAX_GIT_OUTPUT_BYTES = 100_000  # 100 KB hard cap on git diff/status output
+GIT_SUBPROCESS_TIMEOUT_SECONDS = 15.0  # 15s timeout for git inspection
+
+# Mandatory git configuration overrides to neutralize repository-controlled hooks/helpers
+SAFE_GIT_CONFIG_OVERRIDES = [
+    "-c", "core.fsmonitor=false",
+    "-c", "core.hooksPath=",
+    "-c", "diff.autorefreshindex=false",
+    "-c", "core.pager=cat",
+]
 
 
-async def _run_git(args: list[str], cwd: str) -> tuple[int, str, str]:
+async def _run_git(
+    args: list[str],
+    cwd: str,
+    timeout: float = GIT_SUBPROCESS_TIMEOUT_SECONDS,
+    max_output_bytes: int = MAX_GIT_OUTPUT_BYTES,
+) -> tuple[int, str, str]:
+    """
+    Executes a Git inspection command with strict security guardrails:
+    - Neutralizes core.fsmonitor, core.hooksPath, and external diff/textconv helpers.
+    - Uses an isolated environment (scrubs all host API keys and tokens).
+    - Enforces subprocess timeout with recursive process tree termination.
+    - Limits streaming output memory to prevent denial of service.
+    """
     try:
-        cmd = ["git"] + args
+        # Build command with safe global config overrides preceding user arguments
+        cmd = ["git"] + SAFE_GIT_CONFIG_OVERRIDES + args
+
+        # Scrub environment: only safe allowlisted variables, zero API keys
+        env = get_isolated_environment(allow_network=False)
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_OPTIONAL_LOCKS"] = "0"
+        env["GIT_NO_LAZY_FETCH"] = "1"
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
-        stdout, stderr = await proc.communicate()
+
+        try:
+            stdout_data, stderr_data = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            if proc.pid:
+                _kill_process_tree(proc.pid)
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return (-1, "", f"Git execution timed out after {timeout:.1f} seconds.")
+
+        # Enforce bounded output
+        out_truncated = len(stdout_data) > max_output_bytes
+        err_truncated = len(stderr_data) > max_output_bytes
+
+        out_str = stdout_data[:max_output_bytes].decode("utf-8", errors="replace")
+        err_str = stderr_data[:max_output_bytes].decode("utf-8", errors="replace")
+
+        if out_truncated:
+            out_str += f"\n... [GIT OUTPUT TRUNCATED AT {max_output_bytes} BYTES]"
+        if err_truncated:
+            err_str += f"\n... [GIT STDERR TRUNCATED AT {max_output_bytes} BYTES]"
+
         return (
             proc.returncode if proc.returncode is not None else 0,
-            stdout.decode("utf-8", errors="replace"),
-            stderr.decode("utf-8", errors="replace"),
+            out_str,
+            err_str,
         )
     except FileNotFoundError:
         return (-1, "", "Git binary not found in system PATH.")
@@ -35,7 +99,7 @@ class GitStatusTool(BaseTool):
     permission_level = PermissionLevel.READ_ONLY
 
     def get_parameters_schema(self) -> Dict[str, Any]:
-        return {"type": "object", "properties": {}}
+        return {"type": "object", "properties": {}, "additionalProperties": False}
 
     async def execute(self, workspace_path: str, **kwargs) -> ActionResult:
         t0 = time.time()
@@ -76,6 +140,7 @@ class GitDiffTool(BaseTool):
                     "default": "",
                 }
             },
+            "additionalProperties": False,
         }
 
     async def execute(self, workspace_path: str, **kwargs) -> ActionResult:
@@ -83,12 +148,15 @@ class GitDiffTool(BaseTool):
         call_id = kwargs.get("call_id", "git_diff")
         file_path = kwargs.get("file_path", "")
 
-        args = ["diff", "HEAD"] if not file_path else ["diff", "HEAD", "--", file_path]
+        # Explicitly disable external diff and textconv helpers to prevent host execution attacks
+        base_diff_args = ["diff", "--no-ext-diff", "--no-textconv"]
+
+        args = base_diff_args + ["HEAD"] if not file_path else base_diff_args + ["HEAD", "--", file_path]
         code, out, err = await _run_git(args, workspace_path)
 
-        # Fallback to plain diff if HEAD doesn't exist yet (e.g., brand new repo)
+        # Fallback to plain diff if HEAD doesn't exist yet (e.g., brand new repo before initial commit)
         if code != 0:
-            fallback_args = ["diff"] if not file_path else ["diff", "--", file_path]
+            fallback_args = base_diff_args if not file_path else base_diff_args + ["--", file_path]
             code, out, err = await _run_git(fallback_args, workspace_path)
 
         if code != 0:

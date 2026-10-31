@@ -29,6 +29,15 @@ class TaskType(str, Enum):
     TEST_AND_VERIFY = "TEST_AND_VERIFY"     # e.g., add test coverage, verify build, benchmark
 
 
+class VerificationCheckType(str, Enum):
+    TEST = "test"
+    BUILD = "build"
+    LINT = "lint"
+    TYPECHECK = "typecheck"
+    GIT_DIFF = "git_diff"
+    CUSTOM = "custom"
+
+
 class PermissionLevel(str, Enum):
     READ_ONLY = "READ_ONLY"                         # e.g., inspect files, git status
     ROUTINE_MODIFICATION = "ROUTINE_MODIFICATION"   # e.g., edit source code, write tests
@@ -92,7 +101,7 @@ class StructuredAssertion(BaseModel):
 
 class VerificationCheck(BaseModel):
     check_name: str
-    check_type: str  # test, build, lint, git_diff, custom
+    check_type: Union[VerificationCheckType, str] = VerificationCheckType.TEST
     command: Optional[str] = None
     success: bool
     exit_code: Optional[int] = None

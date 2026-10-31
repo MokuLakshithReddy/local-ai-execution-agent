@@ -109,6 +109,7 @@ class ExecutionEngine:
         verifier = VerificationEngine()
         actions_taken: List[str] = []
         modified_files: List[str] = []
+        actually_modified_files: List[str] = []
         recent_tool_signatures: List[str] = []
 
         # Initialize task in database
@@ -390,7 +391,8 @@ class ExecutionEngine:
                     for bad_arg in (
                         "extra_mounts", "allowed_paths", "container_user", "container_image",
                         "image", "memory_limit", "pids_limit", "sandbox_mode", "require_sandbox",
-                        "untrusted_workload", "trusted_development_only"
+                        "untrusted_workload", "trusted_development_only", "container_memory",
+                        "container_pids", "container_name", "allow_network",
                     ):
                         tool_args.pop(bad_arg, None)
 
@@ -430,6 +432,11 @@ class ExecutionEngine:
                     if tool_name in ("write_file", "patch_file") and result.success:
                         file_p = tool_args.get("file_path")
                         if file_p:
+                            is_noop = False
+                            if result.artifacts:
+                                is_noop = result.artifacts.get("is_noop", False) or not result.artifacts.get("content_changed", True)
+                            if not is_noop:
+                                actually_modified_files.append(file_p)
                             modified_files.append(file_p)
 
                     # If verification tool, register in VerificationEngine
@@ -503,14 +510,14 @@ class ExecutionEngine:
                     task_id=task.id,
                     goal=task.goal,
                     actions_taken=actions_taken,
-                    modified_files=modified_files,
+                    modified_files=actually_modified_files,
                     task_type=task.task_type,
                     task_current_status=task.status,
                     git_diff_summary=diff_summary,
                     unresolved_notes=[task.error] if task.error else [],
                     acceptance_criteria=task.acceptance_criteria,
                     criterion_bindings=task.criterion_bindings,
-                    require_structured_evidence=(task.task_type == TaskType.CODE_MODIFICATION),
+                    require_structured_evidence=(task.task_type in (TaskType.CODE_MODIFICATION, TaskType.TEST_AND_VERIFY)),
                 )
 
                 task.final_report = final_report

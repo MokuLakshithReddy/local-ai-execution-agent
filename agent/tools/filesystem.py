@@ -308,16 +308,32 @@ class WriteFileTool(BaseTool):
             os.makedirs(os.path.dirname(target_file), exist_ok=True)
 
             is_new = not os.path.exists(target_file)
+            content_changed = True
+            if not is_new:
+                try:
+                    with open(target_file, "r", encoding="utf-8", errors="replace") as f_prev:
+                        prev_content = f_prev.read()
+                    content_changed = (prev_content != content)
+                except Exception:
+                    content_changed = True
+
             with open(target_file, "w", encoding="utf-8") as f:
                 f.write(content)
 
-            msg = f"Successfully {'created' if is_new else 'updated'} {file_path} ({len(content)} characters)."
+            status_verb = "created" if is_new else ("updated" if content_changed else "re-written without changes (no-op)")
+            msg = f"Successfully {status_verb} {file_path} ({len(content)} characters)."
             return ActionResult(
                 call_id=call_id,
                 tool_name=self.name,
                 success=True,
                 output=msg,
-                artifacts={"file_path": file_path, "is_new": is_new, "bytes_written": len(content.encode("utf-8"))},
+                artifacts={
+                    "file_path": file_path,
+                    "is_new": is_new,
+                    "content_changed": content_changed,
+                    "is_noop": not content_changed,
+                    "bytes_written": len(content.encode("utf-8")),
+                },
                 execution_time_ms=(time.time() - t0) * 1000,
             )
         except Exception as e:
@@ -399,6 +415,7 @@ class PatchFileTool(BaseTool):
                 )
 
             new_content = content.replace(target, replacement, 1)
+            content_changed = (content != new_content)
             with open(target_file, "w", encoding="utf-8") as f:
                 f.write(new_content)
 
@@ -406,8 +423,12 @@ class PatchFileTool(BaseTool):
                 call_id=call_id,
                 tool_name=self.name,
                 success=True,
-                output=f"Successfully patched {file_path}.",
-                artifacts={"file_path": file_path},
+                output=f"Successfully patched {file_path}." if content_changed else f"Patched {file_path} (replacement was identical to target; no content change).",
+                artifacts={
+                    "file_path": file_path,
+                    "content_changed": content_changed,
+                    "is_noop": not content_changed,
+                },
                 execution_time_ms=(time.time() - t0) * 1000,
             )
         except Exception as e:
@@ -432,12 +453,17 @@ class SearchFilesTool(BaseTool):
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Regex or string query to search for.",
+                    "description": "Text substring or regex pattern to search for.",
                 },
                 "file_extension": {
                     "type": "string",
                     "description": "Optional file extension filter, e.g. '.py' or '.ts'.",
                     "default": "",
+                },
+                "is_regex": {
+                    "type": "boolean",
+                    "description": "Set to true to interpret query as a regular expression. Defaults to false (safe literal substring search).",
+                    "default": False,
                 },
             },
             "required": ["query"],
@@ -449,6 +475,7 @@ class SearchFilesTool(BaseTool):
         call_id = kwargs.get("call_id", "search_files")
         query = (kwargs.get("query") or "").strip()
         ext = kwargs.get("file_extension", "")
+        is_regex = bool(kwargs.get("is_regex", False))
 
         if not query:
             return ActionResult(
@@ -470,6 +497,17 @@ class SearchFilesTool(BaseTool):
                 execution_time_ms=(time.time() - t0) * 1000,
             )
 
+        # Guard against pathological ReDoS regex patterns with nested repetition
+        if is_regex and re.search(r"\([^)]*[*+][^)]*\)[*+]", query):
+            return ActionResult(
+                call_id=call_id,
+                tool_name=self.name,
+                success=False,
+                output="",
+                error="Potentially catastrophic regex backtracking pattern rejected (nested quantifiers detected). Use literal search instead.",
+                execution_time_ms=(time.time() - t0) * 1000,
+            )
+
         try:
             workspace_real = os.path.realpath(workspace_path)
             if not os.path.isdir(workspace_real):
@@ -483,10 +521,13 @@ class SearchFilesTool(BaseTool):
                 )
 
             def _sync_search() -> tuple[list[str], bool]:
-                try:
-                    pattern = re.compile(query, re.IGNORECASE)
-                except re.error:
-                    pattern = re.compile(re.escape(query), re.IGNORECASE)
+                query_lower = query.lower()
+                pattern = None
+                if is_regex:
+                    try:
+                        pattern = re.compile(query, re.IGNORECASE)
+                    except re.error as e:
+                        pattern = None
 
                 matches = []
                 max_matches = 50
@@ -534,7 +575,13 @@ class SearchFilesTool(BaseTool):
                                         truncated = True
                                         break
                                     line_sample = line[:1000]
-                                    if pattern.search(line_sample):
+                                    matched = False
+                                    if pattern:
+                                        matched = bool(pattern.search(line_sample))
+                                    else:
+                                        matched = (query_lower in line_sample.lower())
+
+                                    if matched:
                                         matches.append(f"{rel_p}:{idx}: {line.strip()[:160]}")
                                         if len(matches) >= max_matches:
                                             break
@@ -548,7 +595,20 @@ class SearchFilesTool(BaseTool):
 
                 return matches, truncated
 
-            matches, is_truncated = await asyncio.to_thread(_sync_search)
+            try:
+                matches, is_truncated = await asyncio.wait_for(
+                    asyncio.to_thread(_sync_search),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                return ActionResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    success=False,
+                    output="",
+                    error="Search execution timed out after 15.0 seconds. Use literal search or narrow file_extension.",
+                    execution_time_ms=(time.time() - t0) * 1000,
+                )
 
             output = "\n".join(matches) if matches else "No matching files found."
             if is_truncated:

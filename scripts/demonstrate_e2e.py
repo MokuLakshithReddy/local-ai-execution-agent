@@ -20,7 +20,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -446,7 +446,7 @@ class EndToEndDemonstrator:
         ]
         return "\n".join(md)
 
-    async def run(self) -> str:
+    async def run(self, report_path: Optional[str] = None) -> str:
         with tempfile.TemporaryDirectory() as temp_root:
             repo_dir = self._setup_disposable_repo(temp_root)
             self.log("SETUP", f"Disposable Git repository initialized at {repo_dir}.")
@@ -462,15 +462,16 @@ class EndToEndDemonstrator:
 
             report_md = self.generate_demo_report(s1_data, s2_data, s3_data)
 
-            # Write DEMO_RUN.md to workspace
-            demo_run_path = os.path.join(os.getcwd(), "DEMO_RUN.md")
-            with open(demo_run_path, "w", encoding="utf-8") as f:
-                f.write(report_md)
+            # Write demonstration report only if explicitly configured
+            if report_path:
+                with open(report_path, "w", encoding="utf-8") as f:
+                    f.write(report_md)
+                self.log("OUTPUT", f"Wrote authoritative demonstration report to {report_path}")
 
-            self.log("OUTPUT", f"Wrote authoritative demonstration report to {demo_run_path}")
             return report_md
 
 
 if __name__ == "__main__":
     demo = EndToEndDemonstrator()
-    asyncio.run(demo.run())
+    default_report_path = os.path.join(os.getcwd(), "DEMO_RUN.md")
+    asyncio.run(demo.run(report_path=default_report_path))

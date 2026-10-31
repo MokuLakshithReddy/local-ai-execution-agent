@@ -170,18 +170,23 @@ def test_permission_manager_levels():
 @pytest.mark.asyncio
 async def test_terminal_environment_allowlist():
     """Validates that sensitive host environment variables are excluded from child execution."""
-    os.environ["OPENAI_API_KEY"] = "sk-super-secret-host-key"
-    os.environ["CUSTOM_HOST_SECRET"] = "host_secret_value"
-    os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
+    orig_env = dict(os.environ)
+    try:
+        os.environ["OPENAI_API_KEY"] = "sk-super-secret-host-key"
+        os.environ["CUSTOM_HOST_SECRET"] = "host_secret_value"
+        os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
 
-    with tempfile.TemporaryDirectory() as temp_dir:
-        tool = RunCommandTool()
-        # Print environment keys in child process
-        cmd = f'"{sys.executable}" -c "import os; print(\'KEY_FOUND:\', \'OPENAI_API_KEY\' in os.environ, \'CUSTOM_FOUND:\', \'CUSTOM_HOST_SECRET\' in os.environ)"'
-        res = await tool.execute(temp_dir, command=cmd, sandbox_mode="host", require_sandbox=False)
-        assert res.success is True
-        assert "KEY_FOUND: False" in res.output
-        assert "CUSTOM_FOUND: False" in res.output
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tool = RunCommandTool()
+            # Print environment keys in child process
+            cmd = f'"{sys.executable}" -c "import os; print(\'KEY_FOUND:\', \'OPENAI_API_KEY\' in os.environ, \'CUSTOM_FOUND:\', \'CUSTOM_HOST_SECRET\' in os.environ)"'
+            res = await tool.execute(temp_dir, command=cmd, sandbox_mode="host", require_sandbox=False)
+            assert res.success is True
+            assert "KEY_FOUND: False" in res.output
+            assert "CUSTOM_FOUND: False" in res.output
+    finally:
+        os.environ.clear()
+        os.environ.update(orig_env)
 
 
 @pytest.mark.asyncio
@@ -669,78 +674,85 @@ async def test_task_interruption_and_server_restart():
 @pytest.mark.asyncio
 async def test_end_to_end_edit_test_fix_lifecycle():
     """Validates complete end-to-end edit -> test -> fail -> patch -> pass lifecycle."""
-    os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
-    with tempfile.TemporaryDirectory() as ws_dir:
-        write_tool = WriteFileTool()
-        patch_tool = PatchFileTool()
-        terminal_tool = RunCommandTool()
-        ve = VerificationEngine()
+    orig_unisolated = os.environ.get("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION")
+    try:
+        os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
+        with tempfile.TemporaryDirectory() as ws_dir:
+            write_tool = WriteFileTool()
+            patch_tool = PatchFileTool()
+            terminal_tool = RunCommandTool()
+            ve = VerificationEngine()
 
-        # 1. Write buggy Python file (returns 41 instead of 42)
-        code = (
-            "def calculate_answer():\n"
-            "    return 41\n"
-            "\n"
-            "if __name__ == '__main__':\n"
-            "    assert calculate_answer() == 42, 'Incorrect answer'\n"
-        )
-        await write_tool.execute(ws_dir, file_path="calc.py", content=code)
-
-        # 2. Run test - fails as expected
-        cmd_res = await terminal_tool.execute(ws_dir, command=f'"{sys.executable}" calc.py', sandbox_mode="host", require_sandbox=False)
-        assert cmd_res.success is False
-        assert "AssertionError: Incorrect answer" in cmd_res.output or "AssertionError" in str(cmd_res.error)
-
-        ve.record_check(
-            VerificationCheck(
-                check_name="Initial Calc Check",
-                check_type="test",
-                command="python calc.py",
-                success=False,
-                exit_code=1,
-                output="AssertionError",
-                evidence_summary="Initial verification failed as expected.",
+            # 1. Write buggy Python file (returns 41 instead of 42)
+            code = (
+                "def calculate_answer():\n"
+                "    return 41\n"
+                "\n"
+                "if __name__ == '__main__':\n"
+                "    assert calculate_answer() == 42, 'Incorrect answer'\n"
             )
-        )
+            await write_tool.execute(ws_dir, file_path="calc.py", content=code)
 
-        # 3. Patch the file to fix the bug
-        patch_res = await patch_tool.execute(
-            ws_dir,
-            file_path="calc.py",
-            target_content="return 41",
-            replacement_content="return 42",
-        )
-        assert patch_res.success is True
+            # 2. Run test - fails as expected
+            cmd_res = await terminal_tool.execute(ws_dir, command=f'"{sys.executable}" calc.py', sandbox_mode="host", require_sandbox=False)
+            assert cmd_res.success is False
+            assert "AssertionError: Incorrect answer" in cmd_res.output or "AssertionError" in str(cmd_res.error)
 
-        # 4. Re-run test - succeeds with exit code 0
-        cmd_res2 = await terminal_tool.execute(ws_dir, command=f'"{sys.executable}" calc.py', sandbox_mode="host", require_sandbox=False)
-        assert cmd_res2.success is True
-        assert cmd_res2.artifacts["exit_code"] == 0
-
-        ve.record_check(
-            VerificationCheck(
-                check_name="Fixed Calc Check",
-                check_type="test",
-                command="python calc.py",
-                success=True,
-                exit_code=0,
-                output="Success",
-                evidence_summary="Fixed verification passed with exit code 0.",
+            ve.record_check(
+                VerificationCheck(
+                    check_name="Initial Calc Check",
+                    check_type="test",
+                    command="python calc.py",
+                    success=False,
+                    exit_code=1,
+                    output="AssertionError",
+                    evidence_summary="Initial verification failed as expected.",
+                )
             )
-        )
 
-        # 5. Evaluate completion with verifier
-        report = ve.evaluate_completion(
-            task_id="t_e2e",
-            goal="Fix calculate_answer in calc.py to return 42",
-            actions_taken=["Wrote calc.py", "Tested (failed)", "Patched calc.py", "Tested (passed)"],
-            modified_files=["calc.py"],
-            task_type=TaskType.CODE_MODIFICATION,
-            require_structured_evidence=False,
-        )
-        assert report.status == TaskStatus.COMPLETED
-        assert report.acceptance_criteria_satisfied is True
-        assert "calc.py" in report.files_created_or_modified
+            # 3. Patch the file to fix the bug
+            patch_res = await patch_tool.execute(
+                ws_dir,
+                file_path="calc.py",
+                target_content="return 41",
+                replacement_content="return 42",
+            )
+            assert patch_res.success is True
+
+            # 4. Re-run test - succeeds with exit code 0
+            cmd_res2 = await terminal_tool.execute(ws_dir, command=f'"{sys.executable}" calc.py', sandbox_mode="host", require_sandbox=False)
+            assert cmd_res2.success is True
+            assert cmd_res2.artifacts["exit_code"] == 0
+
+            ve.record_check(
+                VerificationCheck(
+                    check_name="Fixed Calc Check",
+                    check_type="test",
+                    command="python calc.py",
+                    success=True,
+                    exit_code=0,
+                    output="Success",
+                    evidence_summary="Fixed verification passed with exit code 0.",
+                )
+            )
+
+            # 5. Evaluate completion with verifier
+            report = ve.evaluate_completion(
+                task_id="t_e2e",
+                goal="Fix calculate_answer in calc.py to return 42",
+                actions_taken=["Wrote calc.py", "Tested (failed)", "Patched calc.py", "Tested (passed)"],
+                modified_files=["calc.py"],
+                task_type=TaskType.CODE_MODIFICATION,
+                require_structured_evidence=False,
+            )
+            assert report.status == TaskStatus.COMPLETED
+            assert report.acceptance_criteria_satisfied is True
+            assert "calc.py" in report.files_created_or_modified
+    finally:
+        if orig_unisolated is None:
+            os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
+        else:
+            os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = orig_unisolated
 
 
 @pytest.mark.asyncio
@@ -2209,59 +2221,66 @@ async def test_run_verification_tool_structured_record_e2e():
     from agent.tools.verification import RunVerificationCheckTool
 
     tool = RunVerificationCheckTool()
-    os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
+    orig_unisolated = os.environ.get("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION")
+    try:
+        os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
 
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-        # Create a sample test file inside the workspace
-        test_file = os.path.join(temp_dir, "test_math.py")
-        with open(test_file, "w") as f:
-            f.write("def test_addition():\n    assert 2 + 2 == 4\n")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            # Create a sample test file inside the workspace
+            test_file = os.path.join(temp_dir, "test_math.py")
+            with open(test_file, "w") as f:
+                f.write("def test_addition():\n    assert 2 + 2 == 4\n")
 
-        res = await tool.execute(
-            workspace_path=temp_dir,
-            call_id="call_verify_e2e",
-            command=f'"{sys.executable}" -m pytest test_math.py',
-            check_name="Math Test",
-            check_type="test",
-            sandbox_mode="host",
-            require_sandbox=False,
-        )
+            res = await tool.execute(
+                workspace_path=temp_dir,
+                call_id="call_verify_e2e",
+                command=f'"{sys.executable}" -m pytest test_math.py',
+                check_name="Math Test",
+                check_type="test",
+                sandbox_mode="host",
+                require_sandbox=False,
+            )
 
-        assert res.success is True
-        assert res.artifacts is not None
-        rec = res.artifacts.get("trusted_execution_record")
-        assert rec is not None
-        assert verify_trusted_execution_record(rec) is True
-        assert any("test_addition" in node for node in rec["passed_nodes"])
+            assert res.success is True
+            assert res.artifacts is not None
+            rec = res.artifacts.get("trusted_execution_record")
+            assert rec is not None
+            assert verify_trusted_execution_record(rec) is True
+            assert any("test_addition" in node for node in rec["passed_nodes"])
 
-        # Confirm temporary XML report in workspace was cleaned up
-        xml_leftovers = [f for f in os.listdir(temp_dir) if f.startswith(".verification_report_")]
-        assert len(xml_leftovers) == 0
+            # Confirm temporary XML report in workspace was cleaned up
+            xml_leftovers = [f for f in os.listdir(temp_dir) if f.startswith(".verification_report_")]
+            assert len(xml_leftovers) == 0
 
-        # In dedicated Docker CI job, container verification is mandatory (fails rather than skips)
-        require_docker = os.environ.get("REQUIRE_DOCKER") == "1"
-        if require_docker or is_docker_daemon_available():
-            if not is_docker_daemon_available():
-                pytest.fail("Docker daemon is required in Docker CI integration test job but was not available.")
-            chk = subprocess.run(["docker", "run", "--rm", "python:3.12-slim", "pytest", "--version"], capture_output=True)
-            if chk.returncode != 0:
-                if require_docker:
-                    pytest.fail(f"Required pytest was not found in python:3.12-slim image: {chk.stderr.decode()}")
-            else:
-                res_c = await tool.execute(
-                    workspace_path=temp_dir,
-                    call_id="call_verify_container_e2e",
-                    command="pytest test_math.py",
-                    check_name="Math Test Container",
-                    check_type="test",
-                    sandbox_mode="container",
-                )
-                assert res_c.success is True
-                assert res_c.artifacts is not None
-                rec_c = res_c.artifacts.get("trusted_execution_record")
-                assert rec_c is not None
-                assert verify_trusted_execution_record(rec_c) is True
-                assert any("test_addition" in node for node in rec_c["passed_nodes"])
+            # In dedicated Docker CI job, container verification is mandatory (fails rather than skips)
+            require_docker = os.environ.get("REQUIRE_DOCKER") == "1"
+            if require_docker or is_docker_daemon_available():
+                if not is_docker_daemon_available():
+                    pytest.fail("Docker daemon is required in Docker CI integration test job but was not available.")
+                chk = subprocess.run(["docker", "run", "--rm", "python:3.12-slim", "pytest", "--version"], capture_output=True)
+                if chk.returncode != 0:
+                    if require_docker:
+                        pytest.fail(f"Required pytest was not found in python:3.12-slim image: {chk.stderr.decode()}")
+                else:
+                    res_c = await tool.execute(
+                        workspace_path=temp_dir,
+                        call_id="call_verify_container_e2e",
+                        command="pytest test_math.py",
+                        check_name="Math Test Container",
+                        check_type="test",
+                        sandbox_mode="container",
+                    )
+                    assert res_c.success is True
+                    assert res_c.artifacts is not None
+                    rec_c = res_c.artifacts.get("trusted_execution_record")
+                    assert rec_c is not None
+                    assert verify_trusted_execution_record(rec_c) is True
+                    assert any("test_addition" in node for node in rec_c["passed_nodes"])
+    finally:
+        if orig_unisolated is None:
+            os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
+        else:
+            os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = orig_unisolated
 
 
 def test_credential_vault_multiprocess_concurrency_and_crash_recovery():
@@ -3335,6 +3354,10 @@ async def test_execution_engine_e2e_enforces_structured_evidence_for_code_modifi
         assert any(ce.verification_tier == "UNVERIFIED_UNSTRUCTURED_EVIDENCE" for ce in completed_task1.final_report.criteria_evidence)
 
         # Task 2: Runs code modification with authentic cryptographically signed TrustedExecutionRecord
+        auth_file = os.path.join(temp_dir, "auth.py")
+        if os.path.exists(auth_file):
+            os.remove(auth_file)
+
         task2 = Task(
             id="task_e2e_structured",
             goal="Implement auth tokens in auth.py",
@@ -4438,6 +4461,78 @@ async def test_diff_and_task_state_synchronization():
         assert any("file_del.txt" in fn for fn in filenames)
         del_item = next(p for p in parsed if "file_del.txt" in p["filename"])
         assert del_item.get("isDeleted") is True
+
+
+@pytest.mark.asyncio
+async def test_git_security_neutralizes_repository_helpers_and_fsmonitor():
+    """Validates P1:
+    Git tools strictly neutralize repository-configured helpers:
+    1. core.fsmonitor hook scripts are disabled (-c core.fsmonitor=false).
+    2. diff.<driver>.textconv helper scripts are disabled (--no-textconv).
+    3. External diff drivers are disabled (--no-ext-diff).
+    4. Core hooks are disabled (-c core.hooksPath=).
+    5. Host environment secrets are scrubbed from git subprocess environment."""
+    from agent.tools.git import GitDiffTool, GitStatusTool, _run_git
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Initialize git repository
+        code, _, _ = await _run_git(["init"], temp_dir)
+        assert code == 0
+        await _run_git(["config", "user.name", "Security Test"], temp_dir)
+        await _run_git(["config", "user.email", "sec@test.local"], temp_dir)
+
+        # Create decoy marker file that a malicious helper script would create if executed
+        marker_file = os.path.join(temp_dir, "malicious_helper_executed.marker")
+        if os.path.exists(marker_file):
+            os.remove(marker_file)
+
+        # Python command string that creates marker_file if run
+        py_exe = sys.executable.replace("\\", "/")
+        marker_path = marker_file.replace("\\", "/")
+        payload = f'"{py_exe}" -c "import pathlib; pathlib.Path(\'{marker_path}\').touch()"'
+
+        # Write malicious configuration to .git/config
+        git_config_path = os.path.join(temp_dir, ".git", "config")
+        with open(git_config_path, "a", encoding="utf-8") as f:
+            f.write(
+                f'\n[core]\n'
+                f'    fsmonitor = {payload}\n'
+                f'[diff "exploit"]\n'
+                f'    textconv = {payload}\n'
+            )
+
+        # Configure .gitattributes to route all .txt files through the exploit driver
+        gitattributes_path = os.path.join(temp_dir, ".gitattributes")
+        with open(gitattributes_path, "w", encoding="utf-8") as f:
+            f.write("*.txt diff=exploit\n")
+
+        # Initial commit
+        test_txt = os.path.join(temp_dir, "sample.txt")
+        with open(test_txt, "w", encoding="utf-8") as f:
+            f.write("initial content\n")
+
+        await _run_git(["add", "-A"], temp_dir)
+        await _run_git(["commit", "-m", "Initial commit"], temp_dir)
+
+        # Modify file to produce a diff
+        with open(test_txt, "w", encoding="utf-8") as f:
+            f.write("modified content with exploit test\n")
+
+        # Execute git_status tool
+        status_tool = GitStatusTool()
+        status_res = await status_tool.execute(temp_dir)
+        assert status_res.success is True
+
+        # Execute git_diff tool
+        diff_tool = GitDiffTool()
+        diff_res = await diff_tool.execute(temp_dir)
+        assert diff_res.success is True
+        assert "modified content with exploit test" in diff_res.output
+
+        # Verify that malicious helper was NEVER executed
+        assert not os.path.exists(marker_file), (
+            "Security Failure: Malicious git helper script was executed by host git process!"
+        )
 
 
 @pytest.mark.asyncio
@@ -5594,6 +5689,11 @@ async def test_verification_identity_checks_cannot_be_skipped():
 """
 
     with tempfile.TemporaryDirectory() as ws_dir:
+        test_file = os.path.join(ws_dir, "tests", "test_auth.py")
+        os.makedirs(os.path.dirname(test_file), exist_ok=True)
+        with open(test_file, "w") as f:
+            f.write("def test_login(): pass\ndef test_logout(): pass\n")
+
         orig_stat = os.stat
         def safe_stat(path, *args, **kwargs):
             if ".agent_verification_evidence_" in str(path) or "junit_" in str(path):
@@ -5684,3 +5784,226 @@ async def test_verification_identity_checks_cannot_be_skipped():
                     assert res_valid.success is True
                     assert res_valid.artifacts["tampering_detected"] is False
                     assert res_valid.artifacts["trusted_execution_record"] is not None
+
+
+@pytest.mark.asyncio
+async def test_parse_junit_xml_report_limits_and_duplicate_rejection():
+    """Validates that JUnit XML parser enforces size and count limits, and rejects duplicates."""
+    from agent.tools.verification import parse_junit_xml_report, MAX_JUNIT_XML_BYTES, MAX_TESTCASES
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # 1. Reject duplicate testcase
+        dup_xml = os.path.join(temp_dir, "dup.xml")
+        with open(dup_xml, "w", encoding="utf-8") as f:
+            f.write("""<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" tests="2" errors="0" failures="0" skipped="0">
+    <testcase classname="tests.test_a" name="test_one" file="tests/test_a.py" />
+    <testcase classname="tests.test_a" name="test_one" file="tests/test_a.py" />
+  </testsuite>
+</testsuites>""")
+        assert parse_junit_xml_report(dup_xml) is None
+
+        # 2. Reject excessive testcases (> MAX_TESTCASES)
+        excess_xml = os.path.join(temp_dir, "excess.xml")
+        cases = "\n".join(f'<testcase classname="tests.test_{i}" name="test_fn_{i}" file="tests/test_{i}.py" />' for i in range(MAX_TESTCASES + 5))
+        with open(excess_xml, "w", encoding="utf-8") as f:
+            f.write(f'<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest" tests="{MAX_TESTCASES + 5}">{cases}</testsuite></testsuites>')
+        assert parse_junit_xml_report(excess_xml) is None
+
+
+@pytest.mark.asyncio
+async def test_verification_ast_validation_detects_phantom_tests():
+    """Validates that host AST verification detects and flags phantom/fabricated testcases from conftest.py hooks."""
+    from agent.tools.verification import RunVerificationCheckTool
+    from agent.core.models import ActionResult
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    tool = RunVerificationCheckTool()
+
+    with tempfile.TemporaryDirectory() as ws_dir:
+        # Create genuine test file defining only test_genuine
+        test_file = os.path.join(ws_dir, "tests", "test_real.py")
+        os.makedirs(os.path.dirname(test_file), exist_ok=True)
+        with open(test_file, "w") as f:
+            f.write("def test_genuine():\n    assert True\n")
+
+        # Console output claims test_phantom was executed and passed
+        fabricated_console = (
+            "tests/test_real.py::test_phantom PASSED [100%]\n"
+            "=== 1 passed in 0.05s ==="
+        )
+
+        orig_stat = os.stat
+        def safe_stat(path, *args, **kwargs):
+            if ".agent_verification_evidence_" in str(path) or "junit_" in str(path):
+                m = MagicMock()
+                m.st_mtime = time.time() + 10.0
+                m.st_size = 500
+                return m
+            return orig_stat(path, *args, **kwargs)
+
+        orig_exists = os.path.exists
+        def safe_exists(path, *args, **kwargs):
+            if ".agent_verification_evidence_" in str(path) or "junit_" in str(path):
+                return True
+            return orig_exists(path, *args, **kwargs)
+
+        with patch.object(tool._command_tool, "execute", AsyncMock(return_value=ActionResult(
+            call_id="c_phantom", tool_name="run_command", success=True, output=fabricated_console, artifacts={"exit_code": 0}
+        ))):
+            with patch("agent.tools.verification.parse_junit_xml_report", return_value={
+                "total": 1, "passed": 1, "failed": 0, "skipped": 0,
+                "passed_nodes": ["tests/test_real.py::test_phantom"],
+                "passed_testcases": [
+                    {"name": "test_phantom", "file": "tests/test_real.py", "classname": "tests.test_real"},
+                ],
+                "failed_nodes": [], "skipped_nodes": [],
+            }):
+                with patch("os.path.exists", side_effect=safe_exists), patch("os.stat", side_effect=safe_stat):
+                    res = await tool.execute(
+                        workspace_path=ws_dir,
+                        command="pytest tests/test_real.py",
+                        check_type="test",
+                    )
+                    assert res.success is False
+                    assert res.artifacts["tampering_detected"] is True
+                    assert "not defined in source file" in res.artifacts["discrepancy"]
+                    assert res.artifacts["trusted_execution_record"] is None
+
+
+@pytest.mark.asyncio
+async def test_test_and_verify_requires_structured_evidence():
+    """Validates that TEST_AND_VERIFY tasks strictly require cryptographically signed structured runner evidence."""
+    from agent.verification.verifier import VerificationEngine
+    from agent.core.models import VerificationCheck, TaskStatus, TaskType
+    from agent.security.provenance import issue_trusted_execution_record
+
+    ve = VerificationEngine()
+    unstructured_check = VerificationCheck(
+        check_name="Unit Tests",
+        check_type="test",
+        command="pytest tests/test_core.py",
+        success=True,
+        exit_code=0,
+        output="=== 5 passed in 0.12s ===",
+        evidence_summary="5 passed",
+        trusted_execution_record=None,  # Missing structured record
+    )
+    ve.record_check(unstructured_check)
+
+    report_rejected = ve.evaluate_completion(
+        task_id="task_tv_1",
+        goal="Run core unit tests and verify module",
+        actions_taken=["Executed pytest"],
+        modified_files=[],
+        task_type=TaskType.TEST_AND_VERIFY,
+        require_structured_evidence=True,
+    )
+    assert report_rejected.status == TaskStatus.PARTIALLY_COMPLETED
+    assert report_rejected.acceptance_criteria_satisfied is False
+    assert any("Unstructured Test Evidence Rejected" in r for r in report_rejected.unresolved_risks_or_limitations)
+
+    # Now provide verified record
+    ve2 = VerificationEngine()
+    record = issue_trusted_execution_record(
+        run_id="task_tv_2",
+        runner="pytest",
+        command="pytest tests/test_core.py",
+        exit_code=0,
+        total=5,
+        passed=5,
+        failed=0,
+        skipped=0,
+        passed_nodes=["tests/test_core.py::test_one"],
+    )
+    structured_check = VerificationCheck(
+        check_name="Unit Tests",
+        check_type="test",
+        command="pytest tests/test_core.py",
+        success=True,
+        exit_code=0,
+        output="tests/test_core.py::test_one PASSED\n=== 5 passed in 0.12s ===",
+        evidence_summary="5 passed",
+        trusted_execution_record=record,
+    )
+    ve2.record_check(structured_check)
+
+    report_accepted = ve2.evaluate_completion(
+        task_id="task_tv_2",
+        goal="Run core unit tests and verify module",
+        actions_taken=["Executed pytest"],
+        modified_files=[],
+        task_type=TaskType.TEST_AND_VERIFY,
+        require_structured_evidence=True,
+    )
+    assert report_accepted.status == TaskStatus.COMPLETED
+    assert report_accepted.acceptance_criteria_satisfied is True
+
+
+@pytest.mark.asyncio
+async def test_code_modification_noop_detection_rejects_completion():
+    """Validates that CODE_MODIFICATION tasks reject completion when writes were no-ops and working tree is clean."""
+    from agent.verification.verifier import VerificationEngine
+    from agent.core.models import VerificationCheck, TaskStatus, TaskType
+
+    ve = VerificationEngine()
+    ve.record_check(VerificationCheck(
+        check_name="Unit Tests",
+        check_type="test",
+        command="pytest",
+        success=True,
+        exit_code=0,
+        output="1 passed",
+        evidence_summary="1 passed",
+    ))
+
+    report = ve.evaluate_completion(
+        task_id="task_noop_1",
+        goal="Fix calculate_tax logic in tax.py",
+        actions_taken=["Executed write_file (no-op)"],
+        modified_files=[],  # No files actually modified (filtered out due to is_noop=True)
+        task_type=TaskType.CODE_MODIFICATION,
+        git_diff_summary="(clean working tree)",
+        require_structured_evidence=False,
+    )
+    assert report.status == TaskStatus.PARTIALLY_COMPLETED
+    assert report.acceptance_criteria_satisfied is False
+    assert any("no files were created or modified in the workspace" in r for r in report.unresolved_risks_or_limitations)
+
+
+@pytest.mark.asyncio
+async def test_destructive_command_escalation_and_fifo_pruning():
+    """Validates dynamic risk escalation for destructive commands and FIFO approval retention pruning."""
+    from agent.security.permissions import (
+        PermissionManager,
+        PermissionPolicy,
+        PermissionLevel,
+        MAX_PENDING_APPROVALS,
+        MAX_APPROVAL_HISTORY,
+    )
+
+    pm = PermissionManager(policy=PermissionPolicy(auto_approve_sensitive=True))
+
+    # Even with auto_approve_sensitive=True, destructive operations must require explicit approval
+    allowed, reason, req = pm.evaluate_action(
+        task_id="t_destruct",
+        tool_name="run_command",
+        arguments={"command": "git clean -fdx"},
+        permission_level=PermissionLevel.SENSITIVE_OPERATION,
+        workspace_path="/tmp",
+    )
+    assert allowed is False
+    assert req is not None
+    assert req.permission_level == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # Verify FIFO pending approvals pruning
+    for i in range(MAX_PENDING_APPROVALS + 20):
+        pm.evaluate_action(
+            task_id=f"t_bulk_{i}",
+            tool_name="run_command",
+            arguments={"command": f"rm -rf /tmp/test_{i}"},
+            permission_level=PermissionLevel.SENSITIVE_OPERATION,
+            workspace_path="/tmp",
+        )
+    assert len(pm.pending_approvals) <= MAX_PENDING_APPROVALS

@@ -26,6 +26,11 @@ class CredentialMigrationError(RuntimeError):
     pass
 
 
+class DatabaseCorruptionError(RuntimeError):
+    """Raised when SQLite database records or schemas are corrupt."""
+    pass
+
+
 class Database:
     def __init__(self, db_path: str = DB_PATH):
         self.db_path = db_path
@@ -80,10 +85,11 @@ class Database:
                     value_json TEXT NOT NULL
                 )
             """)
-            try:
+            # Check schema version/columns explicitly
+            cursor = await db.execute("PRAGMA table_info(tasks)")
+            task_columns = [row[1] for row in await cursor.fetchall()]
+            if "task_type" not in task_columns:
                 await db.execute("ALTER TABLE tasks ADD COLUMN task_type TEXT DEFAULT 'CODE_MODIFICATION'")
-            except Exception:
-                pass
             await db.commit()
 
     async def reconcile_interrupted_tasks(self) -> int:
@@ -279,7 +285,10 @@ class Database:
                 row = await cursor.fetchone()
                 if not row:
                     return default
-                val = json.loads(row["value_json"])
+                try:
+                    val = json.loads(row["value_json"])
+                except Exception as je:
+                    raise DatabaseCorruptionError(f"Corrupted JSON in settings table for key '{key}': {je}") from je
 
                 if key == "app_settings" and isinstance(val, dict):
                     decrypted_val = dict(val)
@@ -312,8 +321,11 @@ class Database:
                     return decrypted_val
 
                 return val
-        except CredentialMigrationError:
+        except (CredentialMigrationError, DatabaseCorruptionError):
             raise
-        except Exception:
-            await self.init()
-            return default
+        except (aiosqlite.DatabaseError, OSError) as dbe:
+            # Propagate database corruption and I/O errors rather than silently returning default
+            raise DatabaseWriteError(f"Database error in get_setting('{key}'): {str(dbe)}") from dbe
+        except Exception as e:
+            # Any unexpected error: re-raise rather than masking as missing setting
+            raise DatabaseWriteError(f"Unexpected error in get_setting('{key}'): {str(e)}") from e
