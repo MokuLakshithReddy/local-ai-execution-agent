@@ -305,6 +305,26 @@ class WriteFileTool(BaseTool):
 
         try:
             target_file = resolve_safe_path(workspace_path, file_path)
+
+            # Prevent modification of designated immutable test specifications
+            immutable_test_files = kwargs.get("immutable_test_files") or []
+            ws_real = os.path.realpath(workspace_path)
+            target_real = os.path.realpath(target_file)
+            for itf in immutable_test_files:
+                itf_clean = itf.strip().replace("\\", "/").lower()
+                itf_real = os.path.realpath(os.path.join(ws_real, itf.strip()))
+                rel_target = os.path.relpath(target_real, ws_real).replace("\\", "/").lower()
+                if target_real == itf_real or rel_target == itf_clean or rel_target.endswith(f"/{itf_clean}"):
+                    return ActionResult(
+                        call_id=call_id,
+                        tool_name=self.name,
+                        success=False,
+                        output="",
+                        error=f"Permission Denied: File '{file_path}' is designated as an immutable test specification and cannot be modified or overwritten.",
+                        artifacts={"file_path": file_path, "tampering_prevented": True},
+                        execution_time_ms=(time.time() - t0) * 1000,
+                    )
+
             os.makedirs(os.path.dirname(target_file), exist_ok=True)
 
             is_new = not os.path.exists(target_file)
@@ -381,6 +401,26 @@ class PatchFileTool(BaseTool):
 
         try:
             target_file = resolve_safe_path(workspace_path, file_path)
+
+            # Prevent patching of designated immutable test specifications
+            immutable_test_files = kwargs.get("immutable_test_files") or []
+            ws_real = os.path.realpath(workspace_path)
+            target_real = os.path.realpath(target_file)
+            for itf in immutable_test_files:
+                itf_clean = itf.strip().replace("\\", "/").lower()
+                itf_real = os.path.realpath(os.path.join(ws_real, itf.strip()))
+                rel_target = os.path.relpath(target_real, ws_real).replace("\\", "/").lower()
+                if target_real == itf_real or rel_target == itf_clean or rel_target.endswith(f"/{itf_clean}"):
+                    return ActionResult(
+                        call_id=call_id,
+                        tool_name=self.name,
+                        success=False,
+                        output="",
+                        error=f"Permission Denied: File '{file_path}' is designated as an immutable test specification and cannot be patched or modified.",
+                        artifacts={"file_path": file_path, "tampering_prevented": True},
+                        execution_time_ms=(time.time() - t0) * 1000,
+                    )
+
             if not os.path.isfile(target_file):
                 return ActionResult(
                     call_id=call_id,

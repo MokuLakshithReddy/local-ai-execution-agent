@@ -6909,8 +6909,261 @@ async def test_engine_immutable_test_intra_command_tamper_detected_e2e():
             assert completed.status == TaskStatus.PARTIALLY_COMPLETED
             assert completed.final_report.acceptance_criteria_satisfied is False
             assert any("Test Specification Tampering Guard" in r for r in completed.final_report.unresolved_risks_or_limitations)
+
+            # Verify file content is strictly preserved on disk
+            with open(test_file, "r", encoding="utf-8") as f:
+                assert f.read() == original_content
         finally:
             if orig_unisolated is not None:
                 os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = orig_unisolated
             else:
                 os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
+
+
+@pytest.mark.asyncio
+async def test_run_verification_escalates_destructive_commands():
+    """Validates that run_verification commands are subject to the same command-risk
+    classification as run_command. Destructive commands (such as 'git restore --worktree .')
+    must escalate to DESTRUCTIVE_OPERATION and cannot be auto-approved under auto_approve_sensitive.
+    Furthermore, RunVerificationCheckTool itself rejects destructive commands fail-closed."""
+    from agent.security.permissions import PermissionManager, PermissionLevel, PermissionPolicy
+    from agent.tools.verification import RunVerificationCheckTool
+
+    pm = PermissionManager(policy=PermissionPolicy(auto_approve_sensitive=True))
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # 1. run_verification with a destructive command must be escalated and NOT auto-approved
+        destructive_args = {
+            "check_name": "Revert All",
+            "command": "git restore --worktree .",
+            "check_type": "custom",
+        }
+        is_permitted, reason, approval_req = pm.evaluate_action(
+            task_id="t_verif_dest",
+            tool_name="run_verification",
+            arguments=destructive_args,
+            permission_level=PermissionLevel.SENSITIVE_OPERATION,
+            workspace_path=temp_dir,
+        )
+        assert is_permitted is False
+        assert approval_req is not None
+        assert approval_req.permission_level == PermissionLevel.DESTRUCTIVE_OPERATION
+        assert "git restore" in approval_req.reason.lower()
+
+        # 2. RunVerificationCheckTool.execute must fail-closed on destructive commands
+        tool = RunVerificationCheckTool()
+        result = await tool.execute(
+            workspace_path=temp_dir,
+            check_name="Destructive Git Restore",
+            command="git restore --worktree .",
+            check_type="custom",
+        )
+        assert result.success is False
+        assert result.artifacts.get("destructive_rejected") is True
+        assert "Verification command rejected" in result.error and "DESTRUCTIVE_OPERATION" in result.error
+
+
+@pytest.mark.asyncio
+async def test_direct_file_tools_prevent_immutable_test_modification():
+    """Validates that direct file manipulation tools (write_file and patch_file) actively
+    prevent modification or overwrite of designated immutable test specifications without touching disk."""
+    from agent.tools.filesystem import WriteFileTool, PatchFileTool
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tests_dir = os.path.join(temp_dir, "tests")
+        os.makedirs(tests_dir, exist_ok=True)
+        test_file = os.path.join(tests_dir, "test_suite.py")
+        original_content = "def test_primary(): assert False\n"
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write(original_content)
+
+        write_tool = WriteFileTool()
+        patch_tool = PatchFileTool()
+        immutable_tests = ["tests/test_suite.py"]
+
+        # 1. write_file attempt on immutable test file
+        res_write = await write_tool.execute(
+            workspace_path=temp_dir,
+            file_path="tests/test_suite.py",
+            content="def test_primary(): assert True\n",
+            immutable_test_files=immutable_tests,
+        )
+        assert res_write.success is False
+        assert "immutable test specification" in res_write.error.lower()
+        assert res_write.artifacts.get("tampering_prevented") is True
+
+        # Verify disk content remained unchanged
+        with open(test_file, "r", encoding="utf-8") as f:
+            assert f.read() == original_content
+
+        # 2. patch_file attempt on immutable test file
+        res_patch = await patch_tool.execute(
+            workspace_path=temp_dir,
+            file_path="tests/test_suite.py",
+            target="assert False",
+            replacement="assert True",
+            immutable_test_files=immutable_tests,
+        )
+        assert res_patch.success is False
+        assert "immutable test specification" in res_patch.error.lower()
+        assert res_patch.artifacts.get("tampering_prevented") is True
+
+        # Verify disk content still remained unchanged
+        with open(test_file, "r", encoding="utf-8") as f:
+            assert f.read() == original_content
+
+
+@pytest.mark.asyncio
+async def test_engine_proactively_blocks_file_write_to_immutable_tests():
+    """Validates that ExecutionEngine proactively blocks LLM tool calls targeting immutable test files
+    using write_file/patch_file, records tampering, and refuses verified task completion."""
+    from agent.core.engine import ExecutionEngine
+    from agent.core.models import Task, TaskStatus, TaskType
+    from agent.tools.registry import ToolRegistry
+    from agent.persistence.db import Database
+    from agent.security.permissions import PermissionManager
+    from unittest.mock import MagicMock, AsyncMock, patch
+    from agent.providers.base import ProviderResponse, LLMToolCall
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tests_dir = os.path.join(temp_dir, "tests")
+        os.makedirs(tests_dir, exist_ok=True)
+        test_file = os.path.join(tests_dir, "test_core.py")
+        original_content = "def test_critical(): assert False\n"
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write(original_content)
+
+        db = Database(db_path=os.path.join(temp_dir, "test.db"))
+        await db.init()
+        registry = ToolRegistry()
+        pm = PermissionManager()
+
+        task = Task(
+            id="task_block_write_immutable",
+            goal="Ensure direct write to immutable test is blocked",
+            workspace_path=temp_dir,
+            task_type=TaskType.CODE_MODIFICATION,
+            model_provider="local",
+            model_name="local-model",
+            immutable_test_files=["tests/test_core.py"],
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.chat_completion = AsyncMock(side_effect=[
+            ProviderResponse(
+                content="Attempting direct overwrite of immutable test",
+                tool_calls=[
+                    LLMToolCall(
+                        id="call_write_bad",
+                        name="write_file",
+                        arguments={
+                            "file_path": "tests/test_core.py",
+                            "content": "def test_critical(): pass\n",
+                        },
+                    ),
+                ],
+            ),
+            ProviderResponse(content="I modified the test", tool_calls=[]),
+        ])
+
+        with patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter):
+            engine = ExecutionEngine(db=db, tool_registry=registry, permission_manager=pm)
+            completed = await engine.run_task(task, api_key="sk-test")
+
+        # The task must be partially completed / rejected due to test specification tampering
+        assert completed.status == TaskStatus.PARTIALLY_COMPLETED
+        assert completed.final_report.acceptance_criteria_satisfied is False
+        assert any("Test Specification Tampering Guard" in r for r in completed.final_report.unresolved_risks_or_limitations)
+
+        # Confirm file was never touched on disk
+        with open(test_file, "r", encoding="utf-8") as f:
+            assert f.read() == original_content
+
+
+@pytest.mark.asyncio
+async def test_database_persists_and_restores_immutable_test_files():
+    """Validates that immutable_test_files are faithfully persisted to and restored from
+    SQLite task history across save_task(), get_task(), and list_tasks(), including schema migration."""
+    from agent.persistence.db import Database
+    from agent.core.models import Task, TaskStatus, TaskType
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_path = os.path.join(temp_dir, "tasks_migration.db")
+
+        # 1. Simulate an older database without the immutable_test_files_json column
+        import aiosqlite
+        async with aiosqlite.connect(db_path) as db_conn:
+            await db_conn.execute("""
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    goal TEXT NOT NULL,
+                    workspace_path TEXT NOT NULL,
+                    model_provider TEXT NOT NULL,
+                    model_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    current_step INTEGER DEFAULT 0,
+                    max_steps INTEGER DEFAULT 30,
+                    plan_json TEXT,
+                    report_json TEXT,
+                    error TEXT,
+                    created_at REAL,
+                    updated_at REAL
+                )
+            """)
+            await db_conn.commit()
+
+        # 2. Database.init() must automatically migrate schema by adding immutable_test_files_json
+        db = Database(db_path=db_path)
+        await db.init()
+
+        # 3. Save a task with multiple immutable_test_files
+        test_files = ["tests/test_auth.py", "tests/test_crypto.py", "spec/test_invariants.py"]
+        task = Task(
+            id="t_persist_immutable",
+            goal="Test persistence of immutable files",
+            workspace_path=temp_dir,
+            task_type=TaskType.CODE_MODIFICATION,
+            model_provider="local",
+            model_name="local-model",
+            immutable_test_files=test_files,
+        )
+        await db.save_task(task)
+
+        # 4. get_task() must restore exact immutable_test_files
+        loaded_task = await db.get_task("t_persist_immutable")
+        assert loaded_task is not None
+        assert loaded_task.immutable_test_files == test_files
+
+        # 5. list_tasks() must also restore immutable_test_files
+        tasks_list = await db.list_tasks()
+        assert len(tasks_list) == 1
+        assert tasks_list[0].immutable_test_files == test_files
+
+
+def test_git_destructive_commands_expanded_coverage():
+    """Validates that classify_command_risk identifies expanded git destructive operations:
+    worktree remove/prune, reflog expire/delete, update-ref -d, tag -d, prune, push --force, gc --prune."""
+    from agent.security.permissions import classify_command_risk, PermissionLevel
+
+    destructive_commands = [
+        "git worktree remove --force other_worktree",
+        "git worktree prune",
+        "git reflog expire --expire=now --all",
+        "git reflog delete HEAD@{1}",
+        "git reflog drop HEAD@{2}",
+        "git update-ref -d refs/heads/feature",
+        "git update-ref --delete refs/tags/v1",
+        "git tag -d old_tag",
+        "git tag --delete release_v1",
+        "git prune --expire=now",
+        "git push -f origin main",
+        "git push --force origin feat",
+        "git push --force-with-lease origin main",
+        "git gc --prune=now",
+        "git gc --force",
+    ]
+
+    for cmd in destructive_commands:
+        level, reason = classify_command_risk(cmd)
+        assert level == PermissionLevel.DESTRUCTIVE_OPERATION, f"Expected DESTRUCTIVE for '{cmd}', got {level}"
+        assert "git" in reason.lower()
+

@@ -139,6 +139,41 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                     PermissionLevel.DESTRUCTIVE_OPERATION,
                     f"High risk: Git rebase operation ('{cmd[:60]}...') requires explicit human authorization.",
                 )
+            if "worktree" in args and any(a in ("remove", "prune") or a.startswith("remove") or a.startswith("prune") for a in args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git worktree removal/pruning ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "reflog" in args and any(a in ("expire", "delete", "drop") or a.startswith("expire") or a.startswith("delete") or a.startswith("drop") for a in args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git reflog expiration/deletion ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "update-ref" in args and any(a in ("-d", "--delete") or a.startswith("--delete") for a in args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git update-ref deletion ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "tag" in args and any(a in ("-d", "--delete") or a.startswith("--delete") for a in args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git tag deletion ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "prune" in args:
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git prune repository objects ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "push" in args and any(a in ("-f", "--force", "--force-with-lease") or a.startswith("--force") for a in args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git force push operation ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "gc" in args and any(a in ("--prune", "--force") or a.startswith("--prune") or a.startswith("--force") for a in args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git garbage collection with pruning ('{cmd[:60]}...') requires explicit human authorization.",
+                )
 
         # Destructive file manipulation utilities
         if exe in ("dd", "truncate", "shred", "wipe"):
@@ -347,7 +382,7 @@ class PermissionManager:
         # 2. Check permission level against policy with dynamic risk escalation for commands
         effective_level = permission_level
         destructive_reason = None
-        if tool_name == "run_command" and "command" in arguments:
+        if tool_name in ("run_command", "run_verification") and "command" in arguments:
             cmd_str = str(arguments.get("command", "")).strip()
             classified_lvl, risk_msg = classify_command_risk(cmd_str)
             if classified_lvl == PermissionLevel.DESTRUCTIVE_OPERATION:

@@ -502,6 +502,45 @@ class ExecutionEngine:
                         tool_args["allow_network"] = False
                         tool_args["immutable_test_files"] = immutable_test_specs
 
+                    if tool_name in ("write_file", "patch_file"):
+                        tool_args["immutable_test_files"] = immutable_test_specs
+
+                    # Proactively block direct file modification tools from modifying immutable test files
+                    if tool_name in ("write_file", "patch_file") and immutable_test_specs:
+                        target_arg = tool_args.get("file_path") or tool_args.get("path") or ""
+                        if target_arg:
+                            ws_real = os.path.realpath(task.workspace_path)
+                            target_real = os.path.realpath(os.path.join(ws_real, target_arg))
+                            blocked_file = None
+                            for itf in immutable_test_specs:
+                                itf_clean = itf.strip().replace("\\", "/").lower()
+                                itf_real = os.path.realpath(os.path.join(ws_real, itf.strip()))
+                                rel_target = os.path.relpath(target_real, ws_real).replace("\\", "/").lower()
+                                if target_real == itf_real or rel_target == itf_clean or rel_target.endswith(f"/{itf_clean}"):
+                                    blocked_file = itf
+                                    break
+                            if blocked_file:
+                                tampered_immutable_files.add(blocked_file)
+                                result = ActionResult(
+                                    call_id=tool_call.id,
+                                    tool_name=tool_name,
+                                    success=False,
+                                    output="",
+                                    error=f"Permission Denied: File '{target_arg}' is an immutable test specification and cannot be modified or overwritten.",
+                                    artifacts={"file_path": target_arg, "tampering_prevented": True},
+                                )
+                                tool_result_str = self.sanitizer.wrap_untrusted_content(tool_name, result.error)
+                                messages.append(
+                                    LLMMessage(
+                                        role="tool",
+                                        content=tool_result_str,
+                                        tool_call_id=tool_call.id,
+                                        name=tool_name,
+                                    )
+                                )
+                                actions_taken.append(f"Blocked {tool_name} targeting immutable test specification '{target_arg}'.")
+                                continue
+
                     # Inspect command text for attempts to modify or overwrite immutable test files
                     if tool_name in ("run_command", "run_verification") and immutable_test_specs:
                         cmd_str = (tool_args.get("command") or "").lower()

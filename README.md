@@ -11,7 +11,7 @@ An open-source, evidence-driven autonomous coding framework that delegates real 
 [![React 19](https://img.shields.io/badge/React-19%20%7C%20Vite-646CFF.svg)](https://vitejs.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-Local--First-003B57.svg)](https://sqlite.org/)
 [![CI](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
-[![Verification: 133 Passed](https://img.shields.io/badge/Verification-133%20Passed-10b981.svg)](EVIDENCE.md)
+[![Verification: 138 Passed](https://img.shields.io/badge/Verification-138%20Passed-10b981.svg)](EVIDENCE.md)
 [![Adversarial Benchmark: 7/7](https://img.shields.io/badge/Adversarial%20Benchmark-7%2F7%20Passed-blue.svg)](EVIDENCE.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -181,7 +181,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Verify Your Environment (133 Passing Tests)
+### 2. Verify Your Environment (138 Passing Tests)
 
 Run the automated test suite to verify kernel job limits, sandbox boundaries, and provenance hashing:
 

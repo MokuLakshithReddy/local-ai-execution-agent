@@ -291,6 +291,20 @@ class RunVerificationCheckTool(BaseTool):
                     execution_time_ms=(time.time() - t0) * 1000,
                 )
 
+        # Reject destructive commands: Verification suites must never discard or overwrite repository state
+        from agent.security.permissions import classify_command_risk, PermissionLevel
+        cmd_risk, risk_reason = classify_command_risk(command)
+        if cmd_risk == PermissionLevel.DESTRUCTIVE_OPERATION:
+            return ActionResult(
+                call_id=call_id,
+                tool_name=self.name,
+                success=False,
+                output="",
+                error=f"Verification command rejected: '{command}' is classified as a DESTRUCTIVE_OPERATION. {risk_reason}",
+                artifacts={"command": command, "tampering_detected": True, "destructive_rejected": True},
+                execution_time_ms=(time.time() - t0) * 1000,
+            )
+
         # Prohibit user-supplied report overrides, custom plugin injections, or help flags
         cmd_lower = command.lower()
         if "--junitxml" in cmd_lower or "-o junit" in cmd_lower:

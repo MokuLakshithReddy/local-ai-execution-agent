@@ -90,6 +90,8 @@ class Database:
             task_columns = [row[1] for row in await cursor.fetchall()]
             if "task_type" not in task_columns:
                 await db.execute("ALTER TABLE tasks ADD COLUMN task_type TEXT DEFAULT 'CODE_MODIFICATION'")
+            if "immutable_test_files_json" not in task_columns:
+                await db.execute("ALTER TABLE tasks ADD COLUMN immutable_test_files_json TEXT DEFAULT '[]'")
             await db.commit()
 
     async def reconcile_interrupted_tasks(self) -> int:
@@ -129,12 +131,14 @@ class Database:
             report_str = sanitizer.redact_secrets(task.final_report.model_dump_json()) if task.final_report else None
             error_clean = sanitizer.redact_secrets(task.error) if task.error else None
             task_type_str = task.task_type.value if hasattr(task, "task_type") and task.task_type else TaskType.CODE_MODIFICATION.value
+            immutable_files_str = json.dumps(getattr(task, "immutable_test_files", []) or [])
             
             await db.execute("""
                 INSERT INTO tasks (
                     id, goal, workspace_path, model_provider, model_name, status,
-                    current_step, max_steps, plan_json, report_json, error, task_type, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    current_step, max_steps, plan_json, report_json, error, task_type,
+                    immutable_test_files_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     goal=excluded.goal,
                     status=excluded.status,
@@ -143,11 +147,12 @@ class Database:
                     report_json=excluded.report_json,
                     error=excluded.error,
                     task_type=excluded.task_type,
+                    immutable_test_files_json=excluded.immutable_test_files_json,
                     updated_at=excluded.updated_at
             """, (
                 task.id, clean_goal, task.workspace_path, task.model_provider, task.model_name,
                 task.status.value, task.current_step, task.max_steps, plan_str, report_str,
-                error_clean, task_type_str, task.created_at, time.time()
+                error_clean, task_type_str, immutable_files_str, task.created_at, time.time()
             ))
             await db.commit()
 
@@ -165,6 +170,11 @@ class Database:
                 if ("task_type" in row.keys() and row["task_type"])
                 else TaskType.CODE_MODIFICATION
             )
+            immutable_files = (
+                json.loads(row["immutable_test_files_json"])
+                if ("immutable_test_files_json" in row.keys() and row["immutable_test_files_json"])
+                else []
+            )
             return Task(
                 id=row["id"],
                 goal=row["goal"],
@@ -176,6 +186,7 @@ class Database:
                 current_step=row["current_step"],
                 max_steps=row["max_steps"],
                 plan=plan,
+                immutable_test_files=immutable_files,
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 error=row["error"],
@@ -196,6 +207,11 @@ class Database:
                     if ("task_type" in row.keys() and row["task_type"])
                     else TaskType.CODE_MODIFICATION
                 )
+                immutable_files = (
+                    json.loads(row["immutable_test_files_json"])
+                    if ("immutable_test_files_json" in row.keys() and row["immutable_test_files_json"])
+                    else []
+                )
                 tasks.append(
                     Task(
                         id=row["id"],
@@ -208,6 +224,7 @@ class Database:
                         current_step=row["current_step"],
                         max_steps=row["max_steps"],
                         plan=plan,
+                        immutable_test_files=immutable_files,
                         created_at=row["created_at"],
                         updated_at=row["updated_at"],
                         error=row["error"],
