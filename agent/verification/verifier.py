@@ -234,6 +234,7 @@ class VerificationEngine:
         acceptance_criteria: Optional[List[str]] = None,
         criterion_bindings: Optional[Dict[str, str]] = None,
         require_structured_evidence: Optional[bool] = None,
+        immutable_test_files: Optional[List[str]] = None,
     ) -> TaskReport:
         """
         Synthesizes observed evidence into a structured completion report.
@@ -522,10 +523,26 @@ class VerificationEngine:
         risks = list(unresolved_notes or [])
         any_undemonstrated = any(not ce.demonstrated for ce in criteria_evidence)
 
+        # Check immutable test specification violation:
+        # If any test specification designated as immutable was modified by the agent, fail completion
+        immutable_violation = False
+        if immutable_test_files:
+            for itf in immutable_test_files:
+                itf_clean = itf.replace("\\", "/").strip().lower()
+                if any(itf_clean in mf.replace("\\", "/").lower() or mf.replace("\\", "/").lower().endswith(itf_clean) for mf in modified_files):
+                    immutable_violation = True
+                    risks.append(
+                        f"Test Specification Tampering Guard: Immutable test specification '{itf}' was modified by the agent. Automated completion is rejected to prevent self-authored passing assertions."
+                    )
+
         # 1. State Consistency Guard:
         # If the task was cancelled, blocked, or failed in the engine, preserve that status
         if task_current_status in (TaskStatus.CANCELLED, TaskStatus.BLOCKED, TaskStatus.FAILED):
             final_status = task_current_status
+            criteria_satisfied = False
+
+        elif immutable_violation:
+            final_status = TaskStatus.PARTIALLY_COMPLETED
             criteria_satisfied = False
 
         # 2. Criteria Evaluation based on TaskType

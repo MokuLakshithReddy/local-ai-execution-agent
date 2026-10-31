@@ -617,6 +617,15 @@ def reset_verification_secret(config_dir: Optional[str] = None) -> None:
 
 
 class TrustedExecutionRecord(BaseModel):
+    """
+    Cryptographically signed, authenticated execution telemetry proving that the specified
+    test runner was executed in the runtime environment and that the observed exit code and
+    parsed testcase nodes match the host-isolated execution record.
+
+    NOTE: This record authenticates execution provenance and observed runner telemetry;
+    it does NOT constitute mathematical proof of code semantic correctness or that arbitrary
+    agent-authored assertions are meaningful.
+    """
     run_id: str
     runner: str
     command: str

@@ -8,7 +8,7 @@ import json
 import os
 import time
 import uuid
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 from agent.core.models import (
     Task,
     TaskStatus,
@@ -46,16 +46,26 @@ CRITICAL RULES:
 """
 
 
-def _snapshot_workspace_hashes(workspace_path: str) -> Dict[str, str]:
+MAX_SNAPSHOT_FILE_BYTES = 50 * 1024 * 1024  # 50 MB individual file limit
+MAX_SNAPSHOT_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB total workspace snapshot limit
+SNAPSHOT_CHUNK_SIZE = 64 * 1024  # 64 KB streaming read buffer
+
+
+def _snapshot_workspace_hashes(workspace_path: str) -> Tuple[Dict[str, str], bool, Optional[str]]:
     """
     Computes a mapping of relative file paths to SHA-256 hashes across the workspace.
-    Skips .git directories, virtualenvs, node_modules, and cache directories to remain fast.
+    Reads files incrementally in bounded 64 KB chunks to bound memory consumption.
+    Enforces per-file and total workspace size budgets.
+    Returns: (hashes_dict, is_complete_bool, error_message_or_None).
     """
     hashes: Dict[str, str] = {}
+    total_bytes_hashed = 0
+
     try:
         ws_real = os.path.realpath(workspace_path)
         if not os.path.isdir(ws_real):
-            return hashes
+            return hashes, False, f"Workspace path does not exist or is not a directory: {workspace_path}"
+
         skip_dirs = {".git", "venv", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
         for root, dirs, files in os.walk(ws_real, topdown=True, followlinks=False):
             dirs[:] = [d for d in dirs if d not in skip_dirs]
@@ -63,15 +73,36 @@ def _snapshot_workspace_hashes(workspace_path: str) -> Dict[str, str]:
                 full_p = os.path.join(root, f)
                 if os.path.islink(full_p) or f.endswith((".db", ".sqlite", ".sqlite3", ".log", ".lock")):
                     continue
+
                 try:
+                    file_stat = os.stat(full_p)
+                    f_size = file_stat.st_size
                     rel_p = os.path.relpath(full_p, ws_real).replace("\\", "/")
+
+                    if f_size > MAX_SNAPSHOT_FILE_BYTES:
+                        # File exceeds individual size budget; hash metadata to detect alterations without OOM
+                        meta_sig = f"largefile:{f_size}:{file_stat.st_mtime_ns}:{file_stat.st_mode}"
+                        hashes[rel_p] = hashlib.sha256(meta_sig.encode()).hexdigest()
+                        continue
+
+                    if total_bytes_hashed + f_size > MAX_SNAPSHOT_TOTAL_BYTES:
+                        return hashes, False, f"Workspace snapshot exceeded total budget limit of {MAX_SNAPSHOT_TOTAL_BYTES // (1024 * 1024)} MB."
+
+                    hasher = hashlib.sha256()
                     with open(full_p, "rb") as fp:
-                        hashes[rel_p] = hashlib.sha256(fp.read()).hexdigest()
-                except (OSError, IOError):
-                    continue
-    except Exception:
-        pass
-    return hashes
+                        while True:
+                            chunk = fp.read(SNAPSHOT_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            hasher.update(chunk)
+                            total_bytes_hashed += len(chunk)
+                    hashes[rel_p] = hasher.hexdigest()
+                except (OSError, IOError) as read_err:
+                    return hashes, False, f"Failed to snapshot workspace file '{f}': {read_err}"
+    except Exception as scan_err:
+        return hashes, False, f"Workspace traversal failed: {scan_err}"
+
+    return hashes, True, None
 
 
 class ExecutionEngine:
@@ -140,7 +171,7 @@ class ExecutionEngine:
         modified_files: List[str] = []
         actually_modified_files: List[str] = []
         recent_tool_signatures: List[str] = []
-        initial_file_hashes: Dict[str, str] = _snapshot_workspace_hashes(task.workspace_path)
+        initial_file_hashes, init_snap_ok, init_snap_err = _snapshot_workspace_hashes(task.workspace_path)
 
         # Initialize task in database
         task.status = TaskStatus.PLANNING
@@ -537,7 +568,10 @@ class ExecutionEngine:
                 diff_summary = git_diff_result.output if git_diff_result.success else None
 
                 # Compute final workspace state hashes vs initial snapshot to detect changes that were completely reverted
-                final_file_hashes = _snapshot_workspace_hashes(task.workspace_path)
+                final_file_hashes, final_snap_ok, final_snap_err = _snapshot_workspace_hashes(task.workspace_path)
+                snapshot_failed = (not init_snap_ok) or (not final_snap_ok)
+                snapshot_error_msg = init_snap_err or final_snap_err
+
                 net_changed_files = set()
                 for rel_p, h in final_file_hashes.items():
                     if initial_file_hashes.get(rel_p) != h:
@@ -562,6 +596,10 @@ class ExecutionEngine:
                     if ncf not in verified_modified_files:
                         verified_modified_files.append(ncf)
 
+                notes = [task.error] if task.error else []
+                if snapshot_failed and task.task_type == TaskType.CODE_MODIFICATION:
+                    notes.append(f"Workspace Baseline Verification Incomplete: Failed to compute complete workspace snapshot baseline ({snapshot_error_msg}).")
+
                 final_report = verifier.evaluate_completion(
                     task_id=task.id,
                     goal=task.goal,
@@ -570,10 +608,11 @@ class ExecutionEngine:
                     task_type=task.task_type,
                     task_current_status=task.status,
                     git_diff_summary=diff_summary,
-                    unresolved_notes=[task.error] if task.error else [],
+                    unresolved_notes=notes,
                     acceptance_criteria=task.acceptance_criteria,
                     criterion_bindings=task.criterion_bindings,
                     require_structured_evidence=(task.task_type in (TaskType.CODE_MODIFICATION, TaskType.TEST_AND_VERIFY)),
+                    immutable_test_files=getattr(task, "immutable_test_files", None),
                 )
 
                 task.final_report = final_report

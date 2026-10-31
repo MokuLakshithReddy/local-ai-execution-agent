@@ -454,6 +454,17 @@ async def get_settings():
 
 @app.post("/api/settings", dependencies=[Depends(verify_auth)])
 async def save_settings(req: SaveSettingsRequest):
+    # 1. Pre-validate every requested field BEFORE modifying or persisting any state
+    validated_ws = None
+    if req.current_workspace:
+        validated_ws = await validate_approved_workspace(req.current_workspace)
+
+    if req.ollama_base_url:
+        parsed_url = urllib.parse.urlparse(req.ollama_base_url)
+        if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+            raise HTTPException(status_code=400, detail="Invalid ollama_base_url: must be a valid HTTP or HTTPS URL.")
+
+    # 2. Prepare atomic settings update
     settings = await db.get_setting("app_settings", {})
     if req.openai_api_key is not None:
         settings["openai_api_key"] = req.openai_api_key
@@ -470,22 +481,22 @@ async def save_settings(req: SaveSettingsRequest):
     if new_policy_sensitive is not None:
         settings["auto_approve_sensitive"] = new_policy_sensitive
 
+    # 3. Persist atomically
     try:
         await db.save_setting("app_settings", settings)
+        if validated_ws:
+            await db.save_setting("current_workspace", validated_ws)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Security Error: Failed to encrypt credentials safely ({str(e)}). Plaintext persistence rejected.",
         )
 
-    # Atomically apply updated policies to live permission manager ONLY after successful persistence
+    # 4. Atomically apply updated policies to live permission manager ONLY after all validations and persistence succeed
     if new_policy_routine is not None:
         permission_manager.policy.auto_approve_routine = new_policy_routine
     if new_policy_sensitive is not None:
         permission_manager.policy.auto_approve_sensitive = new_policy_sensitive
-    if req.current_workspace:
-        real_ws = await validate_approved_workspace(req.current_workspace)
-        await db.save_setting("current_workspace", real_ws)
 
     return {"status": "saved"}
 

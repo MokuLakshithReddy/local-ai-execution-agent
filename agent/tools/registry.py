@@ -2,6 +2,7 @@
 Central Tool Registry.
 Registers tools, exports schemas for LLMs, and coordinates execution with permissions.
 """
+import re
 from typing import Dict, Any, List, Optional, Tuple
 from agent.tools.base import BaseTool
 from agent.tools.filesystem import ListDirTool, ReadFileTool, WriteFileTool, PatchFileTool, SearchFilesTool
@@ -11,17 +12,106 @@ from agent.tools.verification import RunVerificationCheckTool
 from agent.core.models import ActionResult, ToolDefinition
 
 
+def _validate_schema_node(val: Any, spec: Dict[str, Any], path: str) -> Optional[str]:
+    """Recursively validates a value against a JSON schema specification."""
+    if val is None:
+        return None
+
+    # 1. Enum check
+    allowed_enums = spec.get("enum")
+    if allowed_enums is not None and val not in allowed_enums:
+        return f"{path} value '{val}' is invalid. Allowed values: {allowed_enums}."
+
+    # 2. Type validation and type-specific constraints
+    expected_type = spec.get("type")
+    if expected_type == "string":
+        if not isinstance(val, str):
+            return f"{path} must be a string, got {type(val).__name__}."
+        min_len = spec.get("minLength")
+        if min_len is not None and len(val) < min_len:
+            return f"{path} length ({len(val)}) must be at least {min_len} characters."
+        max_len = spec.get("maxLength")
+        if max_len is not None and len(val) > max_len:
+            return f"{path} length ({len(val)}) must not exceed {max_len} characters."
+        pattern = spec.get("pattern")
+        if pattern is not None and not re.search(pattern, val):
+            return f"{path} value '{val}' does not match required pattern '{pattern}'."
+
+    elif expected_type == "integer":
+        if not isinstance(val, int) or isinstance(val, bool):
+            return f"{path} must be an integer, got {type(val).__name__}."
+        min_val = spec.get("minimum")
+        if min_val is not None and val < min_val:
+            return f"{path} value ({val}) must be >= {min_val}."
+        max_val = spec.get("maximum")
+        if max_val is not None and val > max_val:
+            return f"{path} value ({val}) must be <= {max_val}."
+
+    elif expected_type == "number":
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            return f"{path} must be a number, got {type(val).__name__}."
+        min_val = spec.get("minimum")
+        if min_val is not None and val < min_val:
+            return f"{path} value ({val}) must be >= {min_val}."
+        max_val = spec.get("maximum")
+        if max_val is not None and val > max_val:
+            return f"{path} value ({val}) must be <= {max_val}."
+
+    elif expected_type == "boolean":
+        if not isinstance(val, bool):
+            return f"{path} must be a boolean, got {type(val).__name__}."
+
+    elif expected_type == "array":
+        if not isinstance(val, list):
+            return f"{path} must be an array, got {type(val).__name__}."
+        min_items = spec.get("minItems")
+        if min_items is not None and len(val) < min_items:
+            return f"{path} contains {len(val)} items, must be at least {min_items}."
+        max_items = spec.get("maxItems")
+        if max_items is not None and len(val) > max_items:
+            return f"{path} contains {len(val)} items, must not exceed {max_items}."
+        item_spec = spec.get("items")
+        if isinstance(item_spec, dict):
+            for idx, item in enumerate(val):
+                err = _validate_schema_node(item, item_spec, f"{path}[{idx}]")
+                if err:
+                    return err
+
+    elif expected_type == "object":
+        if not isinstance(val, dict):
+            return f"{path} must be an object, got {type(val).__name__}."
+        obj_props = spec.get("properties", {})
+        obj_required = spec.get("required", [])
+        for req in obj_required:
+            if req not in val or val[req] is None:
+                return f"Missing required property '{req}' in {path}."
+        if spec.get("additionalProperties") is False:
+            for k in val.keys():
+                if k not in obj_props:
+                    return f"Unexpected property '{k}' in {path}."
+        for k, v in val.items():
+            if k in obj_props:
+                err = _validate_schema_node(v, obj_props[k], f"{path}.{k}")
+                if err:
+                    return err
+
+    return None
+
+
 def validate_tool_call_schema(tool: BaseTool, kwargs: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """
     Validates runtime tool arguments against the tool's JSON schema:
     - Enforces required parameters.
-    - Validates data types (string, boolean, integer, number, array, object).
-    - Validates allowed enum values.
-    - Rejects undeclared extra parameters.
+    - Validates data types, bounds, string length, regex patterns.
+    - Enforces nested array and object schema constraints.
+    - Enforces enum values.
+    - Rejects undeclared extra parameters when additionalProperties is false or undeclared
+      (including empty-property schemas).
     """
     schema = tool.get_parameters_schema() or {}
     properties = schema.get("properties", {})
     required = schema.get("required", [])
+    allow_additional = schema.get("additionalProperties", False) is True
 
     framework_args = {
         "call_id", "task_id", "run_id", "timeout_seconds",
@@ -41,41 +131,23 @@ def validate_tool_call_schema(tool: BaseTool, kwargs: Dict[str, Any]) -> Tuple[b
         if req_field not in kwargs or kwargs[req_field] is None:
             return False, f"Missing required parameter '{req_field}' for tool '{tool.name}'."
 
-    # 2. Check each argument
-    if properties:
-        for arg_name, arg_val in kwargs.items():
+    # 2. Rejection of undeclared parameters (including empty properties objects)
+    if not allow_additional:
+        for arg_name in kwargs.keys():
             if arg_name in framework_args:
                 continue
             if arg_name not in properties:
                 return False, f"Unexpected parameter '{arg_name}' for tool '{tool.name}'."
 
+    # 3. Validate each argument against property schema
+    for arg_name, arg_val in kwargs.items():
+        if arg_name in framework_args:
+            continue
+        if arg_name in properties:
             prop_spec = properties[arg_name]
-            expected_type = prop_spec.get("type")
-
-            if arg_val is not None and expected_type:
-                if expected_type == "string":
-                    if not isinstance(arg_val, str):
-                        return False, f"Parameter '{arg_name}' must be a string, got {type(arg_val).__name__}."
-                elif expected_type == "integer":
-                    if not isinstance(arg_val, int) or isinstance(arg_val, bool):
-                        return False, f"Parameter '{arg_name}' must be an integer, got {type(arg_val).__name__}."
-                elif expected_type == "number":
-                    if not isinstance(arg_val, (int, float)) or isinstance(arg_val, bool):
-                        return False, f"Parameter '{arg_name}' must be a number, got {type(arg_val).__name__}."
-                elif expected_type == "boolean":
-                    if not isinstance(arg_val, bool):
-                        return False, f"Parameter '{arg_name}' must be a boolean, got {type(arg_val).__name__}."
-                elif expected_type == "array":
-                    if not isinstance(arg_val, list):
-                        return False, f"Parameter '{arg_name}' must be an array, got {type(arg_val).__name__}."
-                elif expected_type == "object":
-                    if not isinstance(arg_val, dict):
-                        return False, f"Parameter '{arg_name}' must be an object, got {type(arg_val).__name__}."
-
-            allowed_enums = prop_spec.get("enum")
-            if allowed_enums and arg_val is not None:
-                if arg_val not in allowed_enums:
-                    return False, f"Parameter '{arg_name}' value '{arg_val}' is invalid. Allowed values: {allowed_enums}."
+            err = _validate_schema_node(arg_val, prop_spec, f"Parameter '{arg_name}'")
+            if err:
+                return False, err
 
     return True, None
 

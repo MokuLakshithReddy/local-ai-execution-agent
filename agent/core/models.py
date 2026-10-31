@@ -158,6 +158,7 @@ class Task(BaseModel):
     plan: List[str] = Field(default_factory=list)
     acceptance_criteria: List[str] = Field(default_factory=list)
     criterion_bindings: Dict[str, str] = Field(default_factory=dict)
+    immutable_test_files: List[str] = Field(default_factory=list)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
     error: Optional[str] = None

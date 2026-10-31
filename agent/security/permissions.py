@@ -20,7 +20,24 @@ DESTRUCTIVE_COMMAND_REGEXES = [
     re.compile(r"\btruncate\s+(table\s+)?", re.IGNORECASE),
     re.compile(r"\bmkfs\b", re.IGNORECASE),
     re.compile(r"\bformat\s+[a-zA-Z]:", re.IGNORECASE),
+    re.compile(r"\bRemove-Item\b", re.IGNORECASE),
+    re.compile(r"\bClear-Item\b", re.IGNORECASE),
+    re.compile(r"\bClear-Content\b", re.IGNORECASE),
+    re.compile(r"\bClear-RecycleBin\b", re.IGNORECASE),
+    re.compile(r"\bFormat-Volume\b", re.IGNORECASE),
+    re.compile(r"\bStop-Process\b", re.IGNORECASE),
+    re.compile(r"\b(?:ri|rmdir|rd|del|erase)\s+-[a-zA-Z]*(?:r|recurse)\b", re.IGNORECASE),
 ]
+
+KNOWN_ROUTINE_EXECUTABLES = {
+    "git", "git.exe", "pytest", "unittest", "npm", "npm.cmd", "npx", "npx.cmd",
+    "yarn", "pnpm", "cargo", "cargo.exe", "go", "go.exe", "mypy", "ruff",
+    "flake8", "eslint", "tsc", "python", "python.exe", "python3", "python3.exe",
+    "py", "py.exe", "node", "node.exe", "ls", "dir", "cat", "type", "head",
+    "tail", "wc", "grep", "findstr", "echo", "pwd", "cd", "which", "where",
+    "get-childitem", "gci", "get-content", "gc", "get-location", "gl",
+    "testclient"
+}
 
 PATH_ARGUMENT_KEYS = ("path", "target_path", "file_path", "relative_path")
 
@@ -92,10 +109,6 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                     PermissionLevel.DESTRUCTIVE_OPERATION,
                     f"High risk: Git branch deletion ('{cmd[:60]}...') requires explicit human authorization.",
                 )
-                return (
-                    PermissionLevel.DESTRUCTIVE_OPERATION,
-                    f"High risk: Git branch deletion ('{cmd[:60]}...') requires explicit human authorization.",
-                )
 
         # B. rm inspection: -r, -rf, -fr, --recursive, -r -f
         if exe in ("rm", "unlink"):
@@ -135,7 +148,30 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                     f"High risk: File deletion command ('{cmd[:60]}...') requires explicit human authorization.",
                 )
 
-        # E. Inline interpreter scripts: python -c, node -e
+        # E. PowerShell cmdlets and aliases
+        if exe in (
+            "remove-item", "ri", "clear-item", "cli", "clear-content", "clc",
+            "clear-recyclebin", "format-volume", "format-disk", "stop-process", "spps"
+        ):
+            return (
+                PermissionLevel.DESTRUCTIVE_OPERATION,
+                f"High risk: Destructive PowerShell cmdlet '{exe}' ('{cmd[:60]}...') requires explicit human authorization.",
+            )
+
+        # F. Shell wrappers executing nested commands (powershell, pwsh, cmd, bash, sh)
+        if exe in ("powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe", "bash", "sh"):
+            for i, arg in enumerate(args):
+                if arg in ("-command", "-c", "/c") or arg.startswith("-command:") or arg.startswith("-c:"):
+                    nested_cmd = " ".join(args[i + 1:])
+                    if nested_cmd:
+                        sub_lvl, sub_reason = classify_command_risk(nested_cmd)
+                        if sub_lvl == PermissionLevel.DESTRUCTIVE_OPERATION:
+                            return (
+                                PermissionLevel.DESTRUCTIVE_OPERATION,
+                                sub_reason or f"High risk: Destructive nested command ('{cmd[:60]}...') requires explicit human authorization.",
+                            )
+
+        # G. Inline interpreter scripts: python -c, node -e
         if exe in ("python", "python3", "py", "node", "ruby", "perl", "bash", "sh"):
             inline_str = " ".join(args)
             destructive_interpreter_terms = (
@@ -148,6 +184,13 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                     PermissionLevel.DESTRUCTIVE_OPERATION,
                     f"High risk: Destructive interpreter deletion ('{cmd[:60]}...') requires explicit human authorization.",
                 )
+
+        # H. Conservative policy: Unknown or unrecognized executables require explicit authorization
+        if exe not in KNOWN_ROUTINE_EXECUTABLES:
+            return (
+                PermissionLevel.DESTRUCTIVE_OPERATION,
+                f"Conservative risk: Unrecognized executable '{exe}' ('{cmd[:60]}...') requires explicit human authorization.",
+            )
 
     return PermissionLevel.ROUTINE_MODIFICATION, None
 

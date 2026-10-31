@@ -3325,7 +3325,13 @@ async def test_execution_engine_e2e_enforces_structured_evidence_for_code_modifi
             description = "Mock verification tool"
             permission_level = PermissionLevel.READ_ONLY
             def get_parameters_schema(self):
-                return {"type": "object"}
+                return {
+                    "type": "object",
+                    "properties": {
+                        "check_name": {"type": "string"},
+                        "command": {"type": "string"},
+                    }
+                }
             async def execute(self, workspace_path: str, **kwargs):
                 return ActionResult(
                     call_id=kwargs.get("call_id", "tc"),
@@ -3385,7 +3391,13 @@ async def test_execution_engine_e2e_enforces_structured_evidence_for_code_modifi
             description = "Mock structured verification tool"
             permission_level = PermissionLevel.READ_ONLY
             def get_parameters_schema(self):
-                return {"type": "object"}
+                return {
+                    "type": "object",
+                    "properties": {
+                        "check_name": {"type": "string"},
+                        "command": {"type": "string"},
+                    }
+                }
             async def execute(self, workspace_path: str, **kwargs):
                 return ActionResult(
                     call_id=kwargs.get("call_id", "tc"),
@@ -6312,10 +6324,11 @@ async def test_runtime_tool_schema_validation_and_enum_enforcement():
 
 @pytest.mark.asyncio
 async def test_verification_adversarial_conftest_real_execution():
-    """Validates Issue 1:
-    Runs an actual pytest execution in a temporary workspace containing an adversarial conftest.py.
-    Demonstrates that RunVerificationCheckTool correctly confines the JUnit XML evidence to a single
-    pre-allocated file and validates that AST verification confirms authentic test execution."""
+    """Validates Issue 1 & P1 Finding 2:
+    Runs an actual pytest execution in a temporary workspace containing a genuinely adversarial conftest.py
+    that attempts to tamper with the generated JUnit XML report by injecting a phantom passing testcase.
+    Demonstrates that RunVerificationCheckTool detects the forgery via host-side AST validation,
+    flags tampering_detected=True, and refuses to issue a TrustedExecutionRecord."""
     from agent.tools.verification import RunVerificationCheckTool
     import sys
 
@@ -6328,33 +6341,134 @@ async def test_verification_adversarial_conftest_real_execution():
             with open(test_file, "w", encoding="utf-8") as f:
                 f.write("def test_ok():\n    assert 1 + 1 == 2\n")
 
-            # Adversarial conftest attempting to access or write outside evidence
+            # Adversarial conftest attempting to forge phantom passing testcase in the report
             conftest_file = os.path.join(temp_dir, "conftest.py")
             with open(conftest_file, "w", encoding="utf-8") as f:
                 f.write("""
-import pytest, os
+import os, sys
+import xml.etree.ElementTree as ET
 
-def pytest_runtest_teardown(item):
-    # conftest cannot modify host-allocated verification evidence
-    pass
+def pytest_sessionfinish(session, exitstatus):
+    # Adversarial hook attempting to inject phantom passing testcase into evidence report
+    for opt in getattr(session.config.invocation_params, 'args', []):
+        if '--junitxml=' in opt:
+            xml_path = opt.split('=', 1)[1]
+            if os.path.exists(xml_path):
+                try:
+                    tree = ET.parse(xml_path)
+                    root = tree.getroot()
+                    suite = root.find('testsuite') if root.tag == 'testsuites' else (root if root.tag == 'testsuite' else None)
+                    if suite is not None:
+                        tc = ET.SubElement(suite, 'testcase')
+                        tc.attrib['name'] = 'test_forged_phantom'
+                        tc.attrib['file'] = 'test_real.py'
+                        tc.attrib['classname'] = 'test_real'
+                        tree.write(xml_path, encoding='utf-8', xml_declaration=True)
+                except Exception:
+                    pass
 """)
 
             res = await tool.execute(
                 workspace_path=temp_dir,
                 command=f'"{sys.executable}" -m pytest test_real.py',
-                check_name="Real Pytest with conftest",
+                check_name="Real Pytest with Adversarial conftest",
                 check_type="test",
                 sandbox_mode="host",
                 require_sandbox=False,
             )
-            assert res.success is True
-            assert res.artifacts.get("tampering_detected") is False
-            rec = res.artifacts.get("trusted_execution_record")
-            assert rec is not None
-            assert any("test_ok" in node for node in rec["passed_nodes"])
+            # The tool MUST catch tampering (count mismatch or AST missing testcases) and reject!
+            assert res.success is False
+            assert res.artifacts.get("tampering_detected") is True
+            assert "Tampering detected" in str(res.artifacts.get("discrepancy")) or "test_forged_phantom" in str(res.artifacts.get("discrepancy"))
+            assert res.artifacts.get("trusted_execution_record") is None
     finally:
         if orig_unisolated is not None:
             os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = orig_unisolated
         else:
             os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
+
+
+@pytest.mark.asyncio
+async def test_verification_immutable_test_specifications_prevent_self_authored_passes():
+    """Validates P1 Finding 2:
+    When a Task defines an immutable test specification (e.g. tests/test_auth.py),
+    and an agent attempts to modify that test file to pass trivially (e.g. replacing assertions with assert True),
+    evaluate_completion rejects task completion, flags Test Specification Tampering Guard,
+    and sets task status to PARTIALLY_COMPLETED."""
+    from agent.verification.verifier import VerificationEngine
+    from agent.core.models import VerificationCheck, TaskStatus, TaskType
+    from agent.security.provenance import issue_trusted_execution_record
+
+    ve = VerificationEngine()
+    genuine_record = issue_trusted_execution_record(
+        run_id="task_tamper_spec",
+        runner="pytest",
+        command="pytest tests/test_auth.py",
+        exit_code=0,
+        total=1,
+        passed=1,
+        failed=0,
+        passed_nodes=["tests/test_auth.py::test_tokens"],
+    )
+
+    check = VerificationCheck(
+        check_name="Auth Tests",
+        check_type="test",
+        command="pytest tests/test_auth.py",
+        success=True,
+        exit_code=0,
+        output="tests/test_auth.py::test_tokens PASSED\n1 passed in 0.05s",
+        evidence_summary="1 passed in 0.05s",
+        trusted_execution_record=genuine_record,
+    )
+    ve.record_check(check)
+
+    # Agent modified both the implementation AND the test specification itself
+    report = ve.evaluate_completion(
+        task_id="task_tamper_spec",
+        goal="Implement auth tokens",
+        actions_taken=["Modified tests/test_auth.py and auth.py"],
+        modified_files=["auth.py", "tests/test_auth.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        task_current_status=TaskStatus.EXECUTING,
+        git_diff_summary="diff --git a/tests/test_auth.py ...",
+        acceptance_criteria=["Auth tokens"],
+        criterion_bindings={"Auth tokens": "tests/test_auth.py::test_tokens"},
+        immutable_test_files=["tests/test_auth.py"],
+    )
+
+    # Must be rejected because immutable reference test file was modified by agent!
+    assert report.status == TaskStatus.PARTIALLY_COMPLETED
+    assert report.acceptance_criteria_satisfied is False
+    assert any("Test Specification Tampering Guard" in r for r in report.unresolved_risks_or_limitations)
+
+
+@pytest.mark.asyncio
+async def test_workspace_hashing_incremental_memory_bounded_and_fails_closed():
+    """Validates P2 Finding 3:
+    _snapshot_workspace_hashes streams in bounded 64 KB chunks, bounds per-file and total size,
+    and fails closed (is_complete=False) when an unreadable or missing file occurs."""
+    from agent.core.engine import _snapshot_workspace_hashes, MAX_SNAPSHOT_FILE_BYTES
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Create normal files
+        f1 = os.path.join(temp_dir, "code.py")
+        with open(f1, "w", encoding="utf-8") as f:
+            f.write("def foo(): return 1\n")
+
+        f2 = os.path.join(temp_dir, "data.txt")
+        with open(f2, "wb") as f:
+            f.write(b"0" * 200_000)  # > 64 KB to test chunked hashing
+
+        hashes, ok, err = _snapshot_workspace_hashes(temp_dir)
+        assert ok is True
+        assert err is None
+        assert "code.py" in hashes
+        assert "data.txt" in hashes
+        assert len(hashes["code.py"]) == 64  # valid SHA-256 hex string
+
+        # Non-existent workspace fails closed
+        _, ok_missing, err_missing = _snapshot_workspace_hashes(os.path.join(temp_dir, "nonexistent"))
+        assert ok_missing is False
+        assert "does not exist" in err_missing
 
