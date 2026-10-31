@@ -1983,6 +1983,24 @@ async def test_real_docker_container_security_boundaries():
             "Security Failure: Container startup failure must NEVER silently fall back to host execution!"
         )
 
+        # 8. Immutable test container mount read-only proof
+        import hashlib
+        test_spec_path = os.path.join(temp_dir, "test_spec.py")
+        with open(test_spec_path, "w") as f:
+            f.write("def test_original(): pass\n")
+        spec_hash = hashlib.sha256(open(test_spec_path, "rb").read()).hexdigest()
+        ro_res = await tool.execute(
+            call_id="c_real_ro_mount",
+            workspace_path=temp_dir,
+            command='python3 -c "open(\'test_spec.py\', \'w\').write(\'tampered\')"',
+            sandbox_mode="container",
+            immutable_test_files=["test_spec.py"],
+        )
+        assert ro_res.success is False
+        assert ro_res.artifacts.get("exit_code") != 0
+        assert "Read-only file system" in ro_res.output or "Permission denied" in ro_res.output or "OSError" in str(ro_res.error)
+        assert hashlib.sha256(open(test_spec_path, "rb").read()).hexdigest() == spec_hash
+
 
 def test_verifier_rejects_fabricated_runner_output_without_trusted_execution_record():
     """Adversarial Test 1:
@@ -6840,6 +6858,7 @@ async def test_engine_immutable_test_intra_command_tamper_detected_e2e():
     from agent.persistence.db import Database
     from unittest.mock import MagicMock, AsyncMock, patch
     from agent.providers.base import ProviderResponse, LLMToolCall
+    import hashlib
 
     with tempfile.TemporaryDirectory() as temp_dir:
         tests_dir = os.path.join(temp_dir, "tests")
@@ -6853,6 +6872,7 @@ async def test_engine_immutable_test_intra_command_tamper_detected_e2e():
         db = Database(db_path=db_path)
         await db.init()
         registry = ToolRegistry()
+        initial_hash = hashlib.sha256(open(test_file, "rb").read()).hexdigest()
 
         task = Task(
             id="task_intra_tamper_e2e",
@@ -6901,6 +6921,26 @@ async def test_engine_immutable_test_intra_command_tamper_detected_e2e():
         orig_unisolated = os.environ.get("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION")
         os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
         try:
+            # 1. Directly assert that the underlying terminal execution fails with non-zero exit code
+            # and permission denied output, proving that the read-only mechanism actively blocked the write
+            tool = registry.get("run_command")
+            direct_write_res = await tool.execute(
+                workspace_path=temp_dir,
+                command=f'python -c "open(\'tests/test_auth.py\', \'w\').write(\'def test_token_auth(): pass\\n\')"',
+                immutable_test_files=["tests/test_auth.py"],
+                sandbox_mode="host",
+                require_sandbox=False,
+            )
+            assert direct_write_res.success is False
+            assert direct_write_res.artifacts.get("exit_code") != 0
+            assert (
+                "PermissionError" in direct_write_res.output
+                or "Permission denied" in direct_write_res.output
+                or "Access is denied" in direct_write_res.output
+                or "Read-only file system" in direct_write_res.output
+            )
+
+            # 2. Run through full ExecutionEngine flow
             with patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter):
                 engine = ExecutionEngine(db=db, tool_registry=registry, permission_manager=pm, on_event=event_collector)
                 completed = await engine.run_task(task, api_key="sk-test")
@@ -6910,14 +6950,167 @@ async def test_engine_immutable_test_intra_command_tamper_detected_e2e():
             assert completed.final_report.acceptance_criteria_satisfied is False
             assert any("Test Specification Tampering Guard" in r for r in completed.final_report.unresolved_risks_or_limitations)
 
-            # Verify file content is strictly preserved on disk
+            # Verify file content and SHA256 hash are strictly preserved on disk
             with open(test_file, "r", encoding="utf-8") as f:
                 assert f.read() == original_content
+            assert hashlib.sha256(open(test_file, "rb").read()).hexdigest() == initial_hash
         finally:
             if orig_unisolated is not None:
                 os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = orig_unisolated
             else:
                 os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
+
+
+@pytest.mark.asyncio
+async def test_immutable_test_write_then_restore_attack_rejected():
+    """Validates that a composite write-then-restore attack command (e.g. backup, overwrite, test, restore)
+    is caught by the engine's intra-command tampering detector, prevented by filesystem write protection,
+    and reliably rejected from verified completion."""
+    from agent.core.engine import ExecutionEngine
+    from agent.core.models import Task, TaskStatus, TaskType
+    from agent.tools.registry import ToolRegistry
+    from agent.persistence.db import Database
+    from agent.security.permissions import PermissionManager
+    from unittest.mock import MagicMock, AsyncMock, patch
+    from agent.providers.base import ProviderResponse, LLMToolCall
+    import hashlib
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tests_dir = os.path.join(temp_dir, "tests")
+        os.makedirs(tests_dir, exist_ok=True)
+        test_file = os.path.join(tests_dir, "test_critical.py")
+        original_content = "def test_critical_security_invariant(): assert False\n"
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write(original_content)
+        baseline_hash = hashlib.sha256(open(test_file, "rb").read()).hexdigest()
+
+        db = Database(db_path=os.path.join(temp_dir, "test_restore.db"))
+        await db.init()
+        registry = ToolRegistry()
+        pm = PermissionManager()
+
+        task = Task(
+            id="t_write_then_restore",
+            goal="Attempt write and restore bypass",
+            workspace_path=temp_dir,
+            task_type=TaskType.CODE_MODIFICATION,
+            model_provider="local",
+            model_name="local-model",
+            immutable_test_files=["tests/test_critical.py"],
+        )
+
+        # Composite command: backup, overwrite with passing test, run, and restore
+        composite_cmd = (
+            'python -c "import shutil; shutil.copy(\'tests/test_critical.py\', \'tests/test_critical.py.bak\'); '
+            'open(\'tests/test_critical.py\', \'w\').write(\'def test_critical_security_invariant(): pass\\n\'); '
+            'shutil.move(\'tests/test_critical.py.bak\', \'tests/test_critical.py\')"'
+        )
+
+        mock_adapter = MagicMock()
+        mock_adapter.chat_completion = AsyncMock(side_effect=[
+            ProviderResponse(
+                content="Executing write then restore attack",
+                tool_calls=[
+                    LLMToolCall(
+                        id="c_restore_attack",
+                        name="run_command",
+                        arguments={"command": composite_cmd},
+                    ),
+                ],
+            ),
+            ProviderResponse(content="I completed the test fix", tool_calls=[]),
+        ])
+
+        async def event_collector(event_type: str, data: dict):
+            if event_type == "approval_required":
+                approval_id = data["approval"]["approval_id"]
+                pm.resolve_approval(approval_id, approved=True)
+
+        orig_unisolated = os.environ.get("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION")
+        os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
+        try:
+            with patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter):
+                engine = ExecutionEngine(db=db, tool_registry=registry, permission_manager=pm, on_event=event_collector)
+                completed = await engine.run_task(task, api_key="sk-test")
+
+            # Task must NOT be marked COMPLETED; must fail with tampering guard flag
+            assert completed.status == TaskStatus.PARTIALLY_COMPLETED
+            assert completed.final_report.acceptance_criteria_satisfied is False
+            assert any("Test Specification Tampering Guard" in r for r in completed.final_report.unresolved_risks_or_limitations)
+
+            # On-disk content and hash must remain completely identical
+            with open(test_file, "r", encoding="utf-8") as f:
+                assert f.read() == original_content
+            assert hashlib.sha256(open(test_file, "rb").read()).hexdigest() == baseline_hash
+        finally:
+            if orig_unisolated is not None:
+                os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = orig_unisolated
+            else:
+                os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
+
+
+def test_conservative_git_subcommand_policy():
+    """Validates the conservative Git subcommand policy:
+    1. Dangerous local and remote mutating subcommands (submodule deinit, push --delete, push :branch, filter-branch) are DESTRUCTIVE.
+    2. Vetted read-only subcommands (status, diff, log, show, rev-parse) are ROUTINE.
+    3. Vetted safe mutating subcommands (add, commit, checkout -b, switch) are ROUTINE.
+    4. Unrecognized or arbitrary mutating Git subcommands (e.g. replace, filter-repo) fail closed as DESTRUCTIVE."""
+    from agent.security.permissions import classify_command_risk, PermissionLevel
+
+    # 1. Dangerous git commands that must be DESTRUCTIVE
+    destructive_git_cases = [
+        "git submodule deinit --force .",
+        "git submodule deinit -f submod",
+        "git push origin --delete old-branch",
+        "git push origin -d feature-branch",
+        "git push origin :old-branch",
+        "git push --force origin main",
+        "git filter-branch --tree-filter 'rm -f passwords.txt' HEAD",
+        "git filter-repo --invert-paths --path secrets.txt",
+        "git config user.name 'attacker'",
+        "git remote rm origin",
+        "git remote remove upstream",
+        "git remote prune origin",
+        "git merge --abort",
+        "git cherry-pick --abort",
+        "git replace HEAD~1 HEAD",
+    ]
+    for cmd in destructive_git_cases:
+        level, reason = classify_command_risk(cmd)
+        assert level == PermissionLevel.DESTRUCTIVE_OPERATION, f"Expected DESTRUCTIVE for '{cmd}', got {level} ({reason})"
+
+    # 2. Vetted safe read-only commands that should be ROUTINE
+    routine_readonly_cases = [
+        "git status",
+        "git status -s",
+        "git log -n 5 --oneline",
+        "git diff HEAD~1",
+        "git show HEAD",
+        "git rev-parse HEAD",
+        "git describe --tags",
+        "git remote -v",
+        "git config --get user.name",
+        "git config --list",
+    ]
+    for cmd in routine_readonly_cases:
+        level, reason = classify_command_risk(cmd)
+        assert level == PermissionLevel.ROUTINE_MODIFICATION, f"Expected ROUTINE for '{cmd}', got {level} ({reason})"
+
+    # 3. Vetted routine mutating operations that should be ROUTINE
+    routine_mutating_cases = [
+        "git add .",
+        "git add path/to/file.py",
+        "git commit -m 'feat: implement fix'",
+        "git checkout -b new-feature",
+        "git switch main",
+        "git branch new-branch",
+        "git tag v1.0.1",
+        "git stash",
+        "git stash push -m 'wip'",
+    ]
+    for cmd in routine_mutating_cases:
+        level, reason = classify_command_risk(cmd)
+        assert level == PermissionLevel.ROUTINE_MODIFICATION, f"Expected ROUTINE for '{cmd}', got {level} ({reason})"
 
 
 @pytest.mark.asyncio
@@ -7023,6 +7216,7 @@ async def test_engine_proactively_blocks_file_write_to_immutable_tests():
     from agent.security.permissions import PermissionManager
     from unittest.mock import MagicMock, AsyncMock, patch
     from agent.providers.base import ProviderResponse, LLMToolCall
+    import hashlib
 
     with tempfile.TemporaryDirectory() as temp_dir:
         tests_dir = os.path.join(temp_dir, "tests")

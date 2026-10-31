@@ -103,6 +103,10 @@ jobs:
       working-directory: ui
       run: npm ci
 
+    - name: Lint UI
+      working-directory: ui
+      run: npm run lint
+
     - name: Build & Typecheck UI
       working-directory: ui
       run: npm run build

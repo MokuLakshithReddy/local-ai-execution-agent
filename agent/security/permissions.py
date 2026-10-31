@@ -92,8 +92,29 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
         exe = os.path.basename(sub[idx]).lower().replace('"', '').replace("'", "")
         args = [a.lower().replace('"', '').replace("'", "") for a in sub[idx + 1:]]
 
-        # A. git inspection: operations that overwrite, discard, or delete files or repository history
+        # A. git inspection: conservative Git subcommand and argument security policy
         if exe == "git" or exe.startswith("git."):
+            # Parse git global options to locate the git subcommand
+            subcmd = None
+            subcmd_args = []
+            skip_next = False
+            for i, a in enumerate(args):
+                if skip_next:
+                    skip_next = False
+                    continue
+                if a in ("-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix"):
+                    skip_next = True
+                    continue
+                if a.startswith(("-c", "-C", "--git-dir=", "--work-tree=", "--namespace=")):
+                    continue
+                if a.startswith("-") and not subcmd:
+                    continue
+                if not subcmd:
+                    subcmd = a
+                    subcmd_args = args[i + 1:]
+                    break
+
+            # 1. Explicit destructive git commands
             if "clean" in args:
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
@@ -164,15 +185,91 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                     PermissionLevel.DESTRUCTIVE_OPERATION,
                     f"High risk: Git prune repository objects ('{cmd[:60]}...') requires explicit human authorization.",
                 )
-            if "push" in args and any(a in ("-f", "--force", "--force-with-lease") or a.startswith("--force") for a in args):
-                return (
-                    PermissionLevel.DESTRUCTIVE_OPERATION,
-                    f"High risk: Git force push operation ('{cmd[:60]}...') requires explicit human authorization.",
-                )
+            if "push" in args:
+                if any(
+                    a in ("-f", "--force", "--force-with-lease", "--delete", "-d")
+                    or a.startswith("--force")
+                    or a.startswith("--delete")
+                    or (a.startswith(":") and len(a) > 1)
+                    for a in args
+                ):
+                    return (
+                        PermissionLevel.DESTRUCTIVE_OPERATION,
+                        f"High risk: Git force push or remote branch deletion ('{cmd[:60]}...') requires explicit human authorization.",
+                    )
             if "gc" in args and any(a in ("--prune", "--force") or a.startswith("--prune") or a.startswith("--force") for a in args):
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
                     f"High risk: Git garbage collection with pruning ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "submodule" in args:
+                if any(a in ("deinit", "absorbgitdirs") or a.startswith("deinit") or "--force" in args or "-f" in args for a in subcmd_args):
+                    return (
+                        PermissionLevel.DESTRUCTIVE_OPERATION,
+                        f"High risk: Git submodule deinitialization/removal ('{cmd[:60]}...') requires explicit human authorization.",
+                    )
+            if subcmd in ("filter-branch", "filter-repo"):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git repository rewrite operation ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if subcmd == "merge" and any(a in ("--abort", "--quit") for a in subcmd_args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git merge abort operation ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if subcmd == "cherry-pick" and any(a in ("--abort", "--quit") for a in subcmd_args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git cherry-pick abort operation ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+
+            # 2. Vetted read-only / safe inspection git subcommands
+            GIT_READ_ONLY_SUBCMDS = {
+                "status", "log", "diff", "show", "rev-parse", "describe", "merge-base",
+                "cat-file", "check-ignore", "ls-files", "ls-remote", "ls-tree", "shortlog",
+                "blame", "annotate", "var", "version", "whatchanged", "name-rev",
+                "count-objects", "fsck"
+            }
+            if subcmd in GIT_READ_ONLY_SUBCMDS:
+                return PermissionLevel.ROUTINE_MODIFICATION, None
+
+            # 3. Vetted routine mutating git subcommands
+            GIT_ROUTINE_MUTATION_SUBCMDS = {
+                "add", "commit", "init", "fetch", "clone", "checkout", "switch",
+                "branch", "tag", "stash", "merge", "cherry-pick", "pull"
+            }
+            if subcmd == "config":
+                if any(a in ("--get", "--list", "-l", "--get-all", "--get-regexp") for a in subcmd_args):
+                    return PermissionLevel.ROUTINE_MODIFICATION, None
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git configuration modification ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+
+            if subcmd == "remote":
+                if any(a in ("rm", "remove", "prune") for a in subcmd_args):
+                    return (
+                        PermissionLevel.DESTRUCTIVE_OPERATION,
+                        f"High risk: Git remote removal/pruning ('{cmd[:60]}...') requires explicit human authorization.",
+                    )
+                if any(a in ("-v", "show", "get-url") for a in subcmd_args) or not subcmd_args:
+                    return PermissionLevel.ROUTINE_MODIFICATION, None
+
+            # If subcommand is recognized routine and passed all destructive checks above
+            if subcmd in GIT_ROUTINE_MUTATION_SUBCMDS:
+                return PermissionLevel.ROUTINE_MODIFICATION, None
+
+            # 4. Conservative Git policy: Any unrecognized or unvetted Git subcommand requires approval
+            if subcmd is not None:
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"Conservative policy: Unrecognized Git subcommand '{subcmd}' ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            elif not any(a in ("--version", "-v", "--help", "-h") for a in args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"Conservative policy: Bare or unrecognized Git invocation ('{cmd[:60]}...') requires explicit human authorization.",
                 )
 
         # Destructive file manipulation utilities

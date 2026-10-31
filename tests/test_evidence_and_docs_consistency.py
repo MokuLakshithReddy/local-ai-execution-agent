@@ -48,7 +48,22 @@ def test_evidence_and_docs_consistency():
         f"README Quick Start count ({readme_qs_count}) does not match EVIDENCE.md total ({ev_total})"
     )
 
-    # 5. Verify commit SHA provenance and git reachability
+    # 5. Check README Verified Suite Summary section and terminal session block
+    readme_vss_match = re.search(r"Verified Suite Summary:\s*(\d+)\s+Comprehensive Automated Tests", readme_content)
+    assert readme_vss_match is not None, "README must declare Verified Suite Summary count"
+    readme_vss_count = int(readme_vss_match.group(1))
+    assert readme_vss_count == ev_total, (
+        f"README Verified Suite Summary count ({readme_vss_count}) does not match EVIDENCE.md total ({ev_total})"
+    )
+
+    readme_session_match = re.search(r"={10,}\s*(\d+)\s+passed\s+\(100\.0%\s+Green CI\)", readme_content)
+    assert readme_session_match is not None, "README must declare terminal session passed count"
+    readme_session_count = int(readme_session_match.group(1))
+    assert readme_session_count == ev_total, (
+        f"README terminal session count ({readme_session_count}) does not match EVIDENCE.md total ({ev_total})"
+    )
+
+    # 6. Verify commit SHA provenance and git reachability
     ev_sha_match = re.search(r"\*\*Commit SHA\*\*\s*:\s*`([a-f0-9]{40})`", evidence_content)
     assert ev_sha_match is not None, "EVIDENCE.md must declare a valid 40-character hexadecimal Commit SHA"
     ev_sha = ev_sha_match.group(1)
