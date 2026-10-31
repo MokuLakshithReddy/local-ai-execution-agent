@@ -6665,18 +6665,30 @@ async def test_api_create_task_immutable_test_files_and_traversal_rejection():
     assert "directory traversal" in res_bad.json()["detail"]
 
     # 2. Valid immutable_test_files is accepted
-    res_ok = client.post(
-        "/api/tasks",
-        headers=headers,
-        json={
-            "goal": "Test goal",
-            "model_provider": "local",
-            "immutable_test_files": ["tests/test_auth.py"],
-        },
-    )
-    assert res_ok.status_code == 200
-    task_id = res_ok.json()["task_id"]
-    assert task_id is not None
+    with tempfile.TemporaryDirectory() as temp_dir:
+        app_res = client.post(
+            "/api/workspaces/approve",
+            headers=headers,
+            json={"workspace_path": temp_dir},
+        )
+        assert app_res.status_code == 200
+        os.makedirs(os.path.join(temp_dir, "tests"), exist_ok=True)
+        with open(os.path.join(temp_dir, "tests", "test_auth.py"), "w", encoding="utf-8") as fp:
+            fp.write("def test_ok(): pass\n")
+
+        res_ok = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "goal": "Test goal",
+                "workspace_path": temp_dir,
+                "model_provider": "local",
+                "immutable_test_files": ["tests/test_auth.py"],
+            },
+        )
+        assert res_ok.status_code == 200
+        task_id = res_ok.json()["task_id"]
+        assert task_id is not None
 
 
 @pytest.mark.asyncio
@@ -6704,4 +6716,201 @@ async def test_immutable_test_protection_catches_temporary_modification_and_rest
     assert report.acceptance_criteria_satisfied is False
     assert any("Test Specification Tampering Guard" in r for r in report.unresolved_risks_or_limitations)
 
+@pytest.mark.asyncio
+async def test_git_restore_and_checkout_classified_as_destructive():
+    """Validates Issue 2:
+    Git restore, checkout (overwriting worktree), reset, rm, switch -f, and data erasure utilities
+    are strictly classified as DESTRUCTIVE_OPERATION so they require explicit human approval."""
+    from agent.security.permissions import classify_command_risk, PermissionLevel
 
+    # 1. git restore operations
+    lvl, _ = classify_command_risk("git restore tests/test_auth.py")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk("git restore --worktree .")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk("git restore --staged main.py")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # 2. git checkout operations that overwrite files
+    lvl, _ = classify_command_risk("git checkout -- tests/test_auth.py")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk("git checkout .")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk("git checkout -f main")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # 3. git reset and rm operations
+    lvl, _ = classify_command_risk("git reset HEAD~1")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk("git rm src/app.py")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk("git switch -f feature-branch")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # 4. Low-level destructive tools
+    lvl, _ = classify_command_risk("truncate -s 0 important.txt")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk("dd if=/dev/zero of=data.db")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # 5. Routine non-destructive git commands remain routine
+    lvl, _ = classify_command_risk("git status")
+    assert lvl == PermissionLevel.ROUTINE_MODIFICATION
+    lvl, _ = classify_command_risk("git diff")
+    assert lvl == PermissionLevel.ROUTINE_MODIFICATION
+    lvl, _ = classify_command_risk("git log -n 5")
+    assert lvl == PermissionLevel.ROUTINE_MODIFICATION
+
+
+@pytest.mark.asyncio
+async def test_api_create_task_immutable_test_files_rejects_missing_and_symlinks():
+    """Validates Issue 1 (API Validation):
+    The API rejects immutable_test_files that do not exist, resolve to directories, or are symlinks."""
+    from fastapi.testclient import TestClient
+    from agent.api.server import app, SESSION_TOKEN
+
+    client = TestClient(app)
+    headers = {"X-Agent-Auth-Token": SESSION_TOKEN}
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Create an authorized workspace
+        app_res = client.post(
+            "/api/workspaces/approve",
+            headers=headers,
+            json={"workspace_path": temp_dir},
+        )
+        assert app_res.status_code == 200
+
+        # 1. Missing file is rejected
+        res_missing = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "goal": "Test missing file",
+                "workspace_path": temp_dir,
+                "model_provider": "local",
+                "immutable_test_files": ["tests/nonexistent.py"],
+            },
+        )
+        assert res_missing.status_code == 400
+        assert "does not exist or is not a regular file" in res_missing.json()["detail"]
+
+        # 2. Directory is rejected
+        os.makedirs(os.path.join(temp_dir, "tests"), exist_ok=True)
+        res_dir = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "goal": "Test directory target",
+                "workspace_path": temp_dir,
+                "model_provider": "local",
+                "immutable_test_files": ["tests"],
+            },
+        )
+        assert res_dir.status_code == 400
+        assert "does not exist or is not a regular file" in res_dir.json()["detail"]
+
+        # 3. Existing regular file is accepted
+        real_file = os.path.join(temp_dir, "tests", "test_valid.py")
+        with open(real_file, "w", encoding="utf-8") as f:
+            f.write("def test_ok(): pass\n")
+
+        res_ok = client.post(
+            "/api/tasks",
+            headers=headers,
+            json={
+                "goal": "Test valid immutable file",
+                "workspace_path": temp_dir,
+                "model_provider": "local",
+                "immutable_test_files": ["tests/test_valid.py"],
+            },
+        )
+        assert res_ok.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_engine_immutable_test_intra_command_tamper_detected_e2e():
+    """Validates Issue 1 (Real E2E Intra-Command Modification & Restore):
+    An agent executes a command that attempts to modify and restore an immutable test file within
+    the same command. The engine's intra-command defense and tampering detector catches the attempt
+    and rejects completion with PARTIALLY_COMPLETED."""
+    from agent.core.engine import ExecutionEngine
+    from agent.core.models import Task, TaskStatus, TaskType
+    from agent.tools.registry import ToolRegistry
+    from agent.persistence.db import Database
+    from unittest.mock import MagicMock, AsyncMock, patch
+    from agent.providers.base import ProviderResponse, LLMToolCall
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        tests_dir = os.path.join(temp_dir, "tests")
+        os.makedirs(tests_dir, exist_ok=True)
+        test_file = os.path.join(tests_dir, "test_auth.py")
+        original_content = "def test_token_auth(): assert False, 'unimplemented'\n"
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write(original_content)
+
+        db_path = os.path.join(temp_dir, "test.db")
+        db = Database(db_path=db_path)
+        await db.init()
+        registry = ToolRegistry()
+
+        task = Task(
+            id="task_intra_tamper_e2e",
+            goal="Fix authentication and pass tests",
+            workspace_path=temp_dir,
+            task_type=TaskType.CODE_MODIFICATION,
+            model_provider="local",
+            model_name="local-model",
+            immutable_test_files=["tests/test_auth.py"],
+        )
+
+        # Adversarial sequence: A command that attempts to overwrite test_auth.py and then restore it
+        # E.g. using shell redirection: echo 'def test_token_auth(): pass' > tests/test_auth.py
+        mock_adapter = MagicMock()
+        mock_adapter.chat_completion = AsyncMock(side_effect=[
+            ProviderResponse(
+                content="Attempting intra-command tamper and test execution",
+                tool_calls=[
+                    LLMToolCall(
+                        id="c1",
+                        name="run_command",
+                        arguments={
+                            "command": f'python -c "open(\'tests/test_auth.py\', \'w\').write(\'def test_token_auth(): pass\\n\')"',
+                        },
+                    ),
+                    LLMToolCall(
+                        id="c2",
+                        name="run_verification",
+                        arguments={
+                            "check_name": "Auth Test",
+                            "command": "python -m pytest tests/test_auth.py",
+                        },
+                    ),
+                ],
+            ),
+            ProviderResponse(content="Completed fix", tool_calls=[]),
+        ])
+
+        from agent.security.permissions import PermissionManager
+        pm = PermissionManager()
+        async def event_collector(event_type: str, data: dict):
+            if event_type == "approval_required":
+                approval_id = data["approval"]["approval_id"]
+                pm.resolve_approval(approval_id, approved=True)
+
+        orig_unisolated = os.environ.get("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION")
+        os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
+        try:
+            with patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter):
+                engine = ExecutionEngine(db=db, tool_registry=registry, permission_manager=pm, on_event=event_collector)
+                completed = await engine.run_task(task, api_key="sk-test")
+
+            # Must be rejected because intra-command tampering was detected!
+            assert completed.status == TaskStatus.PARTIALLY_COMPLETED
+            assert completed.final_report.acceptance_criteria_satisfied is False
+            assert any("Test Specification Tampering Guard" in r for r in completed.final_report.unresolved_risks_or_limitations)
+        finally:
+            if orig_unisolated is not None:
+                os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = orig_unisolated
+            else:
+                os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)

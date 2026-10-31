@@ -153,6 +153,7 @@ export default function App() {
   const [provider, setProvider] = useState('gemini')
   const [model, setModel] = useState('gemini-2.5-flash')
   const [maxSteps, setMaxSteps] = useState(30)
+  const [immutableTestFiles, setImmutableTestFiles] = useState('')
   const [currentWorkspace, setCurrentWorkspace] = useState('')
   const [activeTab, setActiveTab] = useState<'timeline' | 'diff' | 'verification' | 'history'>('timeline')
 
@@ -642,6 +643,10 @@ export default function App() {
           model_name: model,
           max_steps: maxSteps,
           workspace_path: currentWorkspace,
+          immutable_test_files: immutableTestFiles
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean),
         }),
       })
 
@@ -766,6 +771,11 @@ export default function App() {
       setTaskStatus(t.status)
       setCurrentStep(t.current_step)
       setMaxSteps(t.max_steps)
+      if (Array.isArray(t.immutable_test_files)) {
+        setImmutableTestFiles(t.immutable_test_files.join(', '))
+      } else {
+        setImmutableTestFiles('')
+      }
       setFinalReport(t.final_report || null)
       if (t.workspace_path) {
         setCurrentWorkspace(t.workspace_path)
@@ -971,6 +981,23 @@ export default function App() {
               disabled={isRunning}
               style={{ width: '100%', accentColor: 'var(--primary)' }}
               aria-label="Max Step Limit Slider"
+            />
+          </div>
+
+          <div>
+            <div className="section-label" style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span>Protected Tests (Immutable)</span>
+              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>Comma-separated</span>
+            </div>
+            <input
+              type="text"
+              className="text-input"
+              placeholder="e.g. tests/test_auth.py"
+              value={immutableTestFiles}
+              onChange={(e) => setImmutableTestFiles(e.target.value)}
+              disabled={isRunning}
+              style={{ width: '100%', fontSize: 13, padding: '7px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg-input)' }}
+              aria-label="Immutable Test Specifications"
             />
           </div>
 

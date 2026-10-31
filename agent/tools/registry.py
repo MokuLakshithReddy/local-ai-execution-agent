@@ -116,7 +116,7 @@ def validate_tool_call_schema(tool: BaseTool, kwargs: Dict[str, Any]) -> Tuple[b
     framework_args = {
         "call_id", "task_id", "run_id", "timeout_seconds",
         "sandbox_mode", "require_sandbox", "untrusted_workload",
-        "allow_network", "extra_mounts", "allowed_paths",
+        "allow_network", "extra_mounts", "allowed_paths", "immutable_test_files",
         "target_content", "replacement_content"  # aliases accepted by PatchFileTool
     }
 

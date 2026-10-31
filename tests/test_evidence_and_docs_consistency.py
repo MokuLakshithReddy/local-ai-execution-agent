@@ -48,3 +48,34 @@ def test_evidence_and_docs_consistency():
         f"README Quick Start count ({readme_qs_count}) does not match EVIDENCE.md total ({ev_total})"
     )
 
+    # 5. Verify commit SHA provenance and git reachability
+    ev_sha_match = re.search(r"\*\*Commit SHA\*\*\s*:\s*`([a-f0-9]{40})`", evidence_content)
+    assert ev_sha_match is not None, "EVIDENCE.md must declare a valid 40-character hexadecimal Commit SHA"
+    ev_sha = ev_sha_match.group(1)
+
+    import subprocess
+    try:
+        # Commit must exist in the git object database
+        verify_proc = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{ev_sha}^{{commit}}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert verify_proc.returncode == 0, (
+            f"EVIDENCE.md references non-existent git commit SHA: {ev_sha}"
+        )
+
+        # Commit must be part of current branch history (ancestor of HEAD or HEAD itself)
+        ancestor_proc = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", ev_sha, "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert ancestor_proc.returncode == 0, (
+            f"EVIDENCE.md commit SHA {ev_sha} is not an ancestor of current HEAD"
+        )
+    except FileNotFoundError:
+        pass
+

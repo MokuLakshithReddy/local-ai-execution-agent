@@ -650,6 +650,16 @@ class RunCommandTool(BaseTool):
                 execution_time_ms=(time.time() - t0) * 1000,
             )
 
+        # Enforce read-only mounts and write-protection for designated immutable test specifications
+        immutable_test_files = kwargs.get("immutable_test_files") or []
+        for itf in immutable_test_files:
+            clean_itf = itf.strip().replace("\\", "/")
+            full_itf = os.path.join(real_workspace, clean_itf) if not os.path.isabs(clean_itf) else os.path.realpath(clean_itf)
+            if os.path.exists(full_itf) and os.path.isfile(full_itf) and not os.path.islink(full_itf):
+                real_itf = os.path.realpath(full_itf)
+                rel_itf = os.path.relpath(real_itf, real_workspace).replace("\\", "/")
+                extra_mounts.append(f"{real_itf}:/workspace/{rel_itf}:ro")
+
         # Enforce sandbox filesystem, escape, and network isolation
         try:
             validate_sandbox_command(
@@ -925,6 +935,20 @@ class RunCommandTool(BaseTool):
         except SandboxViolationError:
             job_sandbox = None
 
+        # Enforce host-level write-protection on immutable test files during unisolated host execution
+        protected_host_paths = []
+        import stat
+        for itf in immutable_test_files:
+            clean_itf = itf.strip().replace("\\", "/")
+            full_itf = os.path.join(real_workspace, clean_itf) if not os.path.isabs(clean_itf) else os.path.realpath(clean_itf)
+            if os.path.exists(full_itf) and os.path.isfile(full_itf) and not os.path.islink(full_itf):
+                try:
+                    orig_st_mode = os.stat(full_itf).st_mode
+                    os.chmod(full_itf, stat.S_IREAD)
+                    protected_host_paths.append((full_itf, orig_st_mode))
+                except Exception:
+                    pass
+
         try:
             process = await asyncio.create_subprocess_shell(
                 command,
@@ -974,6 +998,11 @@ class RunCommandTool(BaseTool):
                 )
             finally:
                 unregister_task_process(task_id, process)
+                for p, mode in protected_host_paths:
+                    try:
+                        os.chmod(p, mode | stat.S_IWRITE)
+                    except Exception:
+                        pass
 
             exit_code = process.returncode
             stdout_str = stdout_bytes.decode("utf-8", errors="replace")

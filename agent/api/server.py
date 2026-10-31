@@ -554,7 +554,7 @@ async def create_task(req: CreateTaskRequest):
                 detail=f"API key for '{req.model_provider}' is not configured. Please supply an API key in Settings.",
             )
 
-        # Validate immutable test file specifications if provided
+        # Validate immutable test file specifications if provided: must exist as regular non-symlink files within workspace
         validated_immutable_test_files = []
         if req.immutable_test_files:
             for itf in req.immutable_test_files:
@@ -566,7 +566,25 @@ async def create_task(req: CreateTaskRequest):
                         status_code=400,
                         detail=f"Invalid immutable test file path '{itf}': must be a relative path within the workspace without directory traversal ('..').",
                     )
-                validated_immutable_test_files.append(clean_itf)
+                full_p = os.path.join(real_ws, clean_itf)
+                real_p = os.path.realpath(full_p)
+                if not real_p.startswith(real_ws + os.sep) and real_p != real_ws:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid immutable test file path '{itf}': target resolves outside authorized workspace.",
+                    )
+                if os.path.islink(full_p) or os.path.islink(real_p):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid immutable test file path '{itf}': symlinks cannot be designated as immutable test specifications.",
+                    )
+                if not os.path.exists(real_p) or not os.path.isfile(real_p):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid immutable test file path '{itf}': file does not exist or is not a regular file.",
+                    )
+                rel_clean = os.path.relpath(real_p, real_ws).replace("\\", "/")
+                validated_immutable_test_files.append(rel_clean)
 
         task_type = req.task_type or infer_task_type(req.goal)
         task = Task(

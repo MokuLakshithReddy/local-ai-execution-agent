@@ -92,23 +92,60 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
         exe = os.path.basename(sub[idx]).lower().replace('"', '').replace("'", "")
         args = [a.lower().replace('"', '').replace("'", "") for a in sub[idx + 1:]]
 
-        # A. git inspection: flags like git -c ... clean, git reset --hard
+        # A. git inspection: operations that overwrite, discard, or delete files or repository history
         if exe == "git" or exe.startswith("git."):
             if "clean" in args:
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
                     f"High risk: Git clean operation ('{cmd[:60]}...') requires explicit human authorization.",
                 )
-            if "reset" in args and "--hard" in args:
+            if "restore" in args:
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
-                    f"High risk: Git reset --hard ('{cmd[:60]}...') requires explicit human authorization.",
+                    f"High risk: Git restore operation ('{cmd[:60]}...') discards workspace changes and requires explicit human authorization.",
                 )
-            if "branch" in args and any(b in args for b in ("-d", "-d", "--delete")):
+            if "checkout" in args and any(a in args for a in ("--", ".", "-f", "--force")):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git checkout overwriting working tree changes ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "reset" in args:
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git reset operation ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "rm" in args:
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git file removal ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "branch" in args and any(b in args for b in ("-d", "-D", "--delete")):
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
                     f"High risk: Git branch deletion ('{cmd[:60]}...') requires explicit human authorization.",
                 )
+            if "switch" in args and any(a in args for a in ("-f", "--force", "--discard-changes")):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Forced git switch operation ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "stash" in args and any(a in args for a in ("drop", "clear", "pop")):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git stash destructive operation ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "rebase" in args:
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git rebase operation ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+
+        # Destructive file manipulation utilities
+        if exe in ("dd", "truncate", "shred", "wipe"):
+            return (
+                PermissionLevel.DESTRUCTIVE_OPERATION,
+                f"High risk: Destructive data operation '{exe}' ('{cmd[:60]}...') requires explicit human authorization.",
+            )
 
         # B. rm inspection: -r, -rf, -fr, --recursive, -r -f
         if exe in ("rm", "unlink"):

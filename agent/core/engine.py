@@ -176,6 +176,37 @@ class ExecutionEngine:
         initial_file_hashes, init_snap_ok, init_snap_err = _snapshot_workspace_hashes(task.workspace_path)
         tampered_immutable_files: set[str] = set()
         immutable_test_specs: List[str] = list(getattr(task, "immutable_test_files", []) or [])
+        immutable_baseline_hashes: Dict[str, str] = {}
+        ws_real = os.path.realpath(task.workspace_path)
+        for itf in immutable_test_specs:
+            clean_itf = itf.strip().replace("\\", "/")
+            full_itf = os.path.join(ws_real, clean_itf) if not os.path.isabs(clean_itf) else os.path.realpath(clean_itf)
+            if not os.path.exists(full_itf) or not os.path.isfile(full_itf) or os.path.islink(full_itf):
+                task.status = TaskStatus.FAILED
+                task.error = f"Immutable test specification '{itf}' does not exist, is a directory, or is an unauthorized symlink."
+                await self.db.save_task(task)
+                await self.emit("task_error", {"task_id": task.id, "error": task.error})
+                self._active_tasks.pop(task.id, None)
+                self._running_async_tasks.pop(task.id, None)
+                return task
+            try:
+                h_base = hashlib.sha256()
+                with open(full_itf, "rb") as fp:
+                    while True:
+                        chunk = fp.read(SNAPSHOT_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        h_base.update(chunk)
+                rel_itf = os.path.relpath(full_itf, ws_real).replace("\\", "/")
+                immutable_baseline_hashes[rel_itf] = h_base.hexdigest()
+            except Exception as e:
+                task.status = TaskStatus.FAILED
+                task.error = f"Failed to compute baseline hash for immutable test specification '{itf}': {e}"
+                await self.db.save_task(task)
+                await self.emit("task_error", {"task_id": task.id, "error": task.error})
+                self._active_tasks.pop(task.id, None)
+                self._running_async_tasks.pop(task.id, None)
+                return task
 
         # Initialize task in database
         task.status = TaskStatus.PLANNING
@@ -469,6 +500,17 @@ class ExecutionEngine:
                         tool_args["require_sandbox"] = True
                         tool_args["untrusted_workload"] = True
                         tool_args["allow_network"] = False
+                        tool_args["immutable_test_files"] = immutable_test_specs
+
+                    # Inspect command text for attempts to modify or overwrite immutable test files
+                    if tool_name in ("run_command", "run_verification") and immutable_test_specs:
+                        cmd_str = (tool_args.get("command") or "").lower()
+                        for itf in immutable_test_specs:
+                            itf_lower = itf.replace("\\", "/").strip().lower()
+                            itf_base = os.path.basename(itf_lower)
+                            if itf_lower in cmd_str or itf_base in cmd_str:
+                                if any(tok in cmd_str for tok in (">", ">>", "rm ", "del ", "erase ", "sed ", "truncate", "git restore", "git checkout", "copy ", "cp ", "mv ", "open(", ".write(", "shutil.", "unlink", "remove(")):
+                                    tampered_immutable_files.add(itf)
 
                     # Strict wall-clock deadline bounding for tool execution
                     t_rem = max(0.1, overall_deadline - (time.monotonic() - task_start_time))
@@ -515,7 +557,7 @@ class ExecutionEngine:
                                     tampered_immutable_files.add(itf)
                             full_itf = os.path.join(ws_real, itf) if not os.path.isabs(itf) else os.path.realpath(itf)
                             rel_itf = os.path.relpath(full_itf, ws_real).replace("\\", "/")
-                            init_h = initial_file_hashes.get(rel_itf)
+                            init_h = immutable_baseline_hashes.get(rel_itf) or initial_file_hashes.get(rel_itf)
                             if os.path.exists(full_itf) and not os.path.islink(full_itf):
                                 try:
                                     h_cur = hashlib.sha256()
