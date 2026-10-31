@@ -54,8 +54,9 @@ SNAPSHOT_CHUNK_SIZE = 64 * 1024  # 64 KB streaming read buffer
 def _snapshot_workspace_hashes(workspace_path: str) -> Tuple[Dict[str, str], bool, Optional[str]]:
     """
     Computes a mapping of relative file paths to SHA-256 hashes across the workspace.
-    Reads files incrementally in bounded 64 KB chunks to bound memory consumption.
-    Enforces per-file and total workspace size budgets.
+    Reads files incrementally in bounded 64 KB chunks to guarantee constant O(1) memory consumption.
+    All files are content-hashed (no metadata-only shortcuts).
+    Enforces total workspace size budget (500 MB).
     Returns: (hashes_dict, is_complete_bool, error_message_or_None).
     """
     hashes: Dict[str, str] = {}
@@ -78,12 +79,6 @@ def _snapshot_workspace_hashes(workspace_path: str) -> Tuple[Dict[str, str], boo
                     file_stat = os.stat(full_p)
                     f_size = file_stat.st_size
                     rel_p = os.path.relpath(full_p, ws_real).replace("\\", "/")
-
-                    if f_size > MAX_SNAPSHOT_FILE_BYTES:
-                        # File exceeds individual size budget; hash metadata to detect alterations without OOM
-                        meta_sig = f"largefile:{f_size}:{file_stat.st_mtime_ns}:{file_stat.st_mode}"
-                        hashes[rel_p] = hashlib.sha256(meta_sig.encode()).hexdigest()
-                        continue
 
                     if total_bytes_hashed + f_size > MAX_SNAPSHOT_TOTAL_BYTES:
                         return hashes, False, f"Workspace snapshot exceeded total budget limit of {MAX_SNAPSHOT_TOTAL_BYTES // (1024 * 1024)} MB."
@@ -140,6 +135,13 @@ class ExecutionEngine:
 
     def register_running_task(self, task_id: str, async_task: asyncio.Task):
         self._running_async_tasks[task_id] = async_task
+        self._active_tasks[task_id] = True
+
+        def _cleanup(_):
+            self._active_tasks.pop(task_id, None)
+            self._running_async_tasks.pop(task_id, None)
+
+        async_task.add_done_callback(_cleanup)
 
     def cancel_task(self, task_id: str):
         if task_id in self._active_tasks:
@@ -172,6 +174,8 @@ class ExecutionEngine:
         actually_modified_files: List[str] = []
         recent_tool_signatures: List[str] = []
         initial_file_hashes, init_snap_ok, init_snap_err = _snapshot_workspace_hashes(task.workspace_path)
+        tampered_immutable_files: set[str] = set()
+        immutable_test_specs: List[str] = list(getattr(task, "immutable_test_files", []) or [])
 
         # Initialize task in database
         task.status = TaskStatus.PLANNING
@@ -500,6 +504,34 @@ class ExecutionEngine:
                                 actually_modified_files.append(file_p)
                             modified_files.append(file_p)
 
+                    # Continuous immutable test specification tampering detection
+                    if immutable_test_specs:
+                        ws_real = os.path.realpath(task.workspace_path)
+                        for itf in immutable_test_specs:
+                            itf_clean = itf.replace("\\", "/").strip().lower()
+                            if tool_name in ("write_file", "patch_file"):
+                                file_p = (tool_args.get("file_path") or "").replace("\\", "/").strip().lower()
+                                if file_p and (itf_clean in file_p or file_p.endswith(itf_clean) or itf_clean.endswith(file_p)):
+                                    tampered_immutable_files.add(itf)
+                            full_itf = os.path.join(ws_real, itf) if not os.path.isabs(itf) else os.path.realpath(itf)
+                            rel_itf = os.path.relpath(full_itf, ws_real).replace("\\", "/")
+                            init_h = initial_file_hashes.get(rel_itf)
+                            if os.path.exists(full_itf) and not os.path.islink(full_itf):
+                                try:
+                                    h_cur = hashlib.sha256()
+                                    with open(full_itf, "rb") as fp:
+                                        while True:
+                                            chunk = fp.read(SNAPSHOT_CHUNK_SIZE)
+                                            if not chunk:
+                                                break
+                                            h_cur.update(chunk)
+                                    if init_h is not None and h_cur.hexdigest() != init_h:
+                                        tampered_immutable_files.add(itf)
+                                except Exception:
+                                    pass
+                            elif init_h is not None:
+                                tampered_immutable_files.add(itf)
+
                     # If verification tool, register in VerificationEngine
                     if tool_name == "run_verification" and result.artifacts:
                         v_check = VerificationCheck(
@@ -613,6 +645,8 @@ class ExecutionEngine:
                     criterion_bindings=task.criterion_bindings,
                     require_structured_evidence=(task.task_type in (TaskType.CODE_MODIFICATION, TaskType.TEST_AND_VERIFY)),
                     immutable_test_files=getattr(task, "immutable_test_files", None),
+                    workspace_snapshot_verified=(not snapshot_failed),
+                    tampered_immutable_files=list(tampered_immutable_files),
                 )
 
                 task.final_report = final_report

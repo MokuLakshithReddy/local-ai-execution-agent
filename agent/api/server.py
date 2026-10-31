@@ -332,6 +332,7 @@ class CreateTaskRequest(BaseModel):
     max_steps: int = Field(default=30, ge=1, le=100, description='Execution step budget bounded between 1 and 100')
     api_key: Optional[str] = None
     custom_base_url: Optional[str] = None
+    immutable_test_files: List[str] = Field(default_factory=list, description="Designated immutable test specifications that must not be modified by the agent.")
 
 
 class ApproveWorkspaceRequest(BaseModel):
@@ -481,15 +482,16 @@ async def save_settings(req: SaveSettingsRequest):
     if new_policy_sensitive is not None:
         settings["auto_approve_sensitive"] = new_policy_sensitive
 
-    # 3. Persist atomically
+    # 3. Persist atomically in a single transactional write
+    settings_to_save = {"app_settings": settings}
+    if validated_ws:
+        settings_to_save["current_workspace"] = validated_ws
     try:
-        await db.save_setting("app_settings", settings)
-        if validated_ws:
-            await db.save_setting("current_workspace", validated_ws)
+        await db.save_settings_atomic(settings_to_save)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Security Error: Failed to encrypt credentials safely ({str(e)}). Plaintext persistence rejected.",
+            detail=f"Security Error: Failed to save settings atomically ({str(e)}). Plaintext persistence rejected.",
         )
 
     # 4. Atomically apply updated policies to live permission manager ONLY after all validations and persistence succeed
@@ -552,6 +554,20 @@ async def create_task(req: CreateTaskRequest):
                 detail=f"API key for '{req.model_provider}' is not configured. Please supply an API key in Settings.",
             )
 
+        # Validate immutable test file specifications if provided
+        validated_immutable_test_files = []
+        if req.immutable_test_files:
+            for itf in req.immutable_test_files:
+                if not isinstance(itf, str) or not itf.strip():
+                    continue
+                clean_itf = itf.strip().replace("\\", "/")
+                if os.path.isabs(clean_itf) or ".." in clean_itf.split("/"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid immutable test file path '{itf}': must be a relative path within the workspace without directory traversal ('..').",
+                    )
+                validated_immutable_test_files.append(clean_itf)
+
         task_type = req.task_type or infer_task_type(req.goal)
         task = Task(
             id=task_id,
@@ -561,6 +577,7 @@ async def create_task(req: CreateTaskRequest):
             model_provider=req.model_provider,
             model_name=req.model_name,
             max_steps=req.max_steps,
+            immutable_test_files=validated_immutable_test_files,
         )
 
         provider_lower = req.model_provider.lower()

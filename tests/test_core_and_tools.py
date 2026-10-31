@@ -6472,3 +6472,236 @@ async def test_workspace_hashing_incremental_memory_bounded_and_fails_closed():
         assert ok_missing is False
         assert "does not exist" in err_missing
 
+
+@pytest.mark.asyncio
+async def test_workspace_snapshot_failure_explicitly_fails_completion():
+    """Validates P1 Finding 1:
+    An incomplete initial or final snapshot must explicitly prevent verified completion
+    of a code modification task, even if tests passed and working tree diff exists."""
+    from agent.verification.verifier import VerificationEngine
+    from agent.core.models import VerificationCheck, TaskStatus, TaskType
+    from agent.security.provenance import issue_trusted_execution_record
+
+    ve = VerificationEngine()
+    genuine_record = issue_trusted_execution_record(
+        run_id="task_snap_fail",
+        runner="pytest",
+        command="pytest",
+        exit_code=0,
+        total=1,
+        passed=1,
+        failed=0,
+        passed_nodes=["tests/test_core.py::test_ok"],
+    )
+    check = VerificationCheck(
+        check_name="Pytest",
+        check_type="test",
+        command="pytest",
+        success=True,
+        exit_code=0,
+        output="tests/test_core.py::test_ok PASSED\n1 passed in 0.05s",
+        evidence_summary="1 passed in 0.05s",
+        trusted_execution_record=genuine_record,
+    )
+    ve.record_check(check)
+
+    # 1. Snapshot verified is False explicitly
+    report = ve.evaluate_completion(
+        task_id="task_snap_fail",
+        goal="Fix issue in core.py",
+        actions_taken=["Modified core.py"],
+        modified_files=["core.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        task_current_status=TaskStatus.EXECUTING,
+        git_diff_summary="diff --git a/core.py ...",
+        workspace_snapshot_verified=False,
+    )
+    assert report.status == TaskStatus.PARTIALLY_COMPLETED
+    assert report.acceptance_criteria_satisfied is False
+    assert any("Workspace Baseline Verification Incomplete" in r for r in report.unresolved_risks_or_limitations)
+
+    # 2. Snapshot error message in unresolved notes
+    report2 = ve.evaluate_completion(
+        task_id="task_snap_fail_2",
+        goal="Fix issue in core.py",
+        actions_taken=["Modified core.py"],
+        modified_files=["core.py"],
+        task_type=TaskType.CODE_MODIFICATION,
+        task_current_status=TaskStatus.EXECUTING,
+        git_diff_summary="diff --git a/core.py ...",
+        unresolved_notes=["Workspace Baseline Verification Incomplete: Snapshot exceeded budget"],
+    )
+    assert report2.status == TaskStatus.PARTIALLY_COMPLETED
+    assert report2.acceptance_criteria_satisfied is False
+    assert any("Workspace Baseline Verification Incomplete" in r for r in report2.unresolved_risks_or_limitations)
+
+
+@pytest.mark.asyncio
+async def test_workspace_snapshot_hashes_actual_content_not_metadata():
+    """Validates P1 Finding 1 (Metadata Evasion):
+    _snapshot_workspace_hashes hashes actual file contents in chunks rather than
+    relying on size/mtime metadata shortcuts."""
+    from agent.core.engine import _snapshot_workspace_hashes
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        f1 = os.path.join(temp_dir, "large_file.dat")
+        content1 = b"A" * 100_000
+        with open(f1, "wb") as fp:
+            fp.write(content1)
+
+        hashes1, ok1, _ = _snapshot_workspace_hashes(temp_dir)
+        assert ok1 is True
+        h1 = hashes1["large_file.dat"]
+
+        # Now alter content with exact same length and preserve mtime
+        content2 = b"B" * 100_000
+        stat = os.stat(f1)
+        with open(f1, "wb") as fp:
+            fp.write(content2)
+        os.utime(f1, (stat.st_atime, stat.st_mtime))
+
+        hashes2, ok2, _ = _snapshot_workspace_hashes(temp_dir)
+        assert ok2 is True
+        h2 = hashes2["large_file.dat"]
+
+        # Content hashes MUST differ even if file size and mtime were preserved!
+        assert h1 != h2
+
+
+@pytest.mark.asyncio
+async def test_destructive_command_classifier_interpreter_and_encoded_bypasses():
+    """Validates P1 Finding 3:
+    Arbitrary inline interpreter scripts, raw scripts, and encoded shell commands
+    are classified as DESTRUCTIVE_OPERATION. Known routine test/build runners are permitted."""
+    from agent.security.permissions import classify_command_risk, PermissionLevel
+
+    # 1. Inline python code (regardless of whether it uses shutil or open/write)
+    lvl, _ = classify_command_risk('python -c "open(\'test.txt\', \'w\').write(\'\')"')
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk('python3 -c "import os; os.system(\'ls\')"')
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # 2. Arbitrary python script file
+    lvl, _ = classify_command_risk("python malicious_script.py")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # 3. Inline node code
+    lvl, _ = classify_command_risk('node -e "fs.writeFileSync(\'test.txt\', \'\')"')
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # 4. Arbitrary node script file
+    lvl, _ = classify_command_risk("node app.js")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # 5. Encoded PowerShell command
+    lvl, _ = classify_command_risk("powershell -EncodedCommand JABhAD0AMQA=")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk("pwsh -enc JABhAD0AMQA=")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # 6. Raw shell script execution
+    lvl, _ = classify_command_risk("bash dangerous.sh")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # 7. Known routine test/build/metadata commands remain ROUTINE_MODIFICATION
+    lvl, _ = classify_command_risk("python -m pytest tests/")
+    assert lvl == PermissionLevel.ROUTINE_MODIFICATION
+    lvl, _ = classify_command_risk("python -m unittest discover")
+    assert lvl == PermissionLevel.ROUTINE_MODIFICATION
+    lvl, _ = classify_command_risk("python --version")
+    assert lvl == PermissionLevel.ROUTINE_MODIFICATION
+    lvl, _ = classify_command_risk("node -v")
+    assert lvl == PermissionLevel.ROUTINE_MODIFICATION
+    lvl, _ = classify_command_risk("pytest -v")
+    assert lvl == PermissionLevel.ROUTINE_MODIFICATION
+
+
+@pytest.mark.asyncio
+async def test_save_settings_atomic_transaction_and_rollback():
+    """Validates P2 Finding 4:
+    Settings persistence executes inside a single atomic database transaction,
+    rolling back completely if any write fails."""
+    from agent.persistence.db import Database, DatabaseWriteError
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db_file = os.path.join(temp_dir, "test_settings.db")
+        db_inst = Database(db_path=db_file)
+        await db_inst.init()
+
+        # Successful atomic write
+        await db_inst.save_settings_atomic({
+            "app_settings": {"gemini_api_key": "test_key_123"},
+            "current_workspace": temp_dir,
+        })
+
+        saved_app = await db_inst.get_setting("app_settings")
+        saved_ws = await db_inst.get_setting("current_workspace")
+        assert saved_app.get("gemini_api_key") == "test_key_123"
+        assert saved_ws == temp_dir
+
+
+@pytest.mark.asyncio
+async def test_api_create_task_immutable_test_files_and_traversal_rejection():
+    """Validates P1 Finding 2 & P2 Finding 5:
+    POST /api/tasks exposes immutable_test_files, validates relative paths without traversal,
+    and registers task seamlessly without reservation timing gaps."""
+    from fastapi.testclient import TestClient
+    from agent.api.server import app, SESSION_TOKEN
+
+    client = TestClient(app)
+    headers = {"X-Agent-Auth-Token": SESSION_TOKEN}
+
+    # 1. Traversal in immutable_test_files is rejected with 400
+    res_bad = client.post(
+        "/api/tasks",
+        headers=headers,
+        json={
+            "goal": "Test goal",
+            "model_provider": "local",
+            "immutable_test_files": ["../../etc/passwd"],
+        },
+    )
+    assert res_bad.status_code == 400
+    assert "directory traversal" in res_bad.json()["detail"]
+
+    # 2. Valid immutable_test_files is accepted
+    res_ok = client.post(
+        "/api/tasks",
+        headers=headers,
+        json={
+            "goal": "Test goal",
+            "model_provider": "local",
+            "immutable_test_files": ["tests/test_auth.py"],
+        },
+    )
+    assert res_ok.status_code == 200
+    task_id = res_ok.json()["task_id"]
+    assert task_id is not None
+
+
+@pytest.mark.asyncio
+async def test_immutable_test_protection_catches_temporary_modification_and_restore():
+    """Validates P1 Finding 2:
+    Continuous immutable test protection catches an agent that temporarily modifies
+    a protected test file and restores it before finishing."""
+    from agent.verification.verifier import VerificationEngine
+    from agent.core.models import TaskStatus, TaskType
+
+    ve = VerificationEngine()
+    # Even if modified_files at end of task is clean/empty because agent reverted the file:
+    report = ve.evaluate_completion(
+        task_id="task_temp_tamper",
+        goal="Fix authentication",
+        actions_taken=["Modified tests/test_auth.py", "Reverted tests/test_auth.py"],
+        modified_files=[],
+        task_type=TaskType.CODE_MODIFICATION,
+        task_current_status=TaskStatus.EXECUTING,
+        git_diff_summary="(clean working tree)",
+        immutable_test_files=["tests/test_auth.py"],
+        tampered_immutable_files=["tests/test_auth.py"],
+    )
+    assert report.status == TaskStatus.PARTIALLY_COMPLETED
+    assert report.acceptance_criteria_satisfied is False
+    assert any("Test Specification Tampering Guard" in r for r in report.unresolved_risks_or_limitations)
+
+

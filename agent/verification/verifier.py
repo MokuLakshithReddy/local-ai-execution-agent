@@ -235,6 +235,8 @@ class VerificationEngine:
         criterion_bindings: Optional[Dict[str, str]] = None,
         require_structured_evidence: Optional[bool] = None,
         immutable_test_files: Optional[List[str]] = None,
+        workspace_snapshot_verified: bool = True,
+        tampered_immutable_files: Optional[List[str]] = None,
     ) -> TaskReport:
         """
         Synthesizes observed evidence into a structured completion report.
@@ -524,9 +526,15 @@ class VerificationEngine:
         any_undemonstrated = any(not ce.demonstrated for ce in criteria_evidence)
 
         # Check immutable test specification violation:
-        # If any test specification designated as immutable was modified by the agent, fail completion
+        # If any test specification designated as immutable was modified during execution or in final modified_files, fail completion
         immutable_violation = False
-        if immutable_test_files:
+        if tampered_immutable_files:
+            immutable_violation = True
+            for tif in tampered_immutable_files:
+                risks.append(
+                    f"Test Specification Tampering Guard: Immutable test specification '{tif}' was modified during task execution. Automated completion is rejected to prevent self-authored passing assertions."
+                )
+        if immutable_test_files and not immutable_violation:
             for itf in immutable_test_files:
                 itf_clean = itf.replace("\\", "/").strip().lower()
                 if any(itf_clean in mf.replace("\\", "/").lower() or mf.replace("\\", "/").lower().endswith(itf_clean) for mf in modified_files):
@@ -569,14 +577,26 @@ class VerificationEngine:
                 criteria_satisfied = True
 
         elif task_type == TaskType.CODE_MODIFICATION:
-            # Code modifications MUST prove that files were actually changed AND verified
             has_working_tree_diff = bool(
                 isinstance(git_diff_summary, str)
                 and git_diff_summary.strip()
                 and git_diff_summary.strip() != "(no git diff available)"
                 and git_diff_summary.strip() != "(clean working tree)"
             )
-            if not modified_files and not has_working_tree_diff:
+            # 1. Authority Guard: Workspace snapshot MUST be complete and verified
+            has_snapshot_error = (not workspace_snapshot_verified) or any(
+                isinstance(n, str) and ("Workspace Baseline Verification Incomplete" in n or "Workspace Final Snapshot Incomplete" in n)
+                for n in (unresolved_notes or [])
+            )
+            if has_snapshot_error:
+                final_status = TaskStatus.PARTIALLY_COMPLETED
+                criteria_satisfied = False
+                if not any("Workspace Baseline Verification Incomplete" in r or "Workspace Final Snapshot Incomplete" in r for r in risks):
+                    risks.append(
+                        "Workspace Baseline Verification Incomplete: A complete, authoritative workspace snapshot could not be computed. Verification fails closed."
+                    )
+            # Code modifications MUST prove that files were actually changed AND verified
+            elif not modified_files and not has_working_tree_diff:
                 final_status = TaskStatus.PARTIALLY_COMPLETED
                 criteria_satisfied = False
                 risks.append(

@@ -158,8 +158,14 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                 f"High risk: Destructive PowerShell cmdlet '{exe}' ('{cmd[:60]}...') requires explicit human authorization.",
             )
 
-        # F. Shell wrappers executing nested commands (powershell, pwsh, cmd, bash, sh)
+        # F. Shell wrappers and encoded commands (powershell, pwsh, cmd, bash, sh)
         if exe in ("powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe", "bash", "sh"):
+            # Check for encoded commands (e.g. powershell -EncodedCommand ...)
+            if any(arg in ("-encodedcommand", "-enc", "-ec", "-e") for arg in args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Encoded shell command execution ('{cmd[:60]}...') requires explicit human authorization.",
+                )
             for i, arg in enumerate(args):
                 if arg in ("-command", "-c", "/c") or arg.startswith("-command:") or arg.startswith("-c:"):
                     nested_cmd = " ".join(args[i + 1:])
@@ -170,20 +176,65 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                                 PermissionLevel.DESTRUCTIVE_OPERATION,
                                 sub_reason or f"High risk: Destructive nested command ('{cmd[:60]}...') requires explicit human authorization.",
                             )
-
-        # G. Inline interpreter scripts: python -c, node -e
-        if exe in ("python", "python3", "py", "node", "ruby", "perl", "bash", "sh"):
-            inline_str = " ".join(args)
-            destructive_interpreter_terms = (
-                "shutil.rmtree", "os.remove", "os.unlink", "os.rmdir",
-                "pathlib.path.unlink", "fs.rmsync", "fs.rmdirsync",
-                "fs.unlinksync", "fileutils.rm_rf"
-            )
-            if any(term in inline_str for term in destructive_interpreter_terms):
+            # Running raw shell scripts: bash script.sh, sh script.sh
+            non_flag_args = [a for a in args if not a.startswith("-")]
+            if non_flag_args and not any(arg in ("-c", "-command", "/c") for arg in args):
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
-                    f"High risk: Destructive interpreter deletion ('{cmd[:60]}...') requires explicit human authorization.",
+                    f"High risk: Shell script execution ('{cmd[:60]}...') requires explicit human authorization.",
                 )
+
+        # G. Interpreter executions: python, node, ruby, perl, php
+        # Treat arbitrary interpreter scripts and inline code as high risk by default.
+        # Only allow explicit, recognized test/build/metadata commands as routine.
+        if exe in ("python", "python.exe", "python3", "python3.exe", "py", "py.exe"):
+            # 1. Inline python code: python -c "..."
+            if any(a == "-c" or a.startswith("-c:") for a in args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Arbitrary inline Python execution ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            # 2. Check routine test/build runner modules or version checks
+            is_routine_python = False
+            if not args or all(a in ("-v", "--version", "-h", "--help") for a in args):
+                is_routine_python = True
+            elif len(args) >= 2 and args[0] == "-m":
+                mod_name = args[1].lower()
+                if mod_name in ("pytest", "unittest", "mypy", "ruff", "flake8", "py_compile"):
+                    is_routine_python = True
+                elif mod_name == "pip" and len(args) >= 3 and args[2] in ("list", "show", "check"):
+                    is_routine_python = True
+
+            if not is_routine_python:
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Arbitrary Python script or unvetted module execution ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+
+        if exe in ("node", "node.exe"):
+            # 1. Inline node code: node -e "..."
+            if any(a in ("-e", "--eval") or a.startswith("-e:") for a in args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Arbitrary inline Node execution ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            is_routine_node = False
+            if not args or all(a in ("-v", "--version", "-h", "--help") for a in args):
+                is_routine_node = True
+            elif args and args[0] in ("--test", "test"):
+                is_routine_node = True
+
+            if not is_routine_node:
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Arbitrary Node script execution ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+
+        if exe in ("ruby", "perl", "php"):
+            return (
+                PermissionLevel.DESTRUCTIVE_OPERATION,
+                f"High risk: Interpreter script execution ('{cmd[:60]}...') requires explicit human authorization.",
+            )
 
         # H. Conservative policy: Unknown or unrecognized executables require explicit authorization
         if exe not in KNOWN_ROUTINE_EXECUTABLES:

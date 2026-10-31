@@ -273,6 +273,35 @@ class Database:
         except Exception as e:
             raise DatabaseWriteError(f"Database write failure in save_setting('{key}'): {str(e)}") from e
 
+    async def save_settings_atomic(self, settings_map: Dict[str, Any]):
+        """
+        Save multiple settings within a single atomic database transaction.
+        Pre-encrypts credentials and rolls back cleanly on any write error.
+        """
+        prepared_entries = []
+        for key, value in settings_map.items():
+            to_store = value
+            if key == "app_settings" and isinstance(value, dict):
+                to_store = dict(value)
+                for k in ("openai_api_key", "anthropic_api_key", "gemini_api_key"):
+                    if k in to_store and to_store[k]:
+                        to_store[k] = vault.encrypt(to_store[k])
+            prepared_entries.append((key, json.dumps(to_store)))
+
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("""
+                    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL)
+                """)
+                for key, val_json in prepared_entries:
+                    await db.execute("""
+                        INSERT INTO settings (key, value_json) VALUES (?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json
+                    """, (key, val_json))
+                await db.commit()
+        except Exception as e:
+            raise DatabaseWriteError(f"Database write failure in save_settings_atomic: {str(e)}") from e
+
     async def get_setting(self, key: str, default: Any = None) -> Any:
         """Get settings, decrypting OS-native encrypted credentials and migrating legacy formats."""
         try:
