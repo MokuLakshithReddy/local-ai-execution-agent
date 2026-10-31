@@ -92,6 +92,8 @@ def extract_pytest_console_passed_nodes(output: str) -> Set[str]:
     Matches lines like:
     'tests/test_auth.py::test_login PASSED [ 50%]'
     'tests/test_math.py::TestCalc::test_add PASSED [100%]'
+    Stores exact canonical node identifiers (e.g. 'tests/test_auth.py::test_login').
+    Rejects standalone function names or loose basenames.
     """
     if not output:
         return set()
@@ -100,19 +102,16 @@ def extract_pytest_console_passed_nodes(output: str) -> Set[str]:
     for line in output.splitlines():
         line_clean = line.strip()
         if " PASSED" in line_clean:
-            # Extract portion before PASSED
             raw_target = line_clean.split(" PASSED")[0].strip()
             if raw_target:
-                clean_target = raw_target.replace("\\", "/").lower()
+                clean_target = os.path.normpath(raw_target).replace("\\", "/").lower()
                 passed_nodes.add(clean_target)
                 if "::" in clean_target:
                     parts = clean_target.split("::")
-                    test_fn = parts[-1]
-                    passed_nodes.add(test_fn)
+                    # For class-based tests: tests/test_calc.py::TestClass::test_add
+                    # also allow exact file::test_name mapping
                     if len(parts) > 2:
                         passed_nodes.add(f"{parts[0]}::{parts[-1]}")
-                else:
-                    passed_nodes.add(clean_target)
 
     return passed_nodes
 
@@ -223,8 +222,10 @@ def parse_junit_xml_report(xml_path: str) -> Optional[Dict[str, Any]]:
 class RunVerificationCheckTool(BaseTool):
     name = "run_verification"
     description = (
-        "Execute a formal verification command (e.g. pytest, npm test, cargo test, tsc, flake8) "
-        "and record its exit code, output, and verifiable status."
+        "Execute formal verification. Cryptographically verified structured execution records "
+        "(with dual-channel validation and host AST verification) are supported for pytest. "
+        "Other verification checks (build, lint, typecheck, or custom commands) are verified "
+        "via exit status and execution summaries."
     )
     permission_level = PermissionLevel.SENSITIVE_OPERATION
 
@@ -241,7 +242,8 @@ class RunVerificationCheckTool(BaseTool):
                 },
                 "check_type": {
                     "type": "string",
-                    "description": "Category: 'test', 'build', 'lint', 'typecheck', or 'custom'.",
+                    "enum": [e.value for e in VerificationCheckType],
+                    "description": "Category: 'test', 'build', 'lint', 'typecheck', 'git_diff', or 'custom'.",
                     "default": "test",
                 },
                 "command": {
@@ -331,9 +333,20 @@ class RunVerificationCheckTool(BaseTool):
 
         # Create isolated temporary directory strictly OUTSIDE workspace for evidence collection
         report_dir = tempfile.mkdtemp(prefix=".agent_verification_evidence_")
-        register_authorized_evidence_dir(report_dir)
         report_filename = f"junit_{uuid.uuid4().hex}.xml"
         report_host_path = os.path.join(report_dir, report_filename)
+        # Pre-create empty report file with restricted permissions (0o600)
+        with open(report_host_path, "w", encoding="utf-8") as f:
+            pass
+        if hasattr(os, "chmod"):
+            try:
+                os.chmod(report_host_path, 0o600)
+                os.chmod(report_dir, 0o700)
+            except Exception:
+                pass
+
+        register_authorized_evidence_dir(report_host_path)
+        register_authorized_evidence_dir(report_dir)
 
         sandbox_mode = kwargs.get("sandbox_mode", "container")
         exec_cmd = command
@@ -345,13 +358,14 @@ class RunVerificationCheckTool(BaseTool):
             has_verbose = any(v in command.split() for v in ("-v", "-vv", "--verbose"))
             verbose_arg = "" if has_verbose else " -v"
             if sandbox_mode == "container":
-                # Mount external report dir inside container at /verification_evidence
+                # Mount ONLY the single pre-created report file directly to /verification_evidence/report_filename:rw
                 extra_mounts = list(cmd_kwargs.get("extra_mounts", []))
-                extra_mounts.append(f"{report_dir}:/verification_evidence:rw")
+                extra_mounts.append(f"{report_host_path}:/verification_evidence/{report_filename}:rw")
                 cmd_kwargs["extra_mounts"] = extra_mounts
                 exec_cmd = f"{command}{verbose_arg} --junitxml=/verification_evidence/{report_filename}"
             else:
                 allowed_paths = list(cmd_kwargs.get("allowed_paths", []))
+                allowed_paths.append(report_host_path)
                 allowed_paths.append(report_dir)
                 cmd_kwargs["allowed_paths"] = allowed_paths
                 exec_cmd = f'{command}{verbose_arg} --junitxml="{report_host_path}"'
@@ -416,63 +430,74 @@ class RunVerificationCheckTool(BaseTool):
                                     if not tc_file and tc_class:
                                         tc_file = "/".join(tc_class.split(".")) + ".py"
 
+                                    clean_rel = os.path.normpath(tc_file).replace("\\", "/").lower() if tc_file else ""
+                                    canonical = f"{clean_rel}::{tc_name}" if clean_rel else ""
+
+                                    class_name_part = tc_class.split(".")[-1].lower() if tc_class else ""
+                                    class_canonical = f"{clean_rel}::{class_name_part}::{tc_name}" if (clean_rel and class_name_part) else ""
+
+                                    # Exact normalized identity matching against runner console node confirmations
                                     matched = False
-                                    if tc_name:
-                                        if tc_file:
-                                            canonical = f"{tc_file}::{tc_name}"
-                                            if canonical in console_nodes:
-                                                matched = True
-                                            elif any(cn.endswith(f"::{tc_name}") and (tc_file in cn or cn.startswith(tc_file) or os.path.basename(tc_file) in cn) for cn in console_nodes):
-                                                matched = True
-                                        if not matched and tc_class:
-                                            class_canonical = f"{tc_class}::{tc_name}"
-                                            if class_canonical in console_nodes or any(cn.endswith(f"::{tc_name}") and tc_class in cn for cn in console_nodes):
-                                                matched = True
+                                    if canonical and canonical in console_nodes:
+                                        matched = True
+                                    elif class_canonical and class_canonical in console_nodes:
+                                        matched = True
 
                                     if not matched:
-                                        unconfirmed_cases.append(f"{tc_file}::{tc_name}" if tc_file else tc_name)
+                                        unconfirmed_cases.append(canonical or f"{tc_class}::{tc_name}")
                                         continue
 
-                                    # Verify source file containment in workspace and AST definition on host
-                                    if tc_file:
-                                        clean_rel = os.path.normpath(tc_file)
-                                        if os.path.isabs(clean_rel):
+                                    # Fail-closed AST and workspace containment validation
+                                    if not clean_rel or ".." in clean_rel.split("/"):
+                                        tampering_detected = True
+                                        discrepancy_msg = f"Tampering detected: Testcase '{tc_name}' specifies invalid or escaping file path '{tc_file}'."
+                                        break
+
+                                    real_ws = os.path.realpath(workspace_path)
+                                    candidate_host_path = os.path.normpath(os.path.join(workspace_path, clean_rel))
+                                    real_host = os.path.realpath(candidate_host_path)
+
+                                    try:
+                                        is_contained = (os.path.commonpath([real_ws, real_host]) == real_ws)
+                                    except ValueError:
+                                        is_contained = False
+
+                                    if not is_contained:
+                                        tampering_detected = True
+                                        discrepancy_msg = f"Tampering detected: Test source file '{tc_file}' escapes workspace boundary."
+                                        break
+
+                                    if not os.path.isfile(real_host) or os.path.islink(real_host):
+                                        tampering_detected = True
+                                        discrepancy_msg = f"Tampering detected: Test source file '{tc_file}' does not exist on host filesystem or is an untrusted symlink."
+                                        break
+
+                                    if real_host.endswith(".py"):
+                                        if real_host not in ast_cache:
+                                            funcs: Set[str] = set()
                                             try:
-                                                clean_rel = os.path.relpath(clean_rel, workspace_path)
-                                            except ValueError:
-                                                pass
+                                                with open(real_host, "r", encoding="utf-8", errors="replace") as sf:
+                                                    tree = ast.parse(sf.read(), filename=real_host)
+                                                for node in ast.walk(tree):
+                                                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                                        funcs.add(node.name.lower())
+                                            except Exception as parse_exc:
+                                                tampering_detected = True
+                                                discrepancy_msg = f"Tampering detected: Test source file '{tc_file}' failed AST parsing ({parse_exc})."
+                                                break
 
-                                        candidate_host_path = os.path.normpath(os.path.join(workspace_path, clean_rel))
-                                        real_ws = os.path.realpath(workspace_path)
-                                        real_host = os.path.realpath(candidate_host_path)
+                                            if not funcs:
+                                                tampering_detected = True
+                                                discrepancy_msg = f"Tampering detected: Test source file '{tc_file}' contains zero AST-defined test functions."
+                                                break
 
-                                        try:
-                                            is_contained = os.path.commonpath([real_ws, real_host]) == real_ws
-                                        except ValueError:
-                                            is_contained = False
+                                            ast_cache[real_host] = funcs
 
-                                        # If contained and file exists on host, verify AST function definition
-                                        if is_contained and os.path.isfile(real_host):
-                                            if real_host.endswith(".py"):
-                                                if real_host not in ast_cache:
-                                                    funcs: Set[str] = set()
-                                                    try:
-                                                        with open(real_host, "r", encoding="utf-8", errors="replace") as sf:
-                                                            tree = ast.parse(sf.read(), filename=real_host)
-                                                        for node in ast.walk(tree):
-                                                            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                                                                funcs.add(node.name.lower())
-                                                    except Exception:
-                                                        pass
-                                                    ast_cache[real_host] = funcs
-
-                                                base_test_fn = tc_name.split("[")[0].strip().lower()
-                                                if ast_cache[real_host] and base_test_fn not in ast_cache[real_host]:
-                                                    tampering_detected = True
-                                                    discrepancy_msg = (
-                                                        f"Tampering detected: Testcase '{tc_name}' is not defined in source file '{tc_file}' AST."
-                                                    )
-                                                    break
+                                        base_test_fn = tc_name.split("[")[0].strip().lower()
+                                        if base_test_fn not in ast_cache[real_host]:
+                                            tampering_detected = True
+                                            discrepancy_msg = f"Tampering detected: Testcase '{tc_name}' is not defined in source file '{tc_file}' AST."
+                                            break
 
                                 if unconfirmed_cases and not tampering_detected:
                                     tampering_detected = True
@@ -480,7 +505,12 @@ class RunVerificationCheckTool(BaseTool):
                                 elif not unconfirmed_cases and not tampering_detected:
                                     cross_check_passed = True
                         else:
-                            cross_check_passed = True
+                            if check_type in ("test", VerificationCheckType.TEST):
+                                runner_name = command.split()[0] if command else "unknown"
+                                discrepancy_msg = (
+                                    f"Runner limitation: Command '{runner_name}' is not supported for structured cryptographic verification. "
+                                    "Structured JUnit XML records and dual-channel validation currently require 'pytest'."
+                                )
 
                         if cross_check_passed and not tampering_detected:
                             try:
@@ -536,6 +566,8 @@ class RunVerificationCheckTool(BaseTool):
                 execution_time_ms=(time.time() - t0) * 1000,
             )
         finally:
+            if report_host_path:
+                unregister_authorized_evidence_dir(report_host_path)
             if report_dir:
                 unregister_authorized_evidence_dir(report_dir)
                 if os.path.exists(report_dir):

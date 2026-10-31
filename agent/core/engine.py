@@ -3,6 +3,7 @@ Agent Orchestration Engine: Controlled, bounded execution loop.
 Coordinates LLM reasoning, Tool Registry, Permission System, and Verification Engine.
 """
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -43,6 +44,34 @@ CRITICAL RULES:
 - If you encounter a test failure, analyze the output, adjust your solution, and rerun verification.
 - Always operate strictly within the provided workspace.
 """
+
+
+def _snapshot_workspace_hashes(workspace_path: str) -> Dict[str, str]:
+    """
+    Computes a mapping of relative file paths to SHA-256 hashes across the workspace.
+    Skips .git directories, virtualenvs, node_modules, and cache directories to remain fast.
+    """
+    hashes: Dict[str, str] = {}
+    try:
+        ws_real = os.path.realpath(workspace_path)
+        if not os.path.isdir(ws_real):
+            return hashes
+        skip_dirs = {".git", "venv", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
+        for root, dirs, files in os.walk(ws_real, topdown=True, followlinks=False):
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            for f in files:
+                full_p = os.path.join(root, f)
+                if os.path.islink(full_p) or f.endswith((".db", ".sqlite", ".sqlite3", ".log", ".lock")):
+                    continue
+                try:
+                    rel_p = os.path.relpath(full_p, ws_real).replace("\\", "/")
+                    with open(full_p, "rb") as fp:
+                        hashes[rel_p] = hashlib.sha256(fp.read()).hexdigest()
+                except (OSError, IOError):
+                    continue
+    except Exception:
+        pass
+    return hashes
 
 
 class ExecutionEngine:
@@ -111,6 +140,7 @@ class ExecutionEngine:
         modified_files: List[str] = []
         actually_modified_files: List[str] = []
         recent_tool_signatures: List[str] = []
+        initial_file_hashes: Dict[str, str] = _snapshot_workspace_hashes(task.workspace_path)
 
         # Initialize task in database
         task.status = TaskStatus.PLANNING
@@ -506,11 +536,37 @@ class ExecutionEngine:
                 )
                 diff_summary = git_diff_result.output if git_diff_result.success else None
 
+                # Compute final workspace state hashes vs initial snapshot to detect changes that were completely reverted
+                final_file_hashes = _snapshot_workspace_hashes(task.workspace_path)
+                net_changed_files = set()
+                for rel_p, h in final_file_hashes.items():
+                    if initial_file_hashes.get(rel_p) != h:
+                        net_changed_files.add(rel_p)
+                for rel_p in initial_file_hashes.keys():
+                    if rel_p not in final_file_hashes:
+                        net_changed_files.add(rel_p)
+
+                verified_modified_files: List[str] = []
+                ws_real = os.path.realpath(task.workspace_path)
+                for mf in actually_modified_files:
+                    try:
+                        abs_mf = os.path.join(task.workspace_path, mf) if not os.path.isabs(mf) else os.path.realpath(mf)
+                        rel_mf = os.path.relpath(abs_mf, ws_real).replace("\\", "/")
+                        if rel_mf in net_changed_files:
+                            verified_modified_files.append(mf)
+                    except Exception:
+                        if mf in net_changed_files:
+                            verified_modified_files.append(mf)
+
+                for ncf in net_changed_files:
+                    if ncf not in verified_modified_files:
+                        verified_modified_files.append(ncf)
+
                 final_report = verifier.evaluate_completion(
                     task_id=task.id,
                     goal=task.goal,
                     actions_taken=actions_taken,
-                    modified_files=actually_modified_files,
+                    modified_files=verified_modified_files,
                     task_type=task.task_type,
                     task_current_status=task.status,
                     git_diff_summary=diff_summary,

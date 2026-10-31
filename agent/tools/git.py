@@ -24,6 +24,26 @@ SAFE_GIT_CONFIG_OVERRIDES = [
 ]
 
 
+async def _read_bounded_stream(stream: Optional[asyncio.StreamReader], max_bytes: int) -> Tuple[bytes, bool]:
+    """Reads a process stream incrementally, collecting up to max_bytes while discarding excess to bound memory."""
+    if not stream:
+        return b"", False
+    chunks = []
+    collected = 0
+    truncated = False
+    while True:
+        chunk = await stream.read(4096)
+        if not chunk:
+            break
+        if collected < max_bytes:
+            to_take = min(len(chunk), max_bytes - collected)
+            chunks.append(chunk[:to_take])
+            collected += to_take
+        else:
+            truncated = True
+    return b"".join(chunks), truncated
+
+
 async def _run_git(
     args: list[str],
     cwd: str,
@@ -57,8 +77,12 @@ async def _run_git(
         )
 
         try:
-            stdout_data, stderr_data = await asyncio.wait_for(
-                proc.communicate(),
+            (stdout_data, out_truncated), (stderr_data, err_truncated), _ = await asyncio.wait_for(
+                asyncio.gather(
+                    _read_bounded_stream(proc.stdout, max_output_bytes),
+                    _read_bounded_stream(proc.stderr, max_output_bytes),
+                    proc.wait(),
+                ),
                 timeout=timeout,
             )
         except asyncio.TimeoutError:
@@ -70,12 +94,8 @@ async def _run_git(
                 pass
             return (-1, "", f"Git execution timed out after {timeout:.1f} seconds.")
 
-        # Enforce bounded output
-        out_truncated = len(stdout_data) > max_output_bytes
-        err_truncated = len(stderr_data) > max_output_bytes
-
-        out_str = stdout_data[:max_output_bytes].decode("utf-8", errors="replace")
-        err_str = stderr_data[:max_output_bytes].decode("utf-8", errors="replace")
+        out_str = stdout_data.decode("utf-8", errors="replace")
+        err_str = stderr_data.decode("utf-8", errors="replace")
 
         if out_truncated:
             out_str += f"\n... [GIT OUTPUT TRUNCATED AT {max_output_bytes} BYTES]"

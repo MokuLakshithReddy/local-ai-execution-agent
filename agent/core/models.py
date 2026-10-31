@@ -101,7 +101,7 @@ class StructuredAssertion(BaseModel):
 
 class VerificationCheck(BaseModel):
     check_name: str
-    check_type: Union[VerificationCheckType, str] = VerificationCheckType.TEST
+    check_type: VerificationCheckType = VerificationCheckType.TEST
     command: Optional[str] = None
     success: bool
     exit_code: Optional[int] = None

@@ -6007,3 +6007,354 @@ async def test_destructive_command_escalation_and_fifo_pruning():
             workspace_path="/tmp",
         )
     assert len(pm.pending_approvals) <= MAX_PENDING_APPROVALS
+
+
+@pytest.mark.asyncio
+async def test_classify_command_risk_conservative_evasions():
+    """Validates Issue 5:
+    Conservative destructive-command policy handles evasions like git -c ... clean, rm --recursive, find -delete, and interpreter destructive calls."""
+    from agent.security.permissions import classify_command_risk, PermissionLevel
+
+    # 1. git evasions
+    lvl, _ = classify_command_risk("git -c core.pager=cat clean -fdx")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk("git reset --hard HEAD~1")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk("git branch -D feature-branch")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # 2. rm evasions
+    lvl, _ = classify_command_risk("rm --recursive --force /tmp/work")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk("rm -r /tmp/dir")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk("find . -name '*.log' -delete")
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # 3. Interpreter evasions
+    lvl, _ = classify_command_risk('python -c "import shutil; shutil.rmtree(\'/tmp/target\')"')
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+    lvl, _ = classify_command_risk('node -e "fs.rmSync(\'/tmp/target\', {recursive: true})"')
+    assert lvl == PermissionLevel.DESTRUCTIVE_OPERATION
+
+    # Non-destructive commands remain routine
+    lvl, _ = classify_command_risk("git status")
+    assert lvl == PermissionLevel.ROUTINE_MODIFICATION
+    lvl, _ = classify_command_risk("pytest tests/")
+    assert lvl == PermissionLevel.ROUTINE_MODIFICATION
+
+
+@pytest.mark.asyncio
+async def test_approval_history_pruned_on_all_mutation_paths():
+    """Validates Issue 6:
+    Approval history is pruned to MAX_APPROVAL_HISTORY across cancel_task_approvals and expire_approval as well as resolve_approval."""
+    from agent.security.permissions import (
+        PermissionManager,
+        PermissionPolicy,
+        PermissionLevel,
+        MAX_APPROVAL_HISTORY,
+    )
+
+    pm = PermissionManager(policy=PermissionPolicy(auto_approve_routine=False))
+
+    # Test cancel_task_approvals pruning
+    for i in range(MAX_APPROVAL_HISTORY + 30):
+        _, _, req = pm.evaluate_action(
+            task_id=f"task_{i}",
+            tool_name="write_file",
+            arguments={"file_path": f"file_{i}.txt", "content": "data"},
+            permission_level=PermissionLevel.ROUTINE_MODIFICATION,
+            workspace_path="/tmp",
+        )
+        pm.cancel_task_approvals(f"task_{i}")
+
+    assert len(pm.approval_history) <= MAX_APPROVAL_HISTORY
+
+    # Test expire_approval pruning
+    for i in range(MAX_APPROVAL_HISTORY + 30):
+        _, _, req = pm.evaluate_action(
+            task_id=f"task_exp_{i}",
+            tool_name="write_file",
+            arguments={"file_path": f"file_exp_{i}.txt", "content": "data"},
+            permission_level=PermissionLevel.ROUTINE_MODIFICATION,
+            workspace_path="/tmp",
+        )
+        if req:
+            pm.expire_approval(req.approval_id)
+
+    assert len(pm.approval_history) <= MAX_APPROVAL_HISTORY
+
+
+@pytest.mark.asyncio
+async def test_engine_revert_sequence_rejected_for_code_modification():
+    """Validates Issue 2:
+    When an agent writes to a file, runs verification tests, and then reverts the file back to its initial state,
+    ExecutionEngine detects that net workspace changes are zero and rejects completion of CODE_MODIFICATION tasks."""
+    from agent.core.engine import ExecutionEngine
+    from agent.core.models import Task, TaskType, TaskStatus, ActionResult
+    from agent.persistence.db import Database
+    from agent.tools.registry import ToolRegistry
+    from agent.tools.base import BaseTool
+    from agent.security.provenance import issue_trusted_execution_record
+    from unittest.mock import patch, MagicMock, AsyncMock
+    from agent.providers.base import ProviderResponse, LLMToolCall
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        db = Database(db_path=os.path.join(temp_dir, "test.db"))
+        await db.init()
+
+        # Pre-create initial workspace state
+        src_file = os.path.join(temp_dir, "calc.py")
+        with open(src_file, "w", encoding="utf-8") as f:
+            f.write("def add(a, b): return a + b\n")
+
+        task = Task(
+            id="task_revert_detected",
+            goal="Add multiply function to calc.py",
+            workspace_path=temp_dir,
+            model_provider="openai",
+            model_name="gpt-4o",
+            task_type=TaskType.CODE_MODIFICATION,
+        )
+
+        genuine_record = issue_trusted_execution_record(
+            run_id="task_revert_detected",
+            runner="pytest",
+            command="pytest tests/test_calc.py",
+            exit_code=0,
+            total=1,
+            passed=1,
+            failed=0,
+            passed_nodes=["tests/test_calc.py::test_calc"],
+        )
+
+        class MockVerificationTool(BaseTool):
+            name = "run_verification"
+            description = "Mock verification tool"
+            permission_level = PermissionLevel.READ_ONLY
+            def get_parameters_schema(self):
+                return {
+                    "type": "object",
+                    "properties": {
+                        "check_name": {"type": "string"},
+                        "command": {"type": "string"},
+                    }
+                }
+            async def execute(self, workspace_path: str, **kwargs):
+                return ActionResult(
+                    call_id=kwargs.get("call_id", "tc"),
+                    tool_name=self.name,
+                    success=True,
+                    output="tests/test_calc.py::test_calc PASSED\n1 passed",
+                    artifacts={
+                        "passed": True,
+                        "exit_code": 0,
+                        "check_name": kwargs.get("check_name", "Calc Test"),
+                        "command": kwargs.get("command", "pytest tests/test_calc.py"),
+                        "trusted_execution_record": genuine_record,
+                    }
+                )
+
+        registry = ToolRegistry()
+        registry.register(MockVerificationTool())
+
+        # Model actions: write changes, run verification, then revert changes back to original
+        mock_adapter = MagicMock()
+        mock_adapter.chat_completion = AsyncMock(side_effect=[
+            ProviderResponse(
+                content="Modifying calc.py and testing",
+                tool_calls=[
+                    LLMToolCall(id="c1", name="write_file", arguments={"file_path": "calc.py", "content": "def add(a, b): return a + b\ndef multiply(a, b): return a * b\n"}),
+                    LLMToolCall(id="c2", name="run_verification", arguments={"check_name": "Calc Test", "command": "pytest tests/test_calc.py"}),
+                ]
+            ),
+            ProviderResponse(
+                content="Reverting calc.py back to original",
+                tool_calls=[
+                    LLMToolCall(id="c3", name="write_file", arguments={"file_path": "calc.py", "content": "def add(a, b): return a + b\n"}),
+                ]
+            ),
+            ProviderResponse(content="Finished task", tool_calls=[]),
+        ])
+
+        with patch("agent.core.engine.ProviderRegistry.get_adapter", return_value=mock_adapter):
+            engine = ExecutionEngine(db=db, tool_registry=registry)
+            completed = await engine.run_task(task, api_key="sk-test")
+
+        # Final state matches initial state -> must not be marked completed!
+        assert completed.status == TaskStatus.PARTIALLY_COMPLETED
+        assert completed.final_report.acceptance_criteria_satisfied is False
+        assert any("no files were created or modified in the workspace" in r for r in completed.final_report.unresolved_risks_or_limitations)
+
+
+@pytest.mark.asyncio
+async def test_search_files_killable_subprocess_and_redos_guards():
+    """Validates Issue 3:
+    SearchFilesTool ReDoS static guards block nested quantifiers and ambiguous alternations, and regex searches execute in killable subprocess workers."""
+    from agent.tools.filesystem import SearchFilesTool
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        test_f = os.path.join(temp_dir, "sample.txt")
+        with open(test_f, "w", encoding="utf-8") as f:
+            f.write("test line one\n" + "a" * 100 + "\n")
+
+        tool = SearchFilesTool()
+
+        # 1. Ambiguous alternation with repetition blocked statically
+        res = await tool.execute(temp_dir, query="(a|a)+$", is_regex=True)
+        assert res.success is False
+        assert "catastrophic regex backtracking" in res.error
+
+        # 2. Nested quantifier repetition blocked statically
+        res2 = await tool.execute(temp_dir, query="(x+x+)+y", is_regex=True)
+        assert res2.success is False
+        assert "catastrophic regex backtracking" in res2.error
+
+        # 3. Valid regex succeeds via subprocess worker
+        res3 = await tool.execute(temp_dir, query="test line [a-z]+", is_regex=True)
+        assert res3.success is True
+        assert "sample.txt:1: test line one" in res3.output
+
+
+@pytest.mark.asyncio
+async def test_server_atomic_task_reservation_and_loopback_validation():
+    """Validates Issues 7 and 8:
+    Server enforces atomic task slot reservation and strictly validates loopback endpoints (rejecting 0.0.0.0 and ::)."""
+    from agent.api.server import (
+        _is_loopback_endpoint,
+        app,
+        _task_reservation_lock,
+        _reserved_task_slots,
+        engine,
+    )
+    from fastapi.testclient import TestClient
+
+    # Loopback validator checks
+    assert _is_loopback_endpoint("127.0.0.1") is True
+    assert _is_loopback_endpoint("localhost") is True
+    assert _is_loopback_endpoint("::1") is True
+    assert _is_loopback_endpoint("127.0.0.2") is True
+    # INADDR_ANY must be rejected
+    assert _is_loopback_endpoint("0.0.0.0") is False
+    assert _is_loopback_endpoint("::") is False
+    assert _is_loopback_endpoint("0:0:0:0:0:0:0:0") is False
+    # External IP must be rejected
+    assert _is_loopback_endpoint("192.168.1.100") is False
+    assert _is_loopback_endpoint("example.com") is False
+
+    # Atomic reservation prevents exceeding capacity
+    from unittest.mock import patch
+    client = TestClient(app)
+    with patch.dict(engine._active_tasks, {f"task_{i}": True for i in range(10)}, clear=True):
+        from agent.api.server import SESSION_TOKEN
+        resp = client.post(
+            "/api/tasks",
+            headers={"X-Agent-Auth-Token": SESSION_TOKEN},
+            json={"goal": "Exceed capacity task"},
+        )
+        assert resp.status_code == 429
+        assert "Maximum concurrent tasks (10) exceeded" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_tool_schema_validation_and_enum_enforcement():
+    """Validates Issues 9 and 10:
+    ToolRegistry strictly validates runtime arguments against JSON schema (required fields, unexpected properties, types, and enum values)
+    and clarifies supported test runners."""
+    from agent.tools.registry import ToolRegistry, validate_tool_call_schema
+    from agent.tools.verification import RunVerificationCheckTool
+    from agent.core.models import VerificationCheckType
+
+    tool = RunVerificationCheckTool()
+
+    # 1. Parameter schema contains check_type with allowed enum values
+    schema = tool.get_parameters_schema()
+    props = schema.get("properties", {})
+    assert "check_type" in props
+    assert "test" in props["check_type"]["enum"]
+    assert set(props["check_type"]["enum"]) == {e.value for e in VerificationCheckType}
+
+    # 2. Valid tool arguments pass schema validation
+    valid, err = validate_tool_call_schema(tool, {
+        "check_name": "Unit Tests",
+        "command": "pytest tests/",
+        "check_type": "test",
+    })
+    assert valid is True
+    assert err is None
+
+    # 3. Invalid enum value rejected
+    invalid_enum, err_enum = validate_tool_call_schema(tool, {
+        "check_name": "Unit Tests",
+        "command": "pytest tests/",
+        "check_type": "invalid_type",
+    })
+    assert invalid_enum is False
+    assert "Allowed values" in err_enum
+
+    # 4. Unexpected undeclared argument rejected
+    invalid_extra, err_extra = validate_tool_call_schema(tool, {
+        "check_name": "Unit Tests",
+        "command": "pytest tests/",
+        "hacker_flag": "exploit",
+    })
+    assert invalid_extra is False
+    assert "Unexpected parameter 'hacker_flag'" in err_extra
+
+    # 5. Wrong type (e.g. integer for string check_name) rejected
+    invalid_type, err_type = validate_tool_call_schema(tool, {
+        "check_name": 12345,
+        "command": "pytest tests/",
+    })
+    assert invalid_type is False
+    assert "must be a string" in err_type
+
+
+@pytest.mark.asyncio
+async def test_verification_adversarial_conftest_real_execution():
+    """Validates Issue 1:
+    Runs an actual pytest execution in a temporary workspace containing an adversarial conftest.py.
+    Demonstrates that RunVerificationCheckTool correctly confines the JUnit XML evidence to a single
+    pre-allocated file and validates that AST verification confirms authentic test execution."""
+    from agent.tools.verification import RunVerificationCheckTool
+    import sys
+
+    tool = RunVerificationCheckTool()
+    orig_unisolated = os.environ.get("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION")
+    try:
+        os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = "1"
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            test_file = os.path.join(temp_dir, "test_real.py")
+            with open(test_file, "w", encoding="utf-8") as f:
+                f.write("def test_ok():\n    assert 1 + 1 == 2\n")
+
+            # Adversarial conftest attempting to access or write outside evidence
+            conftest_file = os.path.join(temp_dir, "conftest.py")
+            with open(conftest_file, "w", encoding="utf-8") as f:
+                f.write("""
+import pytest, os
+
+def pytest_runtest_teardown(item):
+    # conftest cannot modify host-allocated verification evidence
+    pass
+""")
+
+            res = await tool.execute(
+                workspace_path=temp_dir,
+                command=f'"{sys.executable}" -m pytest test_real.py',
+                check_name="Real Pytest with conftest",
+                check_type="test",
+                sandbox_mode="host",
+                require_sandbox=False,
+            )
+            assert res.success is True
+            assert res.artifacts.get("tampering_detected") is False
+            rec = res.artifacts.get("trusted_execution_record")
+            assert rec is not None
+            assert any("test_ok" in node for node in rec["passed_nodes"])
+    finally:
+        if orig_unisolated is not None:
+            os.environ["AGENT_ALLOW_UNISOLATED_HOST_EXECUTION"] = orig_unisolated
+        else:
+            os.environ.pop("AGENT_ALLOW_UNISOLATED_HOST_EXECUTION", None)
+

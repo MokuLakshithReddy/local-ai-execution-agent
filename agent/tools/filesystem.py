@@ -497,16 +497,17 @@ class SearchFilesTool(BaseTool):
                 execution_time_ms=(time.time() - t0) * 1000,
             )
 
-        # Guard against pathological ReDoS regex patterns with nested repetition
-        if is_regex and re.search(r"\([^)]*[*+][^)]*\)[*+]", query):
-            return ActionResult(
-                call_id=call_id,
-                tool_name=self.name,
-                success=False,
-                output="",
-                error="Potentially catastrophic regex backtracking pattern rejected (nested quantifiers detected). Use literal search instead.",
-                execution_time_ms=(time.time() - t0) * 1000,
-            )
+        # Guard against pathological ReDoS regex patterns (nested repetition or ambiguous alternation)
+        if is_regex:
+            if re.search(r"\([^)]*[*+?][^)]*\)[*+?]", query) or re.search(r"\([^)]*\|[^)]*\)[*+]", query):
+                return ActionResult(
+                    call_id=call_id,
+                    tool_name=self.name,
+                    success=False,
+                    output="",
+                    error="Potentially catastrophic regex backtracking pattern rejected (nested quantifiers or ambiguous alternation detected). Use literal search instead.",
+                    execution_time_ms=(time.time() - t0) * 1000,
+                )
 
         try:
             workspace_real = os.path.realpath(workspace_path)
@@ -595,20 +596,119 @@ class SearchFilesTool(BaseTool):
 
                 return matches, truncated
 
-            try:
-                matches, is_truncated = await asyncio.wait_for(
-                    asyncio.to_thread(_sync_search),
-                    timeout=15.0,
+            if is_regex:
+                import json
+                import sys
+                from agent.tools.terminal import _kill_process_tree
+
+                worker_script = (
+                    "import sys, os, re, json\n"
+                    "query = sys.argv[1]\n"
+                    "workspace_real = sys.argv[2]\n"
+                    "ext = sys.argv[3] if len(sys.argv) > 3 else ''\n"
+                    "IGNORED_DIRS = {'.git', '.svn', '.hg', 'node_modules', 'venv', '.venv', '__pycache__', '.pytest_cache'}\n"
+                    "try:\n"
+                    "    pattern = re.compile(query, re.IGNORECASE)\n"
+                    "except Exception as e:\n"
+                    "    print(json.dumps({'error': f'Invalid regex: {e}'}))\n"
+                    "    sys.exit(0)\n"
+                    "matches = []\n"
+                    "max_matches = 50\n"
+                    "max_file_bytes = 500 * 1024\n"
+                    "max_total_bytes = 5 * 1024 * 1024\n"
+                    "scanned_total_bytes = 0\n"
+                    "truncated = False\n"
+                    "for root, dirs, files in os.walk(workspace_real, followlinks=False):\n"
+                    "    dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not os.path.islink(os.path.join(root, d))]\n"
+                    "    for file in files:\n"
+                    "        if ext and not file.endswith(ext):\n"
+                    "            continue\n"
+                    "        full_p = os.path.join(root, file)\n"
+                    "        if os.path.islink(full_p) or not os.path.isfile(full_p):\n"
+                    "            continue\n"
+                    "        try:\n"
+                    "            f_size = os.path.getsize(full_p)\n"
+                    "            if f_size > max_file_bytes:\n"
+                    "                continue\n"
+                    "            scanned_total_bytes += f_size\n"
+                    "            if scanned_total_bytes > max_total_bytes:\n"
+                    "                truncated = True\n"
+                    "                break\n"
+                    "            rel_p = os.path.relpath(full_p, workspace_real).replace('\\\\', '/')\n"
+                    "            with open(full_p, 'r', encoding='utf-8', errors='ignore') as f:\n"
+                    "                for idx, line in enumerate(f, start=1):\n"
+                    "                    if pattern.search(line[:1000]):\n"
+                    "                        matches.append(f\"{rel_p}:{idx}: {line.strip()[:160]}\")\n"
+                    "                        if len(matches) >= max_matches:\n"
+                    "                            break\n"
+                    "        except Exception:\n"
+                    "            continue\n"
+                    "        if len(matches) >= max_matches or truncated:\n"
+                    "            break\n"
+                    "    if len(matches) >= max_matches or truncated:\n"
+                    "        break\n"
+                    "print(json.dumps({'matches': matches, 'truncated': truncated}))\n"
                 )
-            except asyncio.TimeoutError:
-                return ActionResult(
-                    call_id=call_id,
-                    tool_name=self.name,
-                    success=False,
-                    output="",
-                    error="Search execution timed out after 15.0 seconds. Use literal search or narrow file_extension.",
-                    execution_time_ms=(time.time() - t0) * 1000,
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-c",
+                    worker_script,
+                    query,
+                    workspace_real,
+                    ext,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
+                try:
+                    stdout_data, _ = await asyncio.wait_for(
+                        proc.communicate(),
+                        timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    _kill_process_tree(proc.pid)
+                    return ActionResult(
+                        call_id=call_id,
+                        tool_name=self.name,
+                        success=False,
+                        output="",
+                        error="Search execution timed out after 15.0 seconds. Worker process terminated.",
+                        execution_time_ms=(time.time() - t0) * 1000,
+                    )
+                raw_out = stdout_data.decode("utf-8", errors="replace").strip()
+                try:
+                    res_data = json.loads(raw_out)
+                    if "error" in res_data:
+                        return ActionResult(
+                            call_id=call_id,
+                            tool_name=self.name,
+                            success=False,
+                            output="",
+                            error=res_data["error"],
+                            execution_time_ms=(time.time() - t0) * 1000,
+                        )
+                    matches = res_data.get("matches", [])
+                    is_truncated = res_data.get("truncated", False)
+                except Exception:
+                    matches, is_truncated = [], False
+            else:
+                try:
+                    matches, is_truncated = await asyncio.wait_for(
+                        asyncio.to_thread(_sync_search),
+                        timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    return ActionResult(
+                        call_id=call_id,
+                        tool_name=self.name,
+                        success=False,
+                        output="",
+                        error="Search execution timed out after 15.0 seconds. Use literal search or narrow file_extension.",
+                        execution_time_ms=(time.time() - t0) * 1000,
+                    )
 
             output = "\n".join(matches) if matches else "No matching files found."
             if is_truncated:

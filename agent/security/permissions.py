@@ -2,14 +2,12 @@
 Permission and safety evaluation system.
 Independent from LLM; enforces boundaries, workspace restrictions, symlink containment, and approval gates.
 """
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional
 import os
+import re
+import shlex
 import uuid
 from agent.core.models import PermissionLevel, ApprovalRequest
-
-PATH_ARGUMENT_KEYS = ("path", "target_path", "file_path", "relative_path")
-
-import re
 
 # High-risk patterns that dynamically escalate terminal commands to DESTRUCTIVE_OPERATION
 DESTRUCTIVE_COMMAND_REGEXES = [
@@ -23,6 +21,135 @@ DESTRUCTIVE_COMMAND_REGEXES = [
     re.compile(r"\bmkfs\b", re.IGNORECASE),
     re.compile(r"\bformat\s+[a-zA-Z]:", re.IGNORECASE),
 ]
+
+PATH_ARGUMENT_KEYS = ("path", "target_path", "file_path", "relative_path")
+
+
+def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]:
+    """
+    Inspects a shell command string to classify if it performs destructive operations,
+    using tokenization (shlex) and pattern heuristics to guard against flag evasion.
+    """
+    cmd = cmd_str.strip()
+    if not cmd:
+        return PermissionLevel.ROUTINE_MODIFICATION, None
+
+    # 1. Check explicit destructive regexes
+    for pattern in DESTRUCTIVE_COMMAND_REGEXES:
+        if pattern.search(cmd):
+            return (
+                PermissionLevel.DESTRUCTIVE_OPERATION,
+                f"High risk: Destructive terminal command ('{cmd[:60]}...') requires explicit human authorization.",
+            )
+
+    # 2. Tokenized analysis
+    try:
+        tokens = shlex.split(cmd, posix=False)
+    except Exception:
+        tokens = cmd.split()
+
+    if not tokens:
+        return PermissionLevel.ROUTINE_MODIFICATION, None
+
+    # Check chained commands or pipelines separated by ; && || |
+    subcommands = []
+    current_sub = []
+    for t in tokens:
+        if t in (";", "&&", "||", "|", "&"):
+            if current_sub:
+                subcommands.append(current_sub)
+                current_sub = []
+        else:
+            current_sub.append(t)
+    if current_sub:
+        subcommands.append(current_sub)
+
+    for sub in subcommands:
+        if not sub:
+            continue
+        idx = 0
+        while idx < len(sub) and "=" in sub[idx] and not sub[idx].startswith("-"):
+            idx += 1
+        if idx >= len(sub):
+            continue
+        exe = os.path.basename(sub[idx]).lower().replace('"', '').replace("'", "")
+        args = [a.lower().replace('"', '').replace("'", "") for a in sub[idx + 1:]]
+
+        # A. git inspection: flags like git -c ... clean, git reset --hard
+        if exe == "git" or exe.startswith("git."):
+            if "clean" in args:
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git clean operation ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "reset" in args and "--hard" in args:
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git reset --hard ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if "branch" in args and any(b in args for b in ("-d", "-d", "--delete")):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git branch deletion ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git branch deletion ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+
+        # B. rm inspection: -r, -rf, -fr, --recursive, -r -f
+        if exe in ("rm", "unlink"):
+            has_recursive = any(
+                a in ("-r", "-rf", "-fr", "-R", "--recursive") or (a.startswith("-") and "r" in a and not a.startswith("--"))
+                for a in args
+            )
+            has_force = any(
+                a in ("-f", "-rf", "-fr", "--force") or (a.startswith("-") and "f" in a and not a.startswith("--"))
+                for a in args
+            )
+            if has_recursive or has_force or exe == "unlink":
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Recursive/forced file removal ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+
+        # C. find inspection: find ... -delete or find ... -exec rm
+        if exe == "find":
+            if "-delete" in args or any("rm" in a for a in args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Destructive find operation ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+
+        # D. Windows rd / rmdir / del / erase
+        if exe in ("rd", "rmdir"):
+            if any("/s" in a for a in args) or any("-s" in a for a in args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Directory tree deletion ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+        if exe in ("del", "erase"):
+            if any(flag in args for flag in ("/s", "/f", "/q", "-s", "-f", "-q")):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: File deletion command ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+
+        # E. Inline interpreter scripts: python -c, node -e
+        if exe in ("python", "python3", "py", "node", "ruby", "perl", "bash", "sh"):
+            inline_str = " ".join(args)
+            destructive_interpreter_terms = (
+                "shutil.rmtree", "os.remove", "os.unlink", "os.rmdir",
+                "pathlib.path.unlink", "fs.rmsync", "fs.rmdirsync",
+                "fs.unlinksync", "fileutils.rm_rf"
+            )
+            if any(term in inline_str for term in destructive_interpreter_terms):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Destructive interpreter deletion ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+
+    return PermissionLevel.ROUTINE_MODIFICATION, None
 
 
 MAX_PENDING_APPROVALS = 200
@@ -91,11 +218,10 @@ class PermissionManager:
         destructive_reason = None
         if tool_name == "run_command" and "command" in arguments:
             cmd_str = str(arguments.get("command", "")).strip()
-            for pattern in DESTRUCTIVE_COMMAND_REGEXES:
-                if pattern.search(cmd_str):
-                    effective_level = PermissionLevel.DESTRUCTIVE_OPERATION
-                    destructive_reason = f"High risk: Destructive terminal command ('{cmd_str[:60]}...') requires explicit human authorization."
-                    break
+            classified_lvl, risk_msg = classify_command_risk(cmd_str)
+            if classified_lvl == PermissionLevel.DESTRUCTIVE_OPERATION:
+                effective_level = PermissionLevel.DESTRUCTIVE_OPERATION
+                destructive_reason = risk_msg
 
         if effective_level == PermissionLevel.READ_ONLY:
             return True, "Permitted: Read-only operation within workspace.", None
@@ -204,6 +330,7 @@ class PermissionManager:
                 req.resolved_at = time.time()
                 self.approval_history[aid] = req
                 cancelled_ids.append(aid)
+        self._prune_history()
         return cancelled_ids
 
     def expire_approval(self, approval_id: str) -> ApprovalRequest | None:
@@ -215,6 +342,7 @@ class PermissionManager:
         import time
         req.resolved_at = time.time()
         self.approval_history[approval_id] = req
+        self._prune_history()
         return req
 
     @staticmethod

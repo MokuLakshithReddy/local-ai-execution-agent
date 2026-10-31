@@ -4,6 +4,7 @@ Secured with local session token authorization, strict CORS boundaries,
 and an approved workspace registry.
 """
 import asyncio
+import ipaddress
 import os
 import secrets
 import sys
@@ -206,6 +207,29 @@ engine = ExecutionEngine(
 )
 
 
+_task_reservation_lock = asyncio.Lock()
+_reserved_task_slots: set[str] = set()
+
+
+def _is_loopback_endpoint(host: str) -> bool:
+    """
+    Validates if a hostname or IP address is strictly a loopback address.
+    Explicitly rejects 0.0.0.0, ::, and other non-loopback bindings.
+    """
+    if not host:
+        return False
+    h = host.strip().lower()
+    if h in ("localhost", "testclient"):
+        return True
+    if h in ("0.0.0.0", "::", "0:0:0:0:0:0:0:0"):
+        return False
+    try:
+        ip = ipaddress.ip_address(h)
+        return ip.is_loopback
+    except ValueError:
+        return False
+
+
 def verify_auth(
     x_agent_auth_token: Optional[str] = Header(None, alias="X-Agent-Auth-Token"),
     authorization: Optional[str] = Header(None),
@@ -257,7 +281,7 @@ async def get_session_token(request: Request):
     Guarded against browser-origin attacks, cross-site requests, and unauthorized origins.
     """
     client_host = request.client.host if request.client else ""
-    if client_host not in ("127.0.0.1", "localhost", "::1", "testclient"):
+    if not _is_loopback_endpoint(client_host):
         raise HTTPException(status_code=403, detail="Forbidden: Handshake only available from loopback.")
 
     # 1. Sec-Fetch-Site defense: Modern browsers set this to cross-site when initiated from third-party origins
@@ -468,91 +492,96 @@ async def save_settings(req: SaveSettingsRequest):
 
 @app.post("/api/tasks", dependencies=[Depends(verify_auth)])
 async def create_task(req: CreateTaskRequest):
-    # Enforce global active concurrency limits
-    active_count = len([t for t, is_active in engine._active_tasks.items() if is_active])
-    if active_count >= 10:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Server capacity reached: Maximum concurrent tasks (10) exceeded. Please wait for active tasks to complete.",
-        )
-
-    if req.max_steps < 1 or req.max_steps > 100:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid max_steps ({req.max_steps}). Must be an integer bounded between 1 and 100.",
-        )
-    target_ws = req.workspace_path
-    if not target_ws:
-        curr_ws = await db.get_setting("current_workspace")
-        if curr_ws and os.path.exists(curr_ws) and os.path.isdir(curr_ws):
-            target_ws = curr_ws
-        else:
-            target_ws = os.path.realpath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-    real_ws = await validate_approved_workspace(target_ws)
-
-    # Resolve API key securely
-    settings = await db.get_setting("app_settings", {})
-    api_key = req.api_key
-    if not api_key:
-        provider = req.model_provider.lower()
-        if "gemini" in provider:
-            api_key = settings.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY", "")
-        elif "anthropic" in provider:
-            api_key = settings.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
-        elif "openai" in provider:
-            api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
-        elif "ollama" in provider:
-            api_key = "ollama"
-
-    if api_key:
-        register_global_secret(api_key)
-
-    if not api_key and req.model_provider not in ("ollama", "local"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"API key for '{req.model_provider}' is not configured. Please supply an API key in Settings.",
-        )
-
-    task_type = req.task_type or infer_task_type(req.goal)
     task_id = str(uuid.uuid4())
-    task = Task(
-        id=task_id,
-        goal=req.goal,
-        workspace_path=real_ws,
-        task_type=task_type,
-        model_provider=req.model_provider,
-        model_name=req.model_name,
-        max_steps=req.max_steps,
-    )
+    # Atomically reserve task execution slot under lock
+    async with _task_reservation_lock:
+        active_count = len([t for t, is_active in engine._active_tasks.items() if is_active]) + len(_reserved_task_slots)
+        if active_count >= 10:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Server capacity reached: Maximum concurrent tasks (10) exceeded. Please wait for active tasks to complete.",
+            )
+        _reserved_task_slots.add(task_id)
 
-    provider_lower = req.model_provider.lower()
-    if provider_lower in ("ollama", "local"):
-        resolved_base_url = req.custom_base_url or settings.get("ollama_base_url") or "http://localhost:11434/v1"
-    else:
-        resolved_base_url = req.custom_base_url
-        if resolved_base_url:
-            parsed_u = urllib.parse.urlparse(resolved_base_url)
-            if parsed_u.scheme not in ("http", "https") or not parsed_u.netloc:
-                raise HTTPException(status_code=400, detail="Invalid custom_base_url: must be a valid HTTP or HTTPS URL.")
-            host_lower = (parsed_u.hostname or "").lower()
-            is_loopback = host_lower in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
-            if parsed_u.scheme == "http" and not is_loopback:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Insecure endpoint rejected: Remote custom endpoints must use HTTPS to prevent plaintext transmission of API credentials.",
-                )
+    try:
+        if req.max_steps < 1 or req.max_steps > 100:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid max_steps ({req.max_steps}). Must be an integer bounded between 1 and 100.",
+            )
+        target_ws = req.workspace_path
+        if not target_ws:
+            curr_ws = await db.get_setting("current_workspace")
+            if curr_ws and os.path.exists(curr_ws) and os.path.isdir(curr_ws):
+                target_ws = curr_ws
+            else:
+                target_ws = os.path.realpath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        real_ws = await validate_approved_workspace(target_ws)
 
-    # Launch in background and register with execution engine for prompt cancellation
-    bg_task = asyncio.create_task(
-        engine.run_task(
-            task=task,
-            api_key=api_key or "",
-            custom_base_url=resolved_base_url,
+        # Resolve API key securely
+        settings = await db.get_setting("app_settings", {})
+        api_key = req.api_key
+        if not api_key:
+            provider = req.model_provider.lower()
+            if "gemini" in provider:
+                api_key = settings.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY", "")
+            elif "anthropic" in provider:
+                api_key = settings.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+            elif "openai" in provider:
+                api_key = settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
+            elif "ollama" in provider:
+                api_key = "ollama"
+
+        if api_key:
+            register_global_secret(api_key)
+
+        if not api_key and req.model_provider not in ("ollama", "local"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"API key for '{req.model_provider}' is not configured. Please supply an API key in Settings.",
+            )
+
+        task_type = req.task_type or infer_task_type(req.goal)
+        task = Task(
+            id=task_id,
+            goal=req.goal,
+            workspace_path=real_ws,
+            task_type=task_type,
+            model_provider=req.model_provider,
+            model_name=req.model_name,
+            max_steps=req.max_steps,
         )
-    )
-    engine.register_running_task(task_id, bg_task)
 
-    return {"task_id": task_id, "status": "started", "task_type": task_type.value}
+        provider_lower = req.model_provider.lower()
+        if provider_lower in ("ollama", "local"):
+            resolved_base_url = req.custom_base_url or settings.get("ollama_base_url") or "http://localhost:11434/v1"
+        else:
+            resolved_base_url = req.custom_base_url
+            if resolved_base_url:
+                parsed_u = urllib.parse.urlparse(resolved_base_url)
+                if parsed_u.scheme not in ("http", "https") or not parsed_u.netloc:
+                    raise HTTPException(status_code=400, detail="Invalid custom_base_url: must be a valid HTTP or HTTPS URL.")
+                host_lower = (parsed_u.hostname or "").lower()
+                is_loopback = _is_loopback_endpoint(host_lower)
+                if parsed_u.scheme == "http" and not is_loopback:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Insecure endpoint rejected: Remote custom endpoints must use HTTPS to prevent plaintext transmission of API credentials.",
+                    )
+
+        # Launch in background and register with execution engine for prompt cancellation
+        bg_task = asyncio.create_task(
+            engine.run_task(
+                task=task,
+                api_key=api_key or "",
+                custom_base_url=resolved_base_url,
+            )
+        )
+        engine.register_running_task(task_id, bg_task)
+
+        return {"task_id": task_id, "status": "started", "task_type": task_type.value}
+    finally:
+        _reserved_task_slots.discard(task_id)
 
 
 @app.get("/api/tasks", dependencies=[Depends(verify_auth)])
