@@ -95,6 +95,23 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
 
         # A. git inspection: conservative Git subcommand and argument security policy
         if exe == "git" or exe.startswith("git."):
+            # 0a. Escalate unresolved shell variable expansion, command substitution, or dynamic argument construction
+            has_dynamic_args = any(
+                bool(re.search(r"(\$|`|%[a-zA-Z0-9_]+%)", a))
+                for a in orig_args
+            )
+            has_shell_assignments = any(
+                any("=" in t and not t.startswith("-") for t in other_sub)
+                for other_sub in subcommands
+                if other_sub != sub
+            )
+            has_inline_assignment = (idx > 0)
+            if has_dynamic_args or has_shell_assignments or has_inline_assignment:
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git command contains unresolved shell variable expansion, command substitution, or dynamic argument construction ('{cmd[:60]}...') and requires explicit human authorization.",
+                )
+
             # Parse git global options to locate the git subcommand
             subcmd = None
             subcmd_args = []

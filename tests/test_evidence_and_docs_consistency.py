@@ -1,6 +1,7 @@
 """
 Evidence & Documentation Consistency Automated Audit.
-Verifies that README.md, EVIDENCE.md, and test suite execution counts remain strictly synchronized.
+Verifies that README.md, EVIDENCE.md, and raw pytest JUnit XML records remain strictly synchronized
+and that all claims are mathematically backed by independent execution records.
 """
 import os
 import re
@@ -70,7 +71,6 @@ def test_evidence_and_docs_consistency():
 
     import subprocess
     try:
-        # Check if git repository is shallow
         is_shallow = False
         try:
             shallow_check = subprocess.run(
@@ -84,7 +84,6 @@ def test_evidence_and_docs_consistency():
         except Exception:
             pass
 
-        # Commit must exist in the git object database
         verify_proc = subprocess.run(
             ["git", "rev-parse", "--verify", f"{ev_sha}^{{commit}}"],
             capture_output=True,
@@ -92,7 +91,6 @@ def test_evidence_and_docs_consistency():
             check=False,
         )
         if is_shallow and verify_proc.returncode != 0:
-            # In a shallow clone, attempt to deepen history to resolve commit
             subprocess.run(["git", "fetch", "--depth=50", "origin"], capture_output=True, check=False)
             verify_proc = subprocess.run(
                 ["git", "rev-parse", "--verify", f"{ev_sha}^{{commit}}"],
@@ -106,7 +104,6 @@ def test_evidence_and_docs_consistency():
                 f"EVIDENCE.md references non-existent git commit SHA: {ev_sha}"
             )
 
-            # Commit must NOT be an arbitrary old ancestor; it must match current HEAD or immediate parent (HEAD~1)
             head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
             parent_sha = None
             try:
@@ -156,3 +153,39 @@ def test_evidence_and_docs_consistency():
     else:
         assert "actions/workflows/ci.yml" in evidence_content
 
+    # 11. Independent cross-validation against raw JUnit test XML records
+    if os.path.exists(junit_path):
+        junit_tree = ET.parse(junit_path)
+        junit_root = junit_tree.getroot()
+        xml_testcases = {}
+        for tc in junit_root.iter("testcase"):
+            tc_name = tc.attrib.get("name", "")
+            tc_status = "FAIL" if (tc.find("failure") is not None or tc.find("error") is not None) else ("SKIPPED" if tc.find("skipped") is not None else "PASS")
+            xml_testcases[tc_name] = tc_status
+
+        adv_test_mapping = {
+            "ADV-01": "test_adversarial_scenario_1_path_traversal",
+            "ADV-02": "test_adversarial_scenario_2_secret_redaction",
+            "ADV-03": "test_adversarial_scenario_3_destructive_commands",
+            "ADV-04": "test_adversarial_scenario_4_prompt_injection",
+            "ADV-05": "test_adversarial_scenario_5_env_leakage",
+            "ADV-06": "test_adversarial_scenario_6_network_isolation",
+            "ADV-07": "test_adversarial_scenario_7_subprocess_timeout",
+        }
+        for adv_id, prefix in adv_test_mapping.items():
+            matching_tc = [status for name, status in xml_testcases.items() if prefix in name]
+            assert matching_tc, f"JUnit XML has no testcase record matching {adv_id} ({prefix})"
+            assert all(s == "PASS" for s in matching_tc), f"JUnit XML reports failures in {adv_id}: {matching_tc}"
+
+    docker_junit_path = os.path.join(repo_root, "junit-docker-results.xml")
+    if os.path.exists(docker_junit_path):
+        docker_tree = ET.parse(docker_junit_path)
+        docker_root = docker_tree.getroot()
+        docker_testcases = {}
+        for tc in docker_root.iter("testcase"):
+            tc_name = tc.attrib.get("name", "")
+            tc_status = "FAIL" if (tc.find("failure") is not None or tc.find("error") is not None) else ("SKIPPED" if tc.find("skipped") is not None else "PASS")
+            docker_testcases[tc_name] = tc_status
+        docker_tc = [status for name, status in docker_testcases.items() if "test_real_docker_container_security_boundaries" in name]
+        assert docker_tc, "Docker JUnit XML has no record for test_real_docker_container_security_boundaries"
+        assert all(s == "PASS" for s in docker_tc), f"Docker integration tests failed in JUnit XML: {docker_tc}"

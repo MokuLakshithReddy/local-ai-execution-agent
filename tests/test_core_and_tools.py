@@ -7159,6 +7159,53 @@ def test_conservative_git_subcommand_policy():
         assert level == PermissionLevel.ROUTINE_MODIFICATION, f"Expected ROUTINE for '{cmd}', got {level} ({reason})"
 
 
+def test_git_shell_variable_expansion_bypass_prevention():
+    """Validates that shell variable expansion, command substitution, and shell assignments
+    preceding or combined with Git commands cannot bypass destructive-operation classification.
+    Ensures that PermissionManager with both auto_approve_sensitive=True and auto_approve_routine=True
+    strictly rejects auto-approval and requires explicit human authorization."""
+    from agent.security.permissions import classify_command_risk, PermissionManager, PermissionPolicy, PermissionLevel
+
+    evasion_commands = [
+        "FLAGS=--amend; git commit $FLAGS --no-edit",
+        "OPTS=--output=important.py; git diff $OPTS",
+        "git commit $FLAGS",
+        "git commit ${FLAGS}",
+        "git commit $(echo --amend)",
+        "git commit `echo --amend`",
+        "git diff %OPTS%",
+        "FLAGS=--amend git commit --no-edit",
+        "SET=1; git status $VAR",
+    ]
+
+    for cmd in evasion_commands:
+        level, reason = classify_command_risk(cmd)
+        assert level == PermissionLevel.DESTRUCTIVE_OPERATION, (
+            f"Expected DESTRUCTIVE_OPERATION for '{cmd}', got {level} ({reason})"
+        )
+
+    # Prove PermissionManager refuses auto-approval even with ALL auto-approve settings enabled
+    pm = PermissionManager(policy=PermissionPolicy(
+        auto_approve_sensitive=True,
+        auto_approve_routine=True,
+    ))
+    with tempfile.TemporaryDirectory() as td:
+        for cmd in evasion_commands:
+            is_permitted, reason, approval_req = pm.evaluate_action(
+                task_id="t_git_evasion",
+                tool_name="run_command",
+                arguments={"command": cmd},
+                permission_level=PermissionLevel.ROUTINE_MODIFICATION,
+                workspace_path=td,
+            )
+            assert is_permitted is False, (
+                f"Security Failure: Variable-expanded command '{cmd}' was auto-approved! "
+                f"Must require explicit human approval."
+            )
+            assert approval_req is not None
+            assert approval_req.permission_level == PermissionLevel.DESTRUCTIVE_OPERATION
+
+
 @pytest.mark.asyncio
 async def test_run_verification_escalates_destructive_commands():
     """Validates that run_verification commands are subject to the same command-risk

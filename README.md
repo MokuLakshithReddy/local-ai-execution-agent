@@ -11,7 +11,7 @@ A source-available, evidence-driven autonomous coding framework that delegates r
 [![React 19](https://img.shields.io/badge/React-19%20%7C%20Vite-646CFF.svg)](https://vitejs.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-Local--First-003B57.svg)](https://sqlite.org/)
 [![CI](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
-[![Verification: 140 Passed](https://img.shields.io/badge/Verification-140%20Passed-10b981.svg)](EVIDENCE.md)
+[![Verification: 141 Passed](https://img.shields.io/badge/Verification-141%20Passed-10b981.svg)](EVIDENCE.md)
 [![Adversarial Benchmark: 7/7](https://img.shields.io/badge/Adversarial%20Benchmark-7%2F7%20Passed-blue.svg)](EVIDENCE.md)
 [![License: Non-Commercial](https://img.shields.io/badge/License-Non--Commercial-orange.svg)](LICENSE)
 
@@ -181,7 +181,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Verify Your Environment (140 Passing Tests)
+### 2. Verify Your Environment (141 Passing Tests)
 
 Run the automated test suite to verify kernel job limits, sandbox boundaries, and provenance hashing:
 
@@ -301,7 +301,7 @@ Every release and commit is backed by reproducible automated tests and adversari
 > - **[GitHub Actions CI Pipeline](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)**: Canonical multi-platform CI verification runs and official downloadable evidence artifacts (`execution-evidence-reports`).
 > - **[DEMO_RUN.md](DEMO_RUN.md)**: Full reproducible transcript of an end-to-end task from defect to verified fix and approval lifecycle.
 
-### Verified Suite Summary: 140 Comprehensive Automated Tests
+### Verified Suite Summary: 141 Comprehensive Automated Tests
 
 ```text
 ============================= test session starts =============================
@@ -309,14 +309,14 @@ platform: Ubuntu 24.04 / Windows 11 -- Python 3.12 -- pytest 9.1.1
 rootdir: <repository_root>
 configfile: pytest.ini
 plugins: anyio, asyncio
-collected 141 items / 1 deselected / 140 selected
+collected 142 items / 1 deselected / 141 selected
 
 tests/test_adversarial_benchmark.py ......................... [  6%] (8/8 PASS)
-tests/test_core_and_tools.py ................................ [ 98%] (130/130 PASS)
+tests/test_core_and_tools.py ................................ [ 98%] (131/131 PASS)
 tests/test_evidence_and_docs_consistency.py ................. [ 99%] (1/1 PASS)
 tests/test_e2e_demo.py ...................................... [100%] (1/1 PASS)
 
-======================= 140 passed (100.0% Green CI) =======================
+======================= 141 passed (100.0% Green CI) =======================
 ```
 
 ### Adversarial Security Benchmark Outcomes (7/7 Passed)
@@ -325,11 +325,18 @@ tests/test_e2e_demo.py ...................................... [100%] (1/1 PASS)
 |---|---|---|:---:|
 | `ADV-01` | **Path Traversal & Host Filesystem Escapes** | Canonical path containment & symlink dereferencing | **PASS** |
 | `ADV-02` | **Secret Redaction & Exfiltration Prevention** | Centralized `SecuritySanitizer` & DB persistence masking | **PASS** |
-| `ADV-03` | **Destructive Commands & Container Rootfs** | `validate_sandbox_command` blocklist & Docker `--read-only` | **PASS** |
-| `ADV-04` | **Hostile Repo Instructions (Prompt Injection)** | Delimiter fencing (`=== BEGIN UNTRUSTED DATA ===`) & Verifier | **PASS** |
-| `ADV-05` | **Environment Variable Leakage Protection** | `get_isolated_environment()` strict allowlist (`SAFE_ENV_ALLOWLIST`) | **PASS** |
-| `ADV-06` | **Outbound Network Namespace Isolation** | Docker `--network=none` & model parameter stripping | **PASS** |
+| `ADV-03` | **Destructive Command Filtering & Host Isolation** | `validate_sandbox_command` syntax filtering & fail-closed host rejection | **PASS** |
+| `ADV-04` | **Hostile Repo Instructions (Prompt Injection)** | Delimiter fencing (`=== BEGIN UNTRUSTED DATA ===`) & Verifier truth check | **PASS** |
+| `ADV-05` | **Environment Variable Leakage Protection** | `_get_isolated_environment()` strict allowlist (`SAFE_ENV_ALLOWLIST`) | **PASS** |
+| `ADV-06` | **Command-Level Outbound Network Blocking** | Argument blocklist & model schema parameter stripping | **PASS** |
 | `ADV-07` | **Subprocess Timeouts & Process Tree Termination** | Task timeout budgets & `_kill_process_tree` process group reaper | **PASS** |
+
+### Live Container Security Boundary Integration (Ubuntu CI & Docker Hosts)
+
+| ID | Kernel Boundary Tested | Enforcement Mechanism | Platform Scope | Observed Result |
+|---|---|---|---|:---:|
+| `DOCKER-01` | **Container Rootfs & Non-Root Execution** | Docker `--read-only` rootfs, `--cap-drop=ALL`, `--user 1000:1000` | Linux / Docker Container | **PASS** |
+| `DOCKER-02` | **Kernel Network Namespace Isolation** | Docker `--network=none` detached network namespace | Linux / Docker Container | **PASS** |
 
 ### How to Reproduce Locally
 
