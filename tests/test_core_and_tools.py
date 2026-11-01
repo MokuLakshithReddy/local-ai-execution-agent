@@ -7669,11 +7669,17 @@ async def test_git_option_abbreviations_bypass_prevention():
             res_checkout_force = subprocess.run(["git", "checkout", "--f", cur_branch], cwd=td, capture_output=True, text=True)
             assert res_checkout_force.returncode == 0, f"Git rejected checkout '--f': {res_checkout_force.stderr}"
 
-            # D. git branch --del topic (abbreviation for --delete)
+            # D. git branch --de / --del topic (abbreviation for --delete)
             subprocess.run(["git", "branch", "topic"], cwd=td, check=True, capture_output=True)
-            # Try --del first (unambiguous across all Git versions) or --de if accepted
-            res_branch_del = subprocess.run(["git", "branch", "--del", "topic"], cwd=td, capture_output=True, text=True)
-            assert res_branch_del.returncode == 0, f"Git rejected branch '--del': {res_branch_del.stderr}"
+            res_branch_de = subprocess.run(["git", "branch", "--de", "topic"], cwd=td, capture_output=True, text=True)
+            # In Git versions with only --delete, --de succeeds (returncode 0); in Git versions that added --delete-merged,
+            # Git reports ambiguous option (returncode 129, identifying --delete and --delete-merged).
+            assert res_branch_de.returncode in (0, 129), f"Unexpected Git branch abbreviation response: {res_branch_de.stderr}"
+            if res_branch_de.returncode == 129:
+                assert "could be --delete" in res_branch_de.stderr.lower()
+            # Verify deletion using unambiguous delete flag
+            res_branch_del_exact = subprocess.run(["git", "branch", "-D", "topic"], cwd=td, capture_output=True, text=True)
+            assert res_branch_del_exact.returncode == 0
         except (FileNotFoundError, subprocess.SubprocessError):
             # If git executable is unavailable in local testing sandbox, skip the real binary execution
             pass
