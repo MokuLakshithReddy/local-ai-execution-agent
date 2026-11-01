@@ -128,7 +128,7 @@ def test_evidence_and_docs_consistency():
 
     # 7. Extract reported boundary statuses directly from EVIDENCE.md table
     reported_boundaries = {}
-    for match in re.finditer(r"\|\s*\*\*([A-Z0-9_-]+)\*\*\s*\|.*?\|\s*\*\*([A-Z0-9_\(\)\s-]+)\*\*\s*\|", evidence_content):
+    for match in re.finditer(r"\|\s*\*\*([A-Za-z0-9_-]+)\*\*\s*\|.*?\|\s*\*\*([^\*]+)\*\*\s*\|", evidence_content):
         b_id, b_status = match.group(1).strip(), match.group(2).strip()
         reported_boundaries[b_id] = b_status
 

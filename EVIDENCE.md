@@ -5,16 +5,16 @@
 ## 1. Provenance & Execution Context
 
 - **Report Scope**: `Canonical Linux / Docker Container Environment (Production Target)`
-- **Commit SHA**: `1fdf65476aeb04a5da3cda5812ae3824800920ae`
+- **Commit SHA**: `725969450e2704e17d30fd7e529b2f5ffbd9e851`
 - **Git Branch**: `main`
 - **CI Run ID**: `Local Execution`
 - **CI Run URL**: Local Pre-Commit Run (Canonical CI: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
 - **Canonical CI Pipeline**: [https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
 - **Working Tree**: `Clean (Verified)`
-- **Generated At**: `2026-11-01 07:31:33 UTC`
+- **Generated At**: `2026-11-01 07:35:42 UTC`
 - **Operating System**: `Linux (Ubuntu 24.04 LTS / GitHub Actions CI Runner)`
 - **Python Runtime**: `3.12.10`
-- **Primary Sandbox Mode**: `Kernel Job Object / Local Host Supervisor`
+- **Primary Sandbox Mode**: `Docker Container (--read-only, --network=none)`
 
 ## 2. CI Verification & Artifact Provenance
 
