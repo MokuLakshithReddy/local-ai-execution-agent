@@ -10,6 +10,7 @@ import secrets
 import sys
 import uuid
 import logging
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header, Request, Query, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -154,7 +155,53 @@ def _extract_hostname(host_header: str) -> str:
 
 
 
-app = FastAPI(title="Local-First AI Execution Agent", version="1.1.0")
+db = Database()
+permission_manager = PermissionManager()
+tool_registry = ToolRegistry()
+
+# Active WebSocket connections
+active_connections: List[WebSocket] = []
+
+
+async def broadcast_event(event_type: str, data: Dict[str, Any]):
+    message = {"type": event_type, "data": data}
+    disconnected = []
+    for conn in active_connections:
+        try:
+            await conn.send_json(message)
+        except Exception:
+            disconnected.append(conn)
+    for conn in disconnected:
+        if conn in active_connections:
+            active_connections.remove(conn)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db.init()
+    reconciled = await db.reconcile_interrupted_tasks()
+    if reconciled > 0:
+        logging.getLogger("agent.server").warning(
+            "Startup reconciliation: marked %d interrupted task(s) as FAILED.", reconciled
+        )
+    # Seed current project directory as default approved workspace
+    curr_dir = os.path.realpath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+    existing_ws = await db.get_setting("current_workspace")
+    if not existing_ws:
+        await db.save_setting("current_workspace", curr_dir)
+
+    approved = await db.get_setting("approved_workspaces", [])
+    if curr_dir not in approved:
+        approved.append(curr_dir)
+        await db.save_setting("approved_workspaces", approved)
+
+    # Populate permission manager approved workspaces
+    for ws in approved:
+        permission_manager.approve_workspace(ws)
+    yield
+
+
+app = FastAPI(title="Local-First AI Execution Agent", version="1.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -177,26 +224,6 @@ async def dns_rebinding_protection_middleware(request: Request, call_next):
             content={"detail": "Bad Request: Untrusted or invalid Host header (DNS rebinding protection)."},
         )
     return await call_next(request)
-
-db = Database()
-permission_manager = PermissionManager()
-tool_registry = ToolRegistry()
-
-# Active WebSocket connections
-active_connections: List[WebSocket] = []
-
-
-async def broadcast_event(event_type: str, data: Dict[str, Any]):
-    message = {"type": event_type, "data": data}
-    disconnected = []
-    for conn in active_connections:
-        try:
-            await conn.send_json(message)
-        except Exception:
-            disconnected.append(conn)
-    for conn in disconnected:
-        if conn in active_connections:
-            active_connections.remove(conn)
 
 
 engine = ExecutionEngine(
@@ -247,30 +274,6 @@ def verify_auth(
             detail="Unauthorized: Missing or invalid local session auth token.",
         )
     return token
-
-
-@app.on_event("startup")
-async def on_startup():
-    await db.init()
-    reconciled = await db.reconcile_interrupted_tasks()
-    if reconciled > 0:
-        logging.getLogger("agent.server").warning(
-            "Startup reconciliation: marked %d interrupted task(s) as FAILED.", reconciled
-        )
-    # Seed current project directory as default approved workspace
-    curr_dir = os.path.realpath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-    existing_ws = await db.get_setting("current_workspace")
-    if not existing_ws:
-        await db.save_setting("current_workspace", curr_dir)
-
-    approved = await db.get_setting("approved_workspaces", [])
-    if curr_dir not in approved:
-        approved.append(curr_dir)
-        await db.save_setting("approved_workspaces", approved)
-
-    # Populate permission manager approved workspaces
-    for ws in approved:
-        permission_manager.approve_workspace(ws)
 
 
 @app.get("/api/auth/token")

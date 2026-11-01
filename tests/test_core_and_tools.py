@@ -7535,3 +7535,147 @@ def test_git_destructive_commands_expanded_coverage():
         assert level == PermissionLevel.DESTRUCTIVE_OPERATION, f"Expected DESTRUCTIVE for '{cmd}', got {level}"
         assert "git" in reason.lower()
 
+
+@pytest.mark.asyncio
+async def test_git_option_abbreviations_bypass_prevention():
+    """Validates that Git option abbreviations (e.g. '--am', '--de', '--d', '--f')
+    cannot bypass destructive-operation classification, even when auto_approve_routine
+    and auto_approve_sensitive are enabled.
+    Tests both classify_command_risk and PermissionManager across run_command and run_verification.
+    Also executes the commands against a real disposable Git repository in CI to confirm that
+    Git accepts the abbreviations in production."""
+    import subprocess
+    from agent.security.permissions import classify_command_risk, PermissionManager, PermissionPolicy, PermissionLevel
+    from agent.tools.verification import RunVerificationCheckTool
+
+    # The 4 core commands identified in the security audit
+    core_abbreviated_commands = [
+        "git commit --am --no-edit",
+        "git branch --de topic",
+        "git tag --d v1",
+        "git checkout --f master",
+    ]
+
+    # Additional dangerous option abbreviations: force-push, branch deletion, tag deletion,
+    # history rewriting, output redirection, and switch/merge aborts
+    additional_abbreviated_commands = [
+        "git push origin --f",
+        "git push origin --fo",
+        "git push origin --force-w",
+        "git push origin --del old-branch",
+        "git branch --del topic",
+        "git branch --fo new-branch",
+        "git branch --m old new",
+        "git branch --c old new",
+        "git tag --del v1",
+        "git tag --fo v2",
+        "git diff --ou output.py",
+        "git log --ou=output.py",
+        "git checkout --fo master",
+        "git switch --f main",
+        "git switch --di",
+        "git merge --ab",
+        "git cherry-pick --qu",
+        "git update-ref --del refs/heads/temp",
+        "git gc --pr",
+        "git submodule deinit --f .",
+    ]
+
+    all_abbreviated_commands = core_abbreviated_commands + additional_abbreviated_commands
+
+    # 1. Verify classify_command_risk escalates every abbreviated dangerous command
+    for cmd in all_abbreviated_commands:
+        level, reason = classify_command_risk(cmd)
+        assert level == PermissionLevel.DESTRUCTIVE_OPERATION, (
+            f"Expected DESTRUCTIVE_OPERATION for abbreviated Git command '{cmd}', got {level} ({reason})"
+        )
+        assert reason is not None and ("git" in reason.lower() or "output" in reason.lower())
+
+    # 2. Verify PermissionManager refuses auto-approval for both run_command and run_verification
+    pm = PermissionManager(policy=PermissionPolicy(
+        auto_approve_routine=True,
+        auto_approve_sensitive=True,
+        require_approval_destructive=True,
+    ))
+    verification_tool = RunVerificationCheckTool()
+
+    with tempfile.TemporaryDirectory() as td:
+        for cmd in all_abbreviated_commands:
+            # Check run_command
+            is_permitted_cmd, reason_cmd, approval_req_cmd = pm.evaluate_action(
+                task_id="t_abbr_run_cmd",
+                tool_name="run_command",
+                arguments={"command": cmd},
+                permission_level=PermissionLevel.ROUTINE_MODIFICATION,
+                workspace_path=td,
+            )
+            assert is_permitted_cmd is False, (
+                f"Security Failure: Abbreviated Git command '{cmd}' was auto-approved for run_command!"
+            )
+            assert approval_req_cmd is not None
+            assert approval_req_cmd.permission_level == PermissionLevel.DESTRUCTIVE_OPERATION
+
+            # Check run_verification
+            is_permitted_verif, reason_verif, approval_req_verif = pm.evaluate_action(
+                task_id="t_abbr_run_verif",
+                tool_name="run_verification",
+                arguments={"command": cmd},
+                permission_level=PermissionLevel.SENSITIVE_OPERATION,
+                workspace_path=td,
+            )
+            assert is_permitted_verif is False, (
+                f"Security Failure: Abbreviated Git command '{cmd}' was auto-approved for run_verification!"
+            )
+            assert approval_req_verif is not None
+            assert approval_req_verif.permission_level == PermissionLevel.DESTRUCTIVE_OPERATION
+
+            # Check RunVerificationCheckTool fail-closed rejection
+            res_v = await verification_tool.execute(
+                workspace_path=td,
+                command=cmd,
+                check_name="Abbreviation Check",
+            )
+            assert res_v.success is False, f"RunVerificationCheckTool failed to reject '{cmd}'"
+            assert "destructive" in res_v.error.lower() or "authorization" in res_v.error.lower()
+
+        # 3. Real Git Execution in disposable repository to confirm Git accepts abbreviations
+        try:
+            # Initialize disposable repo
+            subprocess.run(["git", "init"], cwd=td, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "audit@ci.local"], cwd=td, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Audit Runner"], cwd=td, check=True, capture_output=True)
+
+            # Create seed commit
+            seed_file = os.path.join(td, "seed.txt")
+            with open(seed_file, "w") as f:
+                f.write("initial state\n")
+            subprocess.run(["git", "add", "seed.txt"], cwd=td, check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "initial commit"], cwd=td, check=True, capture_output=True)
+
+            # A. git commit --am --no-edit (abbreviation for --amend)
+            with open(seed_file, "a") as f:
+                f.write("amended state\n")
+            subprocess.run(["git", "add", "seed.txt"], cwd=td, check=True, capture_output=True)
+            res_am = subprocess.run(["git", "commit", "--am", "--no-edit"], cwd=td, capture_output=True, text=True)
+            assert res_am.returncode == 0, f"Git rejected '--am': {res_am.stderr}"
+
+            # B. git tag --d v1 (abbreviation for --delete)
+            subprocess.run(["git", "tag", "v1"], cwd=td, check=True, capture_output=True)
+            res_tag_del = subprocess.run(["git", "tag", "--d", "v1"], cwd=td, capture_output=True, text=True)
+            assert res_tag_del.returncode == 0, f"Git rejected tag '--d': {res_tag_del.stderr}"
+
+            # C. git checkout --f <branch> (abbreviation for --force)
+            cur_branch = subprocess.check_output(["git", "branch", "--show-current"], cwd=td, text=True).strip()
+            res_checkout_force = subprocess.run(["git", "checkout", "--f", cur_branch], cwd=td, capture_output=True, text=True)
+            assert res_checkout_force.returncode == 0, f"Git rejected checkout '--f': {res_checkout_force.stderr}"
+
+            # D. git branch --del topic (abbreviation for --delete)
+            subprocess.run(["git", "branch", "topic"], cwd=td, check=True, capture_output=True)
+            # Try --del first (unambiguous across all Git versions) or --de if accepted
+            res_branch_del = subprocess.run(["git", "branch", "--del", "topic"], cwd=td, capture_output=True, text=True)
+            assert res_branch_del.returncode == 0, f"Git rejected branch '--del': {res_branch_del.stderr}"
+        except (FileNotFoundError, subprocess.SubprocessError):
+            # If git executable is unavailable in local testing sandbox, skip the real binary execution
+            pass
+
+

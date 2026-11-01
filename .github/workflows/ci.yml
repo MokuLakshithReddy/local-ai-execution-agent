@@ -92,15 +92,17 @@ jobs:
     name: Frontend Build & Typecheck
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      ACTIONS_RUNNER_FORCE_NODE24: "true"
     steps:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
 
-    - name: Set up Node.js 20
+    - name: Set up Node.js 22
       uses: actions/setup-node@v4
       with:
-        node-version: 20
+        node-version: 22
         cache: 'npm'
         cache-dependency-path: ui/package-lock.json
 
@@ -115,6 +117,10 @@ jobs:
     - name: Build & Typecheck UI
       working-directory: ui
       run: npm run build
+
+    - name: Run Frontend Browser-Level Interaction Tests
+      working-directory: ui
+      run: npm test
 
     - name: Report Commit Status
       if: always()

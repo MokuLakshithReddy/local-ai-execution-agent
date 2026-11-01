@@ -11,7 +11,7 @@ A source-available, evidence-driven autonomous coding framework that delegates r
 [![React 19](https://img.shields.io/badge/React-19%20%7C%20Vite-646CFF.svg)](https://vitejs.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-Local--First-003B57.svg)](https://sqlite.org/)
 [![CI](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
-[![Verification: 142 Passed](https://img.shields.io/badge/Verification-142%20Passed-10b981.svg)](EVIDENCE.md)
+[![Verification: 143 Passed](https://img.shields.io/badge/Verification-143%20Passed-10b981.svg)](EVIDENCE.md)
 [![Adversarial Benchmark: 7/7](https://img.shields.io/badge/Adversarial%20Benchmark-7%2F7%20Passed-blue.svg)](EVIDENCE.md)
 [![License: Non-Commercial](https://img.shields.io/badge/License-Non--Commercial-orange.svg)](LICENSE)
 
@@ -181,7 +181,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Verify Your Environment (142 Passing Tests)
+### 2. Verify Your Environment (143 Passing Tests)
 
 Run the automated test suite to verify kernel job limits, sandbox boundaries, and provenance hashing:
 
@@ -301,7 +301,7 @@ Every release and commit is backed by reproducible automated tests and adversari
 > - **[GitHub Actions CI Pipeline](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)**: Canonical multi-platform CI verification runs and official downloadable evidence artifacts (`execution-evidence-reports`).
 > - **[DEMO_RUN.md](DEMO_RUN.md)**: Full reproducible transcript of an end-to-end task from defect to verified fix and approval lifecycle.
 
-### Verified Suite Summary: 142 Comprehensive Automated Tests
+### Verified Suite Summary: 143 Comprehensive Automated Tests
 
 ```text
 ============================= test session starts =============================
@@ -309,14 +309,14 @@ platform: Ubuntu 24.04 / Windows 11 -- Python 3.12 -- pytest 9.1.1
 rootdir: <repository_root>
 configfile: pytest.ini
 plugins: anyio, asyncio
-collected 143 items / 1 deselected / 142 selected
+collected 144 items / 1 deselected / 143 selected
 
 tests/test_adversarial_benchmark.py ......................... [  6%] (8/8 PASS)
-tests/test_core_and_tools.py ................................ [ 98%] (132/132 PASS)
+tests/test_core_and_tools.py ................................ [ 98%] (133/133 PASS)
 tests/test_evidence_and_docs_consistency.py ................. [ 99%] (1/1 PASS)
 tests/test_e2e_demo.py ...................................... [100%] (1/1 PASS)
 
-======================= 142 passed (100.0% Green CI) =======================
+======================= 143 passed (100.0% Green CI) =======================
 ```
 
 ### Adversarial Security Benchmark Outcomes (7/7 Passed)

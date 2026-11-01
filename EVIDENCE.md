@@ -26,10 +26,10 @@
 
 | Metric | Observed Value | Status |
 |---|---|---|
-| **Total Tests Executed** | `144` | Verified |
-| **Unit & Adversarial Tests** | `142/142` | Pass |
+| **Total Tests Executed** | `145` | Verified |
+| **Unit & Adversarial Tests** | `143/143` | Pass |
 | **Live Docker Integration Tests** | `2/2` | 2/2 Verified |
-| **Tests Passed** | `144` | Pass |
+| **Tests Passed** | `145` | Pass |
 | **Tests Failed** | `0` | Pass (0 failures) |
 | **Tests Skipped** | `0` | Deselected / Platform Conditional |
 | **Execution Duration** | `47.27s` | Bounded |

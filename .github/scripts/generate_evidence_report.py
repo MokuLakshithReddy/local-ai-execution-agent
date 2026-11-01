@@ -393,7 +393,8 @@ def main():
     except Exception:
         pass
 
-    if is_docker or is_canonical:
+    # Real sandbox capability strictly determined by Docker availability probe
+    if is_docker:
         sandbox_mode = "Docker Container (--read-only, --network=none)"
     elif platform.system() == "Windows":
         sandbox_mode = "Kernel Job Object / Local Host Supervisor"
