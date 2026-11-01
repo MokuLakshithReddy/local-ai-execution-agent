@@ -7074,10 +7074,46 @@ def test_conservative_git_subcommand_policy():
         "git merge --abort",
         "git cherry-pick --abort",
         "git replace HEAD~1 HEAD",
+        "git diff --output=important.py",
+        "git diff -o important.py",
+        "git log --output=log.txt",
+        "git show --output=commit.patch",
+        "git branch -f main 1234567",
+        "git branch --force main 1234567",
+        "git branch -m old_name new_name",
+        "git branch -M old_name new_name",
+        "git tag -f v1.0.0",
+        "git tag --force v1.0.0",
+        "git checkout -B main 1234567",
+        "git switch -C main 1234567",
+        "git fsck --lost-found",
+        "git fsck --write-lost-found",
     ]
     for cmd in destructive_git_cases:
         level, reason = classify_command_risk(cmd)
         assert level == PermissionLevel.DESTRUCTIVE_OPERATION, f"Expected DESTRUCTIVE for '{cmd}', got {level} ({reason})"
+
+    # Verify that PermissionManager escalates and DOES NOT auto-approve when auto_approve_sensitive=True
+    from agent.security.permissions import PermissionManager, PermissionPolicy
+    pm = PermissionManager(policy=PermissionPolicy(auto_approve_sensitive=True))
+    with tempfile.TemporaryDirectory() as td:
+        for cmd in [
+            "git diff --output=important.py",
+            "git branch -f main HEAD",
+            "git tag -f v1.0.0",
+            "git checkout -B main HEAD",
+            "git fsck --lost-found",
+        ]:
+            is_permitted, reason, approval_req = pm.evaluate_action(
+                task_id="t_git_destructive",
+                tool_name="run_command",
+                arguments={"command": cmd},
+                permission_level=PermissionLevel.SENSITIVE_OPERATION,
+                workspace_path=td,
+            )
+            assert is_permitted is False, f"Expected {cmd} to require explicit approval, but it was auto-approved"
+            assert approval_req is not None
+            assert approval_req.permission_level == PermissionLevel.DESTRUCTIVE_OPERATION
 
     # 2. Vetted safe read-only commands that should be ROUTINE
     routine_readonly_cases = [

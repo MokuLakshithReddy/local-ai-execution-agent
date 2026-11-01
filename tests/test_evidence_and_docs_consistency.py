@@ -106,16 +106,33 @@ def test_evidence_and_docs_consistency():
                 f"EVIDENCE.md references non-existent git commit SHA: {ev_sha}"
             )
 
-            # Commit must be part of current branch history (ancestor of HEAD or HEAD itself)
-            ancestor_proc = subprocess.run(
-                ["git", "merge-base", "--is-ancestor", ev_sha, "HEAD"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            assert ancestor_proc.returncode == 0, (
-                f"EVIDENCE.md commit SHA {ev_sha} is not an ancestor of current HEAD"
+            # Commit must NOT be an arbitrary old ancestor; it must match current HEAD or immediate parent (HEAD~1)
+            head_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+            parent_sha = None
+            try:
+                parent_sha = subprocess.check_output(["git", "rev-parse", "HEAD~1"], text=True).strip()
+            except Exception:
+                pass
+
+            valid_shas = {head_sha}
+            if parent_sha:
+                valid_shas.add(parent_sha)
+
+            assert ev_sha in valid_shas, (
+                f"EVIDENCE.md references stale commit SHA {ev_sha}. "
+                f"Expected current HEAD ({head_sha}) or immediate parent ({parent_sha})."
             )
     except FileNotFoundError:
         pass
+
+    # 7. Verify all 7 security boundaries are derived and verified as PASS in EVIDENCE.md
+    for adv_id in ("ADV-01", "ADV-02", "ADV-03", "ADV-04", "ADV-05", "ADV-06", "ADV-07"):
+        adv_pattern = rf"\|\s*\*\*{adv_id}\*\*\s*\|.*?\|\s*\*\*PASS\*\*\s*\|"
+        assert re.search(adv_pattern, evidence_content) is not None, (
+            f"Security boundary {adv_id} is not verified as PASS in EVIDENCE.md"
+        )
+
+    # 8. Verify CI Run ID and Working Tree status are declared in EVIDENCE.md
+    assert re.search(r"\*\*CI Run ID\*\*\s*:", evidence_content) is not None, "EVIDENCE.md must declare CI Run ID"
+    assert re.search(r"\*\*Working Tree\*\*\s*:", evidence_content) is not None, "EVIDENCE.md must declare Working Tree status"
 

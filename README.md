@@ -13,7 +13,7 @@ An open-source, evidence-driven autonomous coding framework that delegates real 
 [![CI](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
 [![Verification: 140 Passed](https://img.shields.io/badge/Verification-140%20Passed-10b981.svg)](EVIDENCE.md)
 [![Adversarial Benchmark: 7/7](https://img.shields.io/badge/Adversarial%20Benchmark-7%2F7%20Passed-blue.svg)](EVIDENCE.md)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: Non-Commercial](https://img.shields.io/badge/License-Non--Commercial-orange.svg)](LICENSE)
 
 </div>
 
@@ -220,6 +220,9 @@ In response to extensive adversarial testing, the runtime implements 5 layers of
   - `--read-only`: Prevents modification of root system files.
   - `-v {workspace}:/workspace:rw`: Only the target workspace folder is accessible.
   - `--memory=512m`, `--pids-limit=32`, `--cap-drop=ALL`.
+- **Platform Verification Target**:
+  - **Linux / Ubuntu (CI Target)**: All live Docker container isolation tests (`--read-only`, `--network=none`, non-root user, and read-only test mounts `:ro`) execute and are verified on Linux runners.
+  - **Windows (Developer Environment)**: Tested and verified using Windows Kernel Job Objects (`ctypes.windll.kernel32`) and NTFS `stat.S_IREAD` ACL write-protection. Live Docker container boundaries are verified on Linux only.
 - **Windows Kernel Job Objects**: On Windows host fallback, processes are bound to native Job Objects via `ctypes.windll.kernel32`:
   - `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: Instant child process termination on exit or timeout.
   - Hard caps on active processes (16) and memory (512 MB).

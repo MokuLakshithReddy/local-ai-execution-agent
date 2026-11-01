@@ -90,13 +90,15 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
         if idx >= len(sub):
             continue
         exe = os.path.basename(sub[idx]).lower().replace('"', '').replace("'", "")
-        args = [a.lower().replace('"', '').replace("'", "") for a in sub[idx + 1:]]
+        orig_args = [a.replace('"', '').replace("'", "") for a in sub[idx + 1:]]
+        args = [a.lower() for a in orig_args]
 
         # A. git inspection: conservative Git subcommand and argument security policy
         if exe == "git" or exe.startswith("git."):
             # Parse git global options to locate the git subcommand
             subcmd = None
             subcmd_args = []
+            orig_subcmd_args = []
             skip_next = False
             for i, a in enumerate(args):
                 if skip_next:
@@ -112,9 +114,18 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                 if not subcmd:
                     subcmd = a
                     subcmd_args = args[i + 1:]
+                    orig_subcmd_args = orig_args[i + 1:]
                     break
 
-            # 1. Explicit destructive git commands
+            # 0. Escalate any git command that specifies file output redirection/writing flags
+            for a in orig_args:
+                if a in ("--output", "-o") or a.startswith(("--output=", "-o=")):
+                    return (
+                        PermissionLevel.DESTRUCTIVE_OPERATION,
+                        f"High risk: Git file output redirection ('{a}') writes directly to filesystem and requires explicit human authorization.",
+                    )
+
+            # 1. Explicit destructive git commands and dangerous option flags
             if "clean" in args:
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
@@ -125,10 +136,13 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                     PermissionLevel.DESTRUCTIVE_OPERATION,
                     f"High risk: Git restore operation ('{cmd[:60]}...') discards workspace changes and requires explicit human authorization.",
                 )
-            if "checkout" in args and any(a in args for a in ("--", ".", "-f", "--force")):
+            if "checkout" in args and (
+                any(a in ("--", ".", "-f", "--force", "-B") for a in orig_args)
+                or any(a.startswith(("-B",)) for a in orig_args)
+            ):
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
-                    f"High risk: Git checkout overwriting working tree changes ('{cmd[:60]}...') requires explicit human authorization.",
+                    f"High risk: Git checkout overwriting working tree changes or resetting branches ('{cmd[:60]}...') requires explicit human authorization.",
                 )
             if "reset" in args:
                 return (
@@ -140,15 +154,21 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                     PermissionLevel.DESTRUCTIVE_OPERATION,
                     f"High risk: Git file removal ('{cmd[:60]}...') requires explicit human authorization.",
                 )
-            if "branch" in args and any(b in args for b in ("-d", "-D", "--delete")):
+            if "branch" in args and (
+                any(b in ("-d", "-D", "--delete", "-f", "--force", "-m", "-M", "--move", "-C", "--copy") for b in orig_args)
+                or any(b.startswith(("-f", "--force", "-m", "-M", "--move", "-C", "--copy")) for b in orig_args)
+            ):
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
-                    f"High risk: Git branch deletion ('{cmd[:60]}...') requires explicit human authorization.",
+                    f"High risk: Git branch force update, rename, or deletion ('{cmd[:60]}...') requires explicit human authorization.",
                 )
-            if "switch" in args and any(a in args for a in ("-f", "--force", "--discard-changes")):
+            if "switch" in args and (
+                any(a in ("-f", "--force", "--discard-changes", "-C") for a in orig_args)
+                or any(a.startswith(("-C",)) for a in orig_args)
+            ):
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
-                    f"High risk: Forced git switch operation ('{cmd[:60]}...') requires explicit human authorization.",
+                    f"High risk: Forced git switch or branch reset ('{cmd[:60]}...') requires explicit human authorization.",
                 )
             if "stash" in args and any(a in args for a in ("drop", "clear", "pop")):
                 return (
@@ -175,10 +195,13 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                     PermissionLevel.DESTRUCTIVE_OPERATION,
                     f"High risk: Git update-ref deletion ('{cmd[:60]}...') requires explicit human authorization.",
                 )
-            if "tag" in args and any(a in ("-d", "--delete") or a.startswith("--delete") for a in args):
+            if "tag" in args and (
+                any(a in ("-d", "--delete", "-f", "--force") for a in orig_args)
+                or any(a.startswith(("-f", "--force")) for a in orig_args)
+            ):
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
-                    f"High risk: Git tag deletion ('{cmd[:60]}...') requires explicit human authorization.",
+                    f"High risk: Git tag force update or deletion ('{cmd[:60]}...') requires explicit human authorization.",
                 )
             if "prune" in args:
                 return (
@@ -222,6 +245,11 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
                     f"High risk: Git cherry-pick abort operation ('{cmd[:60]}...') requires explicit human authorization.",
+                )
+            if subcmd == "fsck" and any(a in ("--lost-found", "--write-lost-found") or a.startswith("--lost-found") for a in subcmd_args):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git fsck with file generation ('--lost-found') writes dangling objects and requires explicit human authorization.",
                 )
 
             # 2. Vetted read-only / safe inspection git subcommands

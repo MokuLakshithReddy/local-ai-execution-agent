@@ -62,6 +62,10 @@ jobs:
       run: |
         python .github/scripts/generate_evidence_report.py junit-results.xml EVIDENCE.md
 
+    - name: Verify Evidence and Documentation Consistency
+      run: |
+        pytest tests/test_evidence_and_docs_consistency.py -v
+
     - name: Upload Verification & Demo Artifacts
       if: matrix.os == 'ubuntu-latest' && always()
       uses: actions/upload-artifact@v4
