@@ -24,10 +24,14 @@ def test_evidence_and_docs_consistency():
     with open(evidence_path, "r", encoding="utf-8") as f:
         evidence_content = f.read()
 
-    # 1. Extract test count from EVIDENCE.md
-    ev_total_match = re.search(r"\*\*Total Tests\*\*\s*\|\s*`(\d+)`", evidence_content)
-    assert ev_total_match is not None, "EVIDENCE.md must declare Total Tests metric"
-    ev_total = int(ev_total_match.group(1))
+    # 1. Extract test count from EVIDENCE.md (supporting both Unit & Adversarial and Total Tests metrics)
+    ev_unit_match = re.search(r"\*\*Unit & Adversarial Tests\*\*\s*\|\s*`(\d+)/(\d+)`", evidence_content)
+    if ev_unit_match:
+        ev_total = int(ev_unit_match.group(2))
+    else:
+        ev_total_match = re.search(r"\*\*Total Tests(?:\s+Executed)?\*\*\s*\|\s*`(\d+)`", evidence_content)
+        assert ev_total_match is not None, "EVIDENCE.md must declare Total Tests metric"
+        ev_total = int(ev_total_match.group(1))
 
     # 2. Verify 0 failures and 100% pass rate in EVIDENCE.md
     ev_failed_match = re.search(r"\*\*Tests Failed\*\*\s*\|\s*`(\d+)`", evidence_content)
@@ -122,18 +126,22 @@ def test_evidence_and_docs_consistency():
     except FileNotFoundError:
         pass
 
-    # 7. Verify all 7 core host security boundaries are derived and verified as PASS in EVIDENCE.md
-    for adv_id in ("ADV-01", "ADV-02", "ADV-03", "ADV-04", "ADV-05", "ADV-06", "ADV-07"):
-        adv_pattern = rf"\|\s*\*\*{adv_id}\*\*\s*\|.*?\|\s*\*\*PASS\*\*\s*\|"
-        assert re.search(adv_pattern, evidence_content) is not None, (
-            f"Security boundary {adv_id} is not verified as PASS in EVIDENCE.md"
-        )
+    # 7. Extract reported boundary statuses directly from EVIDENCE.md table
+    reported_boundaries = {}
+    for match in re.finditer(r"\|\s*\*\*([A-Z0-9_-]+)\*\*\s*\|.*?\|\s*\*\*([A-Z0-9_\(\)\s-]+)\*\*\s*\|", evidence_content):
+        b_id, b_status = match.group(1).strip(), match.group(2).strip()
+        reported_boundaries[b_id] = b_status
 
-    # 8. Verify Docker container integration boundaries are accounted for (PASS or SKIPPED on non-Linux platform)
+    # Verify that all 7 core adversarial boundaries are reported as PASS
+    for adv_id in ("ADV-01", "ADV-02", "ADV-03", "ADV-04", "ADV-05", "ADV-06", "ADV-07"):
+        assert adv_id in reported_boundaries, f"EVIDENCE.md is missing boundary {adv_id}"
+        assert reported_boundaries[adv_id] == "PASS", f"Boundary {adv_id} reported '{reported_boundaries[adv_id]}', expected PASS"
+
+    # 8. Verify Docker container integration boundaries are present
     for docker_id in ("DOCKER-01", "DOCKER-02"):
-        docker_pattern = rf"\|\s*\*\*{docker_id}\*\*\s*\|.*?\|\s*\*\*(?:PASS|SKIPPED)"
-        assert re.search(docker_pattern, evidence_content) is not None, (
-            f"Docker boundary {docker_id} is not verified or accounted for in EVIDENCE.md"
+        assert docker_id in reported_boundaries, f"EVIDENCE.md is missing Docker boundary {docker_id}"
+        assert reported_boundaries[docker_id] in ("PASS", "SKIPPED (Docker integration verified on Linux CI)"), (
+            f"Invalid status for {docker_id}: {reported_boundaries[docker_id]}"
         )
 
     # 9. Verify Verifying Test Identifier and Platform Scope columns are present
@@ -175,7 +183,10 @@ def test_evidence_and_docs_consistency():
         for adv_id, prefix in adv_test_mapping.items():
             matching_tc = [status for name, status in xml_testcases.items() if prefix in name]
             assert matching_tc, f"JUnit XML has no testcase record matching {adv_id} ({prefix})"
-            assert all(s == "PASS" for s in matching_tc), f"JUnit XML reports failures in {adv_id}: {matching_tc}"
+            xml_outcome = "PASS" if all(s == "PASS" for s in matching_tc) else "FAIL"
+            assert reported_boundaries.get(adv_id) == xml_outcome, (
+                f"Mismatch for {adv_id}: EVIDENCE.md reported '{reported_boundaries.get(adv_id)}', but JUnit XML was '{xml_outcome}'"
+            )
 
     docker_junit_path = os.path.join(repo_root, "junit-docker-results.xml")
     if os.path.exists(docker_junit_path):
@@ -188,4 +199,8 @@ def test_evidence_and_docs_consistency():
             docker_testcases[tc_name] = tc_status
         docker_tc = [status for name, status in docker_testcases.items() if "test_real_docker_container_security_boundaries" in name]
         assert docker_tc, "Docker JUnit XML has no record for test_real_docker_container_security_boundaries"
-        assert all(s == "PASS" for s in docker_tc), f"Docker integration tests failed in JUnit XML: {docker_tc}"
+        docker_xml_status = "PASS" if all(s == "PASS" for s in docker_tc) else "FAIL"
+        for docker_id in ("DOCKER-01", "DOCKER-02"):
+            assert reported_boundaries.get(docker_id) == docker_xml_status, (
+                f"Mismatch for {docker_id}: EVIDENCE.md reported '{reported_boundaries.get(docker_id)}', but Docker JUnit XML was '{docker_xml_status}'"
+            )

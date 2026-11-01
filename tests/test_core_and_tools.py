@@ -7207,6 +7207,87 @@ def test_git_shell_variable_expansion_bypass_prevention():
 
 
 @pytest.mark.asyncio
+async def test_git_shell_glob_expansion_bypass_prevention():
+    """Validates that shell pathname expansion (globbing with *, ?, []) in Git commands
+    cannot bypass destructive-operation classification, even when matching files exist on disk.
+    Verifies that PermissionManager rejects auto-approval for both run_command and run_verification,
+    and that RunVerificationCheckTool itself rejects the command fail-closed."""
+    from agent.security.permissions import classify_command_risk, PermissionManager, PermissionPolicy, PermissionLevel
+    from agent.tools.verification import RunVerificationCheckTool
+
+    glob_evasion_commands = [
+        "git commit --amend* --no-edit",
+        "git diff --output*",
+        "git checkout -?",
+        "git branch -[f]*",
+        "git commit *",
+    ]
+
+    for cmd in glob_evasion_commands:
+        level, reason = classify_command_risk(cmd)
+        assert level == PermissionLevel.DESTRUCTIVE_OPERATION, (
+            f"Expected DESTRUCTIVE_OPERATION for glob command '{cmd}', got {level} ({reason})"
+        )
+
+    # Prove PermissionManager refuses auto-approval for run_command and run_verification
+    pm = PermissionManager(policy=PermissionPolicy(
+        auto_approve_sensitive=True,
+        auto_approve_routine=True,
+    ))
+    verification_tool = RunVerificationCheckTool()
+
+    with tempfile.TemporaryDirectory() as td:
+        # Create decoy files matching the globs in the workspace
+        # On POSIX or Windows, test filenames that match the wildcard patterns
+        try:
+            with open(os.path.join(td, "--amend"), "w") as f:
+                f.write("decoy")
+            with open(os.path.join(td, "--output=result.txt"), "w") as f:
+                f.write("decoy")
+        except OSError:
+            # Some platforms restrict leading hyphens in certain file calls
+            pass
+
+        for cmd in glob_evasion_commands:
+            # 1. run_command check
+            is_permitted, reason, approval_req = pm.evaluate_action(
+                task_id="t_glob_run_cmd",
+                tool_name="run_command",
+                arguments={"command": cmd},
+                permission_level=PermissionLevel.ROUTINE_MODIFICATION,
+                workspace_path=td,
+            )
+            assert is_permitted is False, (
+                f"Security Failure: Glob command '{cmd}' was auto-approved for run_command!"
+            )
+            assert approval_req is not None
+            assert approval_req.permission_level == PermissionLevel.DESTRUCTIVE_OPERATION
+
+            # 2. run_verification check
+            is_permitted_v, reason_v, approval_req_v = pm.evaluate_action(
+                task_id="t_glob_run_verif",
+                tool_name="run_verification",
+                arguments={"command": cmd},
+                permission_level=PermissionLevel.SENSITIVE_OPERATION,
+                workspace_path=td,
+            )
+            assert is_permitted_v is False, (
+                f"Security Failure: Glob command '{cmd}' was auto-approved for run_verification!"
+            )
+            assert approval_req_v is not None
+            assert approval_req_v.permission_level == PermissionLevel.DESTRUCTIVE_OPERATION
+
+            # 3. Direct RunVerificationCheckTool execution rejection
+            res_v = await verification_tool.execute(
+                workspace_path=td,
+                command=cmd,
+                check_name="Glob Test",
+            )
+            assert res_v.success is False, f"RunVerificationCheckTool failed to reject glob command '{cmd}'"
+            assert "destructive" in res_v.error.lower() or "authorization" in res_v.error.lower()
+
+
+@pytest.mark.asyncio
 async def test_run_verification_escalates_destructive_commands():
     """Validates that run_verification commands are subject to the same command-risk
     classification as run_command. Destructive commands (such as 'git restore --worktree .')

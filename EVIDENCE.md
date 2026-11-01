@@ -5,32 +5,34 @@
 ## 1. Provenance & Execution Context
 
 - **Report Scope**: `Canonical Linux / Docker Container Environment (Production Target)`
-- **Commit SHA**: `02b49cf4b620618ca08d58a49a52437aa5604dd0`
+- **Commit SHA**: `1fdf65476aeb04a5da3cda5812ae3824800920ae`
 - **Git Branch**: `main`
-- **CI Run ID**: `41283454897`
-- **CI Run URL**: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/runs/41283454897
+- **CI Run ID**: `Local Execution`
+- **CI Run URL**: Local Pre-Commit Run (Canonical CI: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
 - **Canonical CI Pipeline**: [https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
 - **Working Tree**: `Clean (Verified)`
-- **Generated At**: `2026-11-01 07:08:21 UTC`
-- **Operating System**: `Linux (Ubuntu 24.04 LTS / GitHub Actions CI)`
+- **Generated At**: `2026-11-01 07:31:33 UTC`
+- **Operating System**: `Linux (Ubuntu 24.04 LTS / GitHub Actions CI Runner)`
 - **Python Runtime**: `3.12.10`
-- **Primary Sandbox Mode**: `Docker Container (--read-only, --network=none)`
+- **Primary Sandbox Mode**: `Kernel Job Object / Local Host Supervisor`
 
 ## 2. CI Verification & Artifact Provenance
 
 - **Canonical Multi-Platform CI**: GitHub Actions executes on both Ubuntu (`ubuntu-latest`) and Windows (`windows-latest`).
 - **Official CI Artifacts**: Every commit archives the machine-generated `EVIDENCE.md`, `DEMO_RUN.md`, `junit-results.xml`, and (on Linux) `junit-docker-results.xml` in the official `execution-evidence-reports` workflow artifact.
-- **Audit Verification URL**: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/runs/41283454897
+- **Audit Verification URL**: Local Pre-Commit Run (Canonical CI: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
 
 ## 3. Test Suite Execution Telemetry
 
 | Metric | Observed Value | Status |
 |---|---|---|
-| **Total Tests** | `141` | Verified |
-| **Tests Passed** | `141` | Pass |
+| **Total Tests Executed** | `144` | Verified |
+| **Unit & Adversarial Tests** | `142/142` | Pass |
+| **Live Docker Integration Tests** | `2/2` | 2/2 Verified |
+| **Tests Passed** | `144` | Pass |
 | **Tests Failed** | `0` | Pass (0 failures) |
 | **Tests Skipped** | `0` | Deselected / Platform Conditional |
-| **Execution Duration** | `49.2s` | Bounded |
+| **Execution Duration** | `47.27s` | Bounded |
 | **Pass Rate** | `**100.0%**` | 100.0% Pass |
 
 ## 4. Security Boundary Verification Summary

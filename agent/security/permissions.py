@@ -95,7 +95,11 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
 
         # A. git inspection: conservative Git subcommand and argument security policy
         if exe == "git" or exe.startswith("git."):
-            # 0a. Escalate unresolved shell variable expansion, command substitution, or dynamic argument construction
+            # 0a. Escalate unresolved shell wildcards/globs, variable expansion, command substitution, or dynamic argument construction
+            has_glob_wildcards = any(
+                any(c in a for c in ("*", "?", "[", "]"))
+                for a in orig_args
+            )
             has_dynamic_args = any(
                 bool(re.search(r"(\$|`|%[a-zA-Z0-9_]+%)", a))
                 for a in orig_args
@@ -106,6 +110,11 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                 if other_sub != sub
             )
             has_inline_assignment = (idx > 0)
+            if has_glob_wildcards:
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git command contains unresolved shell wildcard/glob pattern ('{cmd[:60]}...') which could expand to destructive flags at execution time and requires explicit human authorization.",
+                )
             if has_dynamic_args or has_shell_assignments or has_inline_assignment:
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
