@@ -7088,14 +7088,21 @@ def test_conservative_git_subcommand_policy():
         "git switch -C main 1234567",
         "git fsck --lost-found",
         "git fsck --write-lost-found",
+        "git commit --amend --no-edit",
+        "git commit --amend -m 'amended message'",
+        "git commit -a --amend",
+        "git commit --fixup=amend:HEAD~1",
+        "git commit --fixup=reword:HEAD~1",
+        "git commit --squash=HEAD~1",
+        "git commit --reset-author",
     ]
     for cmd in destructive_git_cases:
         level, reason = classify_command_risk(cmd)
         assert level == PermissionLevel.DESTRUCTIVE_OPERATION, f"Expected DESTRUCTIVE for '{cmd}', got {level} ({reason})"
 
-    # Verify that PermissionManager escalates and DOES NOT auto-approve when auto_approve_sensitive=True
+    # Verify that PermissionManager escalates and DOES NOT auto-approve when auto_approve_sensitive=True and auto_approve_routine=True
     from agent.security.permissions import PermissionManager, PermissionPolicy
-    pm = PermissionManager(policy=PermissionPolicy(auto_approve_sensitive=True))
+    pm = PermissionManager(policy=PermissionPolicy(auto_approve_sensitive=True, auto_approve_routine=True))
     with tempfile.TemporaryDirectory() as td:
         for cmd in [
             "git diff --output=important.py",
@@ -7103,6 +7110,9 @@ def test_conservative_git_subcommand_policy():
             "git tag -f v1.0.0",
             "git checkout -B main HEAD",
             "git fsck --lost-found",
+            "git commit --amend --no-edit",
+            "git commit --fixup=amend:HEAD~1",
+            "git commit --squash=HEAD~1",
         ]:
             is_permitted, reason, approval_req = pm.evaluate_action(
                 task_id="t_git_destructive",

@@ -55,12 +55,12 @@ jobs:
       env:
         REQUIRE_DOCKER: "1"
       run: |
-        pytest tests/ -v -k "test_real_docker or test_run_verification_tool_structured_record_e2e"
+        pytest tests/ -v -k "test_real_docker or test_run_verification_tool_structured_record_e2e" --junitxml=junit-docker-results.xml
 
     - name: Generate Authoritative Evidence Report
       if: always()
       run: |
-        python .github/scripts/generate_evidence_report.py junit-results.xml EVIDENCE.md
+        python .github/scripts/generate_evidence_report.py junit-results.xml EVIDENCE.md --docker-junit=junit-docker-results.xml
 
     - name: Verify Evidence and Documentation Consistency
       run: |
@@ -75,6 +75,7 @@ jobs:
           EVIDENCE.md
           DEMO_RUN.md
           junit-results.xml
+          junit-docker-results.xml
 
     - name: Report Commit Status
       if: always()

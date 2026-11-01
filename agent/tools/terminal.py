@@ -935,7 +935,10 @@ class RunCommandTool(BaseTool):
         except SandboxViolationError:
             job_sandbox = None
 
-        # Enforce host-level write-protection on immutable test files during unisolated host execution
+        # Enforce best-effort host-level write-protection on immutable test files during unisolated host execution.
+        # Note: When host fallback is explicitly enabled (untrusted workloads are rejected), files are marked read-only
+        # via stat.S_IREAD. Windows Job Objects isolate CPU/RAM/processes but not filesystems; container isolation (:ro mounts)
+        # is the authoritative filesystem security boundary.
         protected_host_paths = []
         import stat
         for itf in immutable_test_files:

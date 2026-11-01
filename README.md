@@ -4,7 +4,7 @@
 
 ### *Stop trusting what AI chatbots say. Start verifying what AI agents actually do.*
 
-An open-source, evidence-driven autonomous coding framework that delegates real software engineering tasks to LLMs—with **OS/container containment**, **cryptographic execution provenance**, and **verifiable machine proof**.
+A source-available, evidence-driven autonomous coding framework that delegates real software engineering tasks to LLMs—with **OS/container containment**, **cryptographic execution provenance**, and **verifiable machine proof**.
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688.svg)](https://fastapi.tiangolo.com/)
@@ -297,7 +297,8 @@ In response to extensive adversarial testing, the runtime implements 5 layers of
 Every release and commit is backed by reproducible automated tests and adversarial execution benchmarks. Telemetry is machine-generated and verified directly in GitHub Actions CI.
 
 > 📄 **Authoritative Machine Reports**:
-> - **[EVIDENCE.md](EVIDENCE.md)**: Generated dynamically from JUnit XML and runtime telemetry (Commit SHA, platform capabilities, sandbox mode, pass counts).
+> - **[EVIDENCE.md](EVIDENCE.md)**: Generated dynamically from parsed JUnit XML test records and runtime telemetry (Commit SHA, platform capabilities, sandbox mode, pass counts).
+> - **[GitHub Actions CI Pipeline](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)**: Canonical multi-platform CI verification runs and official downloadable evidence artifacts (`execution-evidence-reports`).
 > - **[DEMO_RUN.md](DEMO_RUN.md)**: Full reproducible transcript of an end-to-end task from defect to verified fix and approval lifecycle.
 
 ### Verified Suite Summary: 140 Comprehensive Automated Tests
@@ -426,7 +427,7 @@ python .github/scripts/generate_evidence_report.py junit-results.xml EVIDENCE.md
 ├── DEMO_RUN.md                    # Audited transcript of end-to-end fix, diff, and verification
 ├── main.py                        # Service entrypoint
 ├── pytest.ini                     # Pytest configuration
-├── LICENSE                        # MIT License
+├── LICENSE                        # Source-Available Non-Commercial License
 └── README.md                      # Evidence-driven developer documentation
 ```
 
@@ -434,4 +435,4 @@ python .github/scripts/generate_evidence_report.py junit-results.xml EVIDENCE.md
 
 ## 📜 License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under a custom [Source-Available Non-Commercial License](LICENSE) (Copyright © 2026 Moku Lakshith Reddy). It grants public inspection, testing, evaluation, and research use while explicitly prohibiting unauthorized commercial use, sublicensing, or redistribution. See [LICENSE](LICENSE) for terms.

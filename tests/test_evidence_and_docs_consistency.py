@@ -125,14 +125,34 @@ def test_evidence_and_docs_consistency():
     except FileNotFoundError:
         pass
 
-    # 7. Verify all 7 security boundaries are derived and verified as PASS in EVIDENCE.md
+    # 7. Verify all 7 core host security boundaries are derived and verified as PASS in EVIDENCE.md
     for adv_id in ("ADV-01", "ADV-02", "ADV-03", "ADV-04", "ADV-05", "ADV-06", "ADV-07"):
         adv_pattern = rf"\|\s*\*\*{adv_id}\*\*\s*\|.*?\|\s*\*\*PASS\*\*\s*\|"
         assert re.search(adv_pattern, evidence_content) is not None, (
             f"Security boundary {adv_id} is not verified as PASS in EVIDENCE.md"
         )
 
-    # 8. Verify CI Run ID and Working Tree status are declared in EVIDENCE.md
+    # 8. Verify Docker container integration boundaries are accounted for (PASS or SKIPPED on non-Linux platform)
+    for docker_id in ("DOCKER-01", "DOCKER-02"):
+        docker_pattern = rf"\|\s*\*\*{docker_id}\*\*\s*\|.*?\|\s*\*\*(?:PASS|SKIPPED)"
+        assert re.search(docker_pattern, evidence_content) is not None, (
+            f"Docker boundary {docker_id} is not verified or accounted for in EVIDENCE.md"
+        )
+
+    # 9. Verify Verifying Test Identifier and Platform Scope columns are present
+    assert "| Verifying Test Identifier | Platform Scope | Status |" in evidence_content
+
+    # 10. Verify CI Run ID, Canonical CI Pipeline, and Working Tree status are declared in EVIDENCE.md
     assert re.search(r"\*\*CI Run ID\*\*\s*:", evidence_content) is not None, "EVIDENCE.md must declare CI Run ID"
     assert re.search(r"\*\*Working Tree\*\*\s*:", evidence_content) is not None, "EVIDENCE.md must declare Working Tree status"
+    assert re.search(r"\*\*Canonical CI Pipeline\*\*\s*:", evidence_content) is not None, "EVIDENCE.md must link Canonical CI Pipeline"
+
+    ci_run_match = re.search(r"\*\*CI Run ID\*\*\s*:\s*`([^`]+)`", evidence_content)
+    assert ci_run_match is not None
+    ci_run_val = ci_run_match.group(1).strip()
+    if ci_run_val.isdigit():
+        expected_run_url = f"https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/runs/{ci_run_val}"
+        assert expected_run_url in evidence_content, f"EVIDENCE.md must contain valid run URL for CI Run {ci_run_val}"
+    else:
+        assert "actions/workflows/ci.yml" in evidence_content
 

@@ -170,6 +170,17 @@ def classify_command_risk(cmd_str: str) -> Tuple[PermissionLevel, Optional[str]]
                     PermissionLevel.DESTRUCTIVE_OPERATION,
                     f"High risk: Forced git switch or branch reset ('{cmd[:60]}...') requires explicit human authorization.",
                 )
+            if "commit" in args and (
+                any(
+                    a in ("--amend", "--fixup", "--squash", "--reset-author")
+                    or a.startswith(("--amend", "--fixup", "--squash", "--reset-author"))
+                    for a in orig_args
+                )
+            ):
+                return (
+                    PermissionLevel.DESTRUCTIVE_OPERATION,
+                    f"High risk: Git commit history-rewriting operation ('{cmd[:60]}...') modifies repository commit history and requires explicit human authorization.",
+                )
             if "stash" in args and any(a in args for a in ("drop", "clear", "pop")):
                 return (
                     PermissionLevel.DESTRUCTIVE_OPERATION,
