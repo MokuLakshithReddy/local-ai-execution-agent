@@ -4,13 +4,13 @@
 
 ## 1. Provenance & Execution Context
 
-- **Commit SHA**: `82f16c0066aac5925602b3e13f7374245ac4edda`
+- **Commit SHA**: `76ef78316d6f7d806592645798e396785f043ac5`
 - **Git Branch**: `main`
-- **CI Run ID**: `Local Execution`
-- **CI Run URL**: Local Pre-Commit Run (Canonical CI: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
+- **CI Run ID**: `41282331263`
+- **CI Run URL**: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/runs/41282331263
 - **Canonical CI Pipeline**: [https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
-- **Working Tree**: `Dirty (Uncommitted Changes Present)`
-- **Generated At**: `2026-11-01 06:48:22 UTC`
+- **Working Tree**: `Clean (Verified)`
+- **Generated At**: `2026-11-01 06:51:03 UTC`
 - **Operating System**: `Windows 11 (AMD64)`
 - **Python Runtime**: `3.12.10`
 - **Primary Sandbox Mode**: `Kernel Job Object / Local Host Supervisor`
@@ -19,7 +19,7 @@
 
 - **Canonical Multi-Platform CI**: GitHub Actions executes on both Ubuntu (`ubuntu-latest`) and Windows (`windows-latest`).
 - **Official CI Artifacts**: Every commit archives the machine-generated `EVIDENCE.md`, `DEMO_RUN.md`, `junit-results.xml`, and (on Linux) `junit-docker-results.xml` in the official `execution-evidence-reports` workflow artifact.
-- **Audit Verification URL**: Local Pre-Commit Run (Canonical CI: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
+- **Audit Verification URL**: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/runs/41282331263
 
 ## 3. Test Suite Execution Telemetry
 
