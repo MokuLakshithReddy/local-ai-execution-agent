@@ -5,10 +5,10 @@
 ## 1. Provenance & Execution Context
 
 - **Report Scope**: `Canonical Linux / Docker Container Environment (Production Target)`
-- **Commit SHA**: `7af723f0b111695b894d8451b798895ad879b5eb`
+- **Commit SHA**: `4aa5ffe769598b60632cd2524859fc568fa81cd5`
 - **Git Branch**: `main`
-- **CI Run ID**: `41285458340`
-- **CI Run URL**: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/runs/41285458340
+- **CI Run ID**: `41287736100`
+- **CI Run URL**: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/runs/41287736100
 - **Canonical CI Pipeline**: [https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/workflows/ci.yml)
 - **Working Tree**: `Clean (Verified)`
 - **Generated At**: `2026-11-01 07:37:37 UTC`
@@ -20,7 +20,7 @@
 
 - **Canonical Multi-Platform CI**: GitHub Actions executes on both Ubuntu (`ubuntu-latest`) and Windows (`windows-latest`).
 - **Official CI Artifacts**: Every commit archives the machine-generated `EVIDENCE.md`, `DEMO_RUN.md`, `junit-results.xml`, and (on Linux) `junit-docker-results.xml` in the official `execution-evidence-reports` workflow artifact.
-- **Audit Verification URL**: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/runs/41285458340
+- **Audit Verification URL**: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/runs/41287736100
 
 ## 3. Test Suite Execution Telemetry
 
