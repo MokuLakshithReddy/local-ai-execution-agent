@@ -19,6 +19,38 @@ A source-available, evidence-driven autonomous coding framework that delegates r
 
 ---
 
+## Visual walkthrough: claims are not completion
+
+```mermaid
+flowchart TD
+    A["Task request"] --> B["Planner and policy checks"]
+    B --> C["Isolated workspace / worktree"]
+    C --> D["Contained execution: Docker or OS boundary"]
+    D --> E["Independent test and build runners"]
+    E --> F{"Exit codes and assertions pass?"}
+    F -->|No| G["Return failure evidence for repair"]
+    G --> D
+    F -->|Yes| H["Audit diff and workspace state"]
+    H --> I["Generate signed execution evidence"]
+    I --> J["Verified completion"]
+```
+
+### Verification snapshot
+
+| Evidence | Recorded result |
+|---|---:|
+| Total tests | **145 passed** |
+| Unit and adversarial tests | **143 / 143** |
+| Docker integration tests | **2 / 2** |
+| CI execution time | **47.27 s** |
+| CI evidence | [Run 41287736100](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/runs/41287736100) |
+
+These are the recorded results in the [machine-generated evidence report](EVIDENCE.md) for commit `4aa5ffe` (2026-11-01), not a guarantee for every machine or future commit.
+
+**Why it matters:** an agent cannot mark work complete from its own claim; independent tests, an audited diff, and machine-verifiable provenance must agree.
+
+---
+
 ## 💡 The Big Idea in 30 Seconds
 
 Most AI coding assistants (Copilot, Cursor, chat interfaces) are **"chatbots with text editors."** 
