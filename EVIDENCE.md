@@ -5,7 +5,7 @@
 ## 1. Provenance & Execution Context
 
 - **Report Scope**: `Canonical Linux / Docker Container Environment (Production Target)`
-- **Commit SHA**: `4aa5ffe769598b60632cd2524859fc568fa81cd5`
+- **Commit SHA**: `59d6f0ae1cd8f64b82ad2383b4f781ee246ec967`
 - **Git Branch**: `main`
 - **CI Run ID**: `41287736100`
 - **CI Run URL**: https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/runs/41287736100
