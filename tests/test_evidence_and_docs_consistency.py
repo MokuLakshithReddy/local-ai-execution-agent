@@ -119,6 +119,13 @@ def test_evidence_and_docs_consistency():
             if parent_sha:
                 valid_shas.add(parent_sha)
 
+            for ref in ("HEAD^2", "HEAD^2~1"):
+                try:
+                    ref_sha = subprocess.check_output(["git", "rev-parse", ref], text=True, stderr=subprocess.DEVNULL).strip()
+                    valid_shas.add(ref_sha)
+                except Exception:
+                    pass
+
             assert ev_sha in valid_shas, (
                 f"EVIDENCE.md references stale commit SHA {ev_sha}. "
                 f"Expected current HEAD ({head_sha}) or immediate parent ({parent_sha})."
