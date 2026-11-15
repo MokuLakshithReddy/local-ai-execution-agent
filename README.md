@@ -45,7 +45,7 @@ flowchart TD
 | CI execution time | **47.27 s** |
 | CI evidence | [Run 41287736100](https://github.com/MokuLakshithReddy/local-ai-execution-agent/actions/runs/41287736100) |
 
-These are the recorded results in the [machine-generated evidence report](EVIDENCE.md) for commit `59d6f0a` (2026-11-01), not a guarantee for every machine or future commit.
+These are the recorded results in the [machine-generated evidence report](EVIDENCE.md) for commit `379f741` (2026-11-01), not a guarantee for every machine or future commit.
 
 **Why it matters:** an agent cannot mark work complete from its own claim; independent tests, an audited diff, and machine-verifiable provenance must agree.
 
